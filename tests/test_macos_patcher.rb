@@ -487,10 +487,11 @@ class MacosPatcherTest < Minitest::Test
       "+.example.com,+.example.org" => ["223.5.5.5"],
       "+.keep.example" => ["https://1.1.1.1/dns-query#OtherGroup"]
     }
-    policy_out = ClashPatch.patch(config, @policy).fetch(:config).dig("dns", "nameserver-policy")
+    result = ClashPatch.patch(config, @policy)
+    policy_out = result.fetch(:config).dig("dns", "nameserver-policy")
 
     refute policy_out.key?("+.example.com,+.example.org")
-    safe_group = ClashPatch.patch(config, @policy).fetch(:safe_group)
+    safe_group = result.fetch(:safe_group)
     assert policy_out.fetch("+.example.com").all? { |value| value.end_with?("##{safe_group}") }
     assert policy_out.fetch("+.example.org").all? { |value| value.end_with?("##{safe_group}") }
     assert policy_out.fetch("+.keep.example").all? { |value| value.end_with?("##{safe_group}") }
@@ -566,6 +567,14 @@ class MacosPatcherTest < Minitest::Test
     refute_includes output, "\a"
     refute_includes output, "11111111-2222-3333-4444-555555555555"
     refute_includes output, "secret-value"
+  end
+
+  def test_safe_labels_hide_absolute_paths
+    output = ClashPatch.safe_label("failed at /Users/private/Clash/config.yaml and C:\\Users\\private\\Clash\\config.yaml")
+
+    refute_includes output, "/Users/private"
+    refute_includes output, "C:\\Users\\private"
+    assert_includes output, "[路径已隐藏]"
   end
 
   def test_backup_directory_and_files_use_private_permissions
@@ -929,6 +938,24 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_cli_reports_useful_policy_errors_without_dumping_policy_content
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      policy = File.join(directory, "policy.json")
+      File.write(profile, YAML.dump(base_config))
+      File.write(policy, %({"token":"do-not-print",))
+
+      _output, error, status = Open3.capture3(
+        RbConfig.ruby, PATCHER_PATH, "--profile-dir", directory, "--policy", policy, "--dry-run"
+      )
+
+      refute status.success?
+      assert_includes error, "策略文件不是有效的 JSON"
+      refute_includes error, "do-not-print"
+      refute_equal "Clash 补丁运行失败：JSON::ParserError\n", error
+    end
+  end
+
   def test_generated_profile_passes_installed_mihomo_validation
     core = ClashPatch.mihomo_core_path
     skip "ClashX Meta Mihomo core is not installed" unless core
@@ -963,8 +990,7 @@ class MacosPatcherTest < Minitest::Test
 
   def test_every_profile_status_is_documented
     policy_document = File.read(File.join(ROOT, "clash-patch/references/patch-policy.md"))
-    line = policy_document[/订阅状态只能是：(.*?)。当前订阅/m, 1]
-    documented = line.split("、")
+    skill_document = File.read(File.join(ROOT, "clash-patch/SKILL.md"))
     examples = [
       { path: "/profiles/friend.yaml", status: :updated, active: true, reloaded: true, selected_home: nil },
       { path: "/profiles/friend.yaml", status: :updated, active: true, reloaded: false, selected_home: nil },
@@ -973,12 +999,16 @@ class MacosPatcherTest < Minitest::Test
       { path: "/profiles/friend.yaml", status: :no_main_group },
       { path: "/profiles/friend.yaml", status: :invalid },
       { path: "/profiles/friend.yaml", status: :validation_failed },
+      { path: "/profiles/friend.yaml", status: :invalid_policy },
+      { path: "/profiles/friend.yaml", status: :concurrent_change },
       { path: "/profiles/friend.yaml", status: :io_error },
       { path: "/profiles/friend.yaml", status: :error }
     ]
     examples.each do |example|
       message = ClashPatch.chinese_status(example).split("：", 2).last
-      assert documented.any? { |status| message.start_with?(status) }, message
+      status = message.split("；", 2).first
+      assert_includes policy_document, status
+      assert_includes skill_document, "`#{status}`"
     end
   end
 

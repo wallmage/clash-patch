@@ -438,11 +438,21 @@ test('Windows installation fails closed and preserves exact restore state', () =
   assert.match(installer, /function Write-BytesAtomic/);
   assert.match(installer, /OriginalBytes/);
   assert.match(installer, /install-state\.json/);
+  assert.match(installer, /SetAccessRuleProtection/);
+  assert.match(installer, /async\\s\+function\\s\+main/);
+  assert.match(installer, /不会等待异步 main/);
   assert.match(uninstaller, /InstalledSha256/);
+  assert.match(uninstaller, /function New-UninstallBackup/);
+  assert.match(uninstaller, /Guid.*NewGuid/);
   assert.equal(fs.existsSync(installWrapperPath), true);
   assert.equal(fs.existsSync(uninstallWrapperPath), true);
   assert.match(fs.readFileSync(installWrapperPath, 'utf8'), /-ExecutionPolicy Bypass/);
   assert.match(fs.readFileSync(uninstallWrapperPath, 'utf8'), /-ExecutionPolicy Bypass/);
+});
+
+test('Windows engine contains no unused rule-identity helper', () => {
+  const source = fs.readFileSync(enginePath, 'utf8');
+  assert.doesNotMatch(source, /function clashPatchRuleIdentity/);
 });
 
 test('Windows PowerShell entry scripts have a UTF-8 BOM', () => {

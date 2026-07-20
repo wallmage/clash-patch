@@ -18,6 +18,16 @@ if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
 $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object {
     . ([scriptblock]::Create($_.Extent.Text))
 }
+$uninstallTokens = $null
+$uninstallParseErrors = $null
+$uninstallAst = [System.Management.Automation.Language.Parser]::ParseFile($uninstaller, [ref]$uninstallTokens, [ref]$uninstallParseErrors)
+if ($uninstallParseErrors.Count -gt 0) { throw ($uninstallParseErrors | Out-String) }
+$uninstallAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "New-UninstallBackup"
+}, $true) | ForEach-Object {
+    . ([scriptblock]::Create($_.Extent.Text))
+}
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
@@ -80,6 +90,24 @@ try {
     Backup-Once $backupSource
     $savedBackup = [System.IO.File]::ReadAllBytes("$backupSource.clash-patch.original.backup")
     Assert-True (([Convert]::ToBase64String($savedBackup)) -eq ([Convert]::ToBase64String($backupBytes))) "exclusive backup was overwritten"
+    if ($onWindows) {
+        $backupAcl = Get-Acl -LiteralPath "$backupSource.clash-patch.original.backup"
+        Assert-True $backupAcl.AreAccessRulesProtected "backup ACL still inherits permissions"
+        $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $hasCurrentUser = @($backupAcl.Access | Where-Object {
+            $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq $currentSid -and
+            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow
+        }).Count -gt 0
+        Assert-True $hasCurrentUser "backup ACL does not allow the current user"
+    }
+
+    $uninstallBackupSource = Join-Path $sandbox "uninstall-script.js"
+    [System.IO.File]::WriteAllBytes($uninstallBackupSource, $backupBytes)
+    $uninstallBackupOne = New-UninstallBackup $uninstallBackupSource
+    $uninstallBackupTwo = New-UninstallBackup $uninstallBackupSource
+    Assert-True ($uninstallBackupOne -ne $uninstallBackupTwo) "same-second uninstall backups collided"
+    Assert-True (([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($uninstallBackupOne))) -eq ([Convert]::ToBase64String($backupBytes))) "first uninstall backup changed bytes"
+    Assert-True (([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($uninstallBackupTwo))) -eq ([Convert]::ToBase64String($backupBytes))) "second uninstall backup changed bytes"
 
     $transactionDir = Join-Path $sandbox "transaction"
     New-Item -ItemType Directory -Path $transactionDir -Force | Out-Null
@@ -151,6 +179,23 @@ try {
     Assert-True ($restoredScript.Contains("const friendAfterPatch = true;")) "uninstaller discarded code after the managed block"
     Assert-True ((Get-Content -LiteralPath (Join-Path $composeCase "config.yaml") -Raw) -eq $composeConfigOriginal) "uninstaller did not restore config.yaml"
     Assert-True ((Get-Content -LiteralPath (Join-Path $composeCase "verge.yaml") -Raw) -eq $composeVergeOriginal) "uninstaller did not restore verge.yaml"
+
+    $asyncCase = Join-Path $sandbox "async-case"
+    $asyncProfiles = Join-Path $asyncCase "profiles"
+    New-Item -ItemType Directory -Path $asyncProfiles -Force | Out-Null
+    $asyncConfig = "ipv6: true`ntun: null`n"
+    $asyncVerge = "enable_tun_mode: false`n"
+    $asyncScript = "async function main(config) { return config; }`n"
+    [System.IO.File]::WriteAllText((Join-Path $asyncCase "config.yaml"), $asyncConfig)
+    [System.IO.File]::WriteAllText((Join-Path $asyncCase "verge.yaml"), $asyncVerge)
+    $asyncScriptPath = Join-Path $asyncProfiles "Script.js"
+    [System.IO.File]::WriteAllText($asyncScriptPath, $asyncScript)
+    $asyncOutput = & $PowerShellPath -NoLogo -NoProfile -File $installer -AppHome $asyncCase -MihomoPath $fakeCore 2>&1 | Out-String
+    Assert-True ($LASTEXITCODE -eq 1) "installer accepted an async main that Clash Verge Rev cannot await"
+    Assert-True ($asyncOutput.Contains("异步 main")) "async main rejection did not explain the incompatibility"
+    Assert-True ((Get-Content -LiteralPath $asyncScriptPath -Raw) -eq $asyncScript) "async main rejection changed Script.js"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $asyncCase "config.yaml") -Raw) -eq $asyncConfig) "async main rejection changed config.yaml"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $asyncCase "verge.yaml") -Raw) -eq $asyncVerge) "async main rejection changed verge.yaml"
 
     $badMarkerCase = Join-Path $sandbox "bad-marker-case"
     $badMarkerProfiles = Join-Path $badMarkerCase "profiles"

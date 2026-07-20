@@ -9,6 +9,31 @@ function Write-Info([string]$Message) {
     Write-Host "[Clash 补丁] $Message"
 }
 
+function Protect-BackupAcl([string]$Path) {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return }
+
+    $security = Get-Acl -LiteralPath $Path
+    $security.SetAccessRuleProtection($true, $false)
+    @($security.Access) | Where-Object { -not $_.IsInherited } | ForEach-Object {
+        $security.RemoveAccessRuleSpecific($_)
+    }
+    $sidValues = @(
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+        "S-1-5-18",
+        "S-1-5-32-544"
+    ) | Select-Object -Unique
+    foreach ($sidValue in $sidValues) {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier($sidValue)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $security.AddAccessRule($rule) | Out-Null
+    }
+    Set-Acl -LiteralPath $Path -AclObject $security
+}
+
 function Backup-Once([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
     $destination = "$Path.clash-patch.original.backup"
@@ -32,9 +57,18 @@ function Backup-Once([string]$Path) {
         if ($created -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
             Remove-Item -LiteralPath $destination -Force
         } elseif (-not $created -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
+            Protect-BackupAcl $destination
             return
         }
         throw $failure
+    }
+    try {
+        Protect-BackupAcl $destination
+    } catch {
+        if ($created -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
+            Remove-Item -LiteralPath $destination -Force
+        }
+        throw
     }
 }
 
@@ -406,6 +440,9 @@ function Build-GlobalScript([string]$EnginePath, [string]$TargetPath) {
             $prefix = $current.Substring(0, $beginIndex).TrimEnd()
             $suffix = $current.Substring($endIndex + $end.Length).Trim()
         } elseif (-not [string]::IsNullOrWhiteSpace($current)) {
+            if ([regex]::IsMatch($current, '(?m)^\s*async\s+function\s+main\s*\(')) {
+                throw "检测到异步 main。Clash Verge Rev 不会等待异步 main 的结果，原脚本没有被修改。"
+            }
             $matches = [regex]::Matches($current, '(?m)^\s*function\s+main\s*\(')
             if ($matches.Count -ne 1) {
                 throw "检测到已有全局扩展脚本，但无法安全合并。原脚本没有被修改，请把提示和 Script.js 截图发回来。"

@@ -101,6 +101,13 @@ class SkillContractTest < Minitest::Test
     assert system(RbConfig.ruby, generator, "--check"), "Windows policy block is stale"
   end
 
+  def test_windows_policy_generator_uses_binary_io
+    source = File.read(File.join(ROOT, "tests/generate_windows_policy.rb"))
+    assert_includes source, "File.binread"
+    assert_includes source, "File.binwrite"
+    refute_match(/File\.write\(engine_path/, source)
+  end
+
   def test_readme_is_chinese_and_explains_both_persistence_mechanisms
     path = File.join(ROOT, "README.md")
     skip unless File.file?(path)
@@ -132,6 +139,7 @@ class SkillContractTest < Minitest::Test
     assert_includes source, "osascript"
     assert_includes source, "--print-tun-state"
     refute_includes source, "read_tun_enabled"
+    assert_match(/\A#!\/bin\/sh\nset -eu\nset -f\n/, source)
   end
 
   def test_installers_preflight_and_uninstallers_restore_owned_settings
@@ -155,7 +163,17 @@ class SkillContractTest < Minitest::Test
     assert_includes windows_install, "Test-MihomoVersion"
     assert_includes windows_install, "OriginalBytes"
     assert_includes windows_install, "install-state.json"
+    assert_includes windows_install, "SetAccessRuleProtection"
+    assert_includes windows_install, "S-1-5-18"
+    assert_includes windows_install, "S-1-5-32-544"
     assert_includes windows_uninstall, "InstalledSha256"
+  end
+
+  def test_reality_short_id_scope_is_documented
+    readme = File.read(File.join(ROOT, "README.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    assert_match(/macOS[^\n]*REALITY `short-id`|REALITY `short-id`[^\n]*macOS/, readme)
+    assert_match(/macOS[^\n]*REALITY `short-id`|REALITY `short-id`[^\n]*macOS/, policy)
   end
 
   def test_ci_covers_production_runtimes_and_pins_actions

@@ -430,12 +430,6 @@ function clashPatchManagedRuleKey(rule) {
   return info.type + "\u0000" + info.payload.toLowerCase();
 }
 
-function clashPatchRuleIdentity(rule) {
-  const info = clashPatchRuleInfo(rule);
-  const key = clashPatchManagedRuleKey(rule);
-  return key && info.target ? key + "\u0000" + info.target : null;
-}
-
 function clashPatchBroadRule(rule) {
   return ["MATCH", "GEOSITE", "GEOIP", "RULE-SET"].indexOf(clashPatchRuleInfo(rule).type) !== -1;
 }

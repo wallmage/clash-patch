@@ -904,6 +904,8 @@ module ClashPatch
     text = text.gsub(/\b(?:password|passwd|token|secret|uuid)\s*[=:]\s*\S+/i, "[已隐藏]")
     text = text.gsub(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/i, "[已隐藏]")
     text = text.gsub(%r{https?://\S+}i, "[已隐藏]")
+    text = text.gsub(%r{(?<![A-Za-z0-9])/(?:[^/\s]+/)+[^/\s]*}, "[路径已隐藏]")
+    text = text.gsub(/\b[A-Za-z]:[\\\/](?:[^\\\/\s]+[\\\/])+[^\\\/\s]*/, "[路径已隐藏]")
     text = text.strip
     text = "未命名" if text.empty?
     text.each_char.take(120).join
@@ -980,8 +982,14 @@ module ClashPatch
   rescue Errno::ENOENT
     warn "Clash 补丁运行失败：找不到所需文件。"
     1
+  rescue JSON::ParserError
+    warn "Clash 补丁运行失败：策略文件不是有效的 JSON。"
+    1
+  rescue InvalidConfigError => error
+    warn "Clash 补丁运行失败：#{safe_label(error.message)}。"
+    1
   rescue StandardError => error
-    warn "Clash 补丁运行失败：#{error.class}"
+    warn "Clash 补丁运行失败：#{safe_label(error.message)}（#{error.class}）"
     1
   end
 end

@@ -207,6 +207,18 @@
         "rules": ["MATCH,Auto"]
       },
       "expected_main_group": "Proxy"
+    },
+    {
+      "name": "missing-match-target-falls-through",
+      "config": {
+        "proxies": [{ "name": "node", "type": "ss", "server": "node.example" }],
+        "proxy-groups": [
+          { "name": "Proxy", "type": "select", "proxies": ["node"] },
+          { "name": "Fallback", "type": "select", "proxies": ["node"] }
+        ],
+        "rules": ["MATCH,Missing"]
+      },
+      "expected_main_group": "Proxy"
     }
   ]
 }

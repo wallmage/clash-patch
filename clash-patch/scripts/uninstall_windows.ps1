@@ -8,6 +8,47 @@ function Write-Info([string]$Message) {
     Write-Host "[Clash 补丁] $Message"
 }
 
+function Protect-BackupAcl([string]$Path) {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return }
+
+    $security = Get-Acl -LiteralPath $Path
+    $security.SetAccessRuleProtection($true, $false)
+    @($security.Access) | Where-Object { -not $_.IsInherited } | ForEach-Object {
+        $security.RemoveAccessRuleSpecific($_)
+    }
+    $sidValues = @(
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+        "S-1-5-18",
+        "S-1-5-32-544"
+    ) | Select-Object -Unique
+    foreach ($sidValue in $sidValues) {
+        $sid = New-Object System.Security.Principal.SecurityIdentifier($sidValue)
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow
+        )
+        $security.AddAccessRule($rule) | Out-Null
+    }
+    Set-Acl -LiteralPath $Path -AclObject $security
+}
+
+function New-UninstallBackup([string]$Path) {
+    $stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
+    $nonce = [System.Guid]::NewGuid().ToString("N").Substring(0, 12)
+    $destination = "$Path.clash-patch-uninstall.$stamp-$nonce.backup"
+    [System.IO.File]::Copy($Path, $destination, $false)
+    try {
+        Protect-BackupAcl $destination
+    } catch {
+        if (Test-Path -LiteralPath $destination -PathType Leaf) {
+            Remove-Item -LiteralPath $destination -Force
+        }
+        throw
+    }
+    return $destination
+}
+
 function Write-BytesAtomic([string]$Path, [byte[]]$Bytes) {
     if (Test-Path -LiteralPath $Path -PathType Container) { throw "目标路径是目录，不能写入：$Path" }
     $directory = Split-Path -Parent $Path
@@ -116,8 +157,7 @@ try {
                 $prefix = [regex]::Replace($prefix, '(?m)^\s*function\s+clashPatchPreviousMain\s*\(', 'function main(', 1).TrimEnd()
             }
             $remaining = @($prefix, $suffix) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-            $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-            Copy-Item -LiteralPath $target -Destination "$target.clash-patch-uninstall.$stamp.backup"
+            New-UninstallBackup $target | Out-Null
             if ($remaining.Count -eq 0) {
                 Remove-Item -LiteralPath $target -Force
             } else {

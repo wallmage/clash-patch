@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+set -f
 
 # 默认本地配置目录：~/.config/clash.meta；同时自动发现 ClashX Meta 的 iCloud 配置目录。
 CUSTOM_PROFILE_DIR="${CLASH_PATCH_PROFILE_DIR:-}"
