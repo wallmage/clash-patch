@@ -14,9 +14,15 @@ module ClashPatch
 
   AI_GROUP_BASE = "🤖 AI · Clash Patch".freeze
   SAFE_GROUP_BASE = "🛡 安全代理 · Clash Patch".freeze
-  DIRECT_TYPES = %w[direct reject pass compatible].freeze
-  DIRECT_NAMES = %w[DIRECT REJECT REJECT-DROP PASS COMPATIBLE].freeze
-  EXCLUDED_SAFE_TYPES = "Direct|Reject|Pass|Compatible".freeze
+  MIN_MIHOMO_VERSION = [1, 19, 27].freeze
+  MAX_PATCH_ATTEMPTS = 3
+  POLICY_VERSION = 1
+  AUTO_CORE = Object.new.freeze
+  DIRECT_TYPES = %w[direct reject pass compatible rematch].freeze
+  DIRECT_NAMES = %w[DIRECT REJECT REJECT-DROP PASS PASS-RULE COMPATIBLE REMATCH].freeze
+  EXCLUDED_SAFE_TYPES = "Direct|Reject|Pass|Compatible|Rematch".freeze
+
+  class InvalidConfigError < StandardError; end
 
   TUN_POLICY = {
     "enable" => true,
@@ -26,8 +32,6 @@ module ClashPatch
     "auto-detect-interface" => true,
     "strict-route" => true
   }.freeze
-
-  BROAD_PROVIDER_PATTERN = /(?:^|[-_])(ai|cn|china|direct|domestic|global|notcn|proxy)(?:$|[-_])/i
 
   class YAML12ScalarScanner < Psych::ScalarScanner
     INTEGER = /\A[-+]?(?:0|[1-9][0-9_]*|0o[0-7_]+|0x[0-9a-fA-F_]+|0b[01_]+)\z/.freeze
@@ -82,7 +86,7 @@ module ClashPatch
   end
 
   def managed_name?(name, base)
-    name.is_a?(String) && name.match?(/\A#{Regexp.escape(base)}(?: [2-9][0-9]*)?\z/)
+    name.is_a?(String) && name.match?(/\A#{Regexp.escape(base)}(?: (?:[2-9]|[1-9][0-9]+))?\z/)
   end
 
   def managed_group_name?(name)
@@ -95,17 +99,15 @@ module ClashPatch
     end
     names = candidates.map { |group| group["name"] }
 
-    match_rule = Array(config["rules"]).reverse.find { |rule| rule.to_s.start_with?("MATCH,") }
-    match_target = match_rule.to_s.split(",", 2)[1]
-    return match_target if match_target != "DIRECT" && names.include?(match_target)
+    match = Array(config["rules"]).reverse.map { |rule| rule_info(rule) }.find { |info| info[:type] == "MATCH" }
+    match_target = match && match[:target]
+    return match_target if !direct_name?(match_target) && names.include?(match_target)
 
     references = Hash.new(0)
     Array(config["rules"]).each do |rule|
       next unless broad_rule?(rule)
 
-      parts = rule.to_s.split(",")
-      target = parts[-1]
-      target = parts[-2] if target == "no-resolve"
+      target = rule_info(rule)[:target]
       references[target] += 1 if names.include?(target)
     end
     frequent = references.max_by { |name, count| [count, -names.index(name)] }
@@ -141,17 +143,12 @@ module ClashPatch
   end
 
   def home_candidate(config, policy)
-    group_names = Array(config["proxy-groups"]).map do |group|
-      group["name"] if group.is_a?(Hash) && group["name"].is_a?(String)
-    end.compact
     candidates = Array(config["proxies"]).map do |proxy|
-      proxy["name"] if proxy.is_a?(Hash) && proxy["name"].is_a?(String)
+      next unless proxy.is_a?(Hash) && proxy["name"].is_a?(String)
+      next if DIRECT_TYPES.include?(proxy["type"].to_s.downcase)
+
+      proxy["name"]
     end.compact
-    Array(config["proxy-groups"]).each do |group|
-      Array(group["proxies"]).each do |name|
-        candidates << name if name.is_a?(String) && !group_names.include?(name)
-      end
-    end
     candidates = candidates.uniq.select { |name| name.include?("家宽") }
 
     taiwan = candidates.find { |name| Array(policy["taiwan_tokens"]).any? { |token| token_match?(name, token) } }
@@ -169,12 +166,52 @@ module ClashPatch
     "#{base} #{suffix}"
   end
 
-  def find_managed_select_group(config, base)
-    selectable_groups(config).find { |group| managed_name?(group["name"], base) }
+  def owned_ai_group?(config, name, policy)
+    keys = Array(policy["ai_rules"]).map { |template| managed_rule_key(template) }.compact.uniq
+    matches = Array(config["rules"]).count do |rule|
+      info = rule_info(rule)
+      info[:target] == name && keys.include?(managed_rule_key(rule))
+    end
+    return false unless matches >= 2
+
+    selectable_groups(config).any? do |group|
+      managed_name?(group["name"], SAFE_GROUP_BASE) && owned_safe_group?(config, group["name"])
+    end
   end
 
-  def ensure_ai_group(config, main_group, candidate)
-    group = find_managed_select_group(config, AI_GROUP_BASE)
+  def resolver_targets(config)
+    dns = config["dns"]
+    return [] unless dns.is_a?(Hash)
+
+    fields = %w[nameserver fallback direct-nameserver]
+    endpoints = fields.flat_map { |field| Array(dns[field]) }
+    if dns["nameserver-policy"].is_a?(Hash)
+      endpoints.concat(dns["nameserver-policy"].values.flat_map { |value| Array(value) })
+    end
+    endpoints.map { |endpoint| resolver_target(endpoint) }.compact
+  end
+
+  def owned_safe_group?(config, name)
+    guarded = Array(config["rules"]).each_cons(2).any? do |first, second|
+      first_info = rule_info(first)
+      second_info = rule_info(second)
+      first_info[:type] == "NETWORK" && first_info[:payload].casecmp("UDP").zero? && first_info[:target] == name &&
+        second_info[:type] == "NETWORK" && second_info[:payload].casecmp("UDP").zero? &&
+        second_info[:target].to_s.casecmp("REJECT").zero?
+    end
+    guarded && resolver_targets(config).include?(name)
+  end
+
+  def find_managed_select_group(config, base, kind, policy = nil)
+    selectable_groups(config).find do |group|
+      next false unless managed_name?(group["name"], base)
+
+      kind == :ai ? owned_ai_group?(config, group["name"], policy) : owned_safe_group?(config, group["name"])
+    end
+  end
+
+  def ensure_ai_group(config, main_group, candidate, policy)
+    group = find_managed_select_group(config, AI_GROUP_BASE, :ai, policy)
     unless group
       group = { "name" => unique_group_name(config, AI_GROUP_BASE), "type" => "select" }
       config["proxy-groups"] << group
@@ -200,7 +237,7 @@ module ClashPatch
   end
 
   def ensure_safe_group(config, candidate)
-    group = find_managed_select_group(config, SAFE_GROUP_BASE)
+    group = find_managed_select_group(config, SAFE_GROUP_BASE, :safe)
     unless group
       group = { "name" => unique_group_name(config, SAFE_GROUP_BASE), "type" => "select" }
       config["proxy-groups"] << group
@@ -246,22 +283,30 @@ module ClashPatch
     return false unless group
 
     members = Array(group["proxies"])
-    member_safe = members.all? do |member|
+    return false if members.empty?
+    return false unless Array(group["use"]).empty?
+    return false if group["include-all"] == true || group["include-all-proxies"] == true || group["include-all-providers"] == true
+
+    members.all? do |member|
       safe_proxy_target?(config, member) || group_cannot_reach_direct?(config, member, visiting + [target])
     end
-    provider_safe = Array(group["use"]).all? { |name| config.fetch("proxy-providers", {}).key?(name) }
-    provider_safe &&= !Array(group["use"]).empty?
-    include_all_safe = group["include-all"] == true && group["exclude-type"].to_s.downcase.include?("direct")
+  end
 
-    member_safe && (!members.empty? || provider_safe || include_all_safe)
+  def resolver_target(endpoint)
+    fragment = endpoint.to_s.split("#", 2)[1]
+    return nil if fragment.nil? || fragment.empty?
+
+    target = fragment.split("&", 2).first.to_s
+    return nil if target.empty? || target.include?("=")
+
+    target
   end
 
   def safe_resolver_endpoint?(config, endpoint)
-    fragment = endpoint.to_s.split("#", 2)[1]
-    return false if fragment.nil? || fragment.empty?
+    return false unless endpoint.to_s.match?(/\A(?:https|tls|quic):\/\//i)
 
-    target = fragment.split("&", 2).first.to_s
-    return false if target.empty? || target.include?("=") || direct_name?(target)
+    target = resolver_target(endpoint)
+    return false if target.nil? || direct_name?(target)
 
     safe_proxy_target?(config, target) || group_cannot_reach_direct?(config, target)
   end
@@ -294,9 +339,53 @@ module ClashPatch
     dns["nameserver-policy"] = policies
   end
 
+  def split_rule_fields(rule)
+    fields = []
+    buffer = +""
+    depth = 0
+    rule.to_s.each_char do |character|
+      case character
+      when "("
+        depth += 1
+        buffer << character
+      when ")"
+        depth -= 1 if depth.positive?
+        buffer << character
+      when ","
+        if depth.zero?
+          fields << buffer.strip
+          buffer = +""
+        else
+          buffer << character
+        end
+      else
+        buffer << character
+      end
+    end
+    fields << buffer.strip
+    fields
+  end
+
+  def rule_info(rule)
+    parts = split_rule_fields(rule)
+    type = parts[0].to_s.upcase
+    no_resolve = parts.last.to_s.casecmp("no-resolve").zero?
+    target_index = no_resolve ? parts.length - 2 : parts.length - 1
+    target = target_index.positive? ? parts[target_index] : nil
+    { parts: parts, type: type, payload: parts[1].to_s, target: target }
+  end
+
+  def managed_rule_key(rule)
+    info = rule_info(rule)
+    return nil if info[:type].empty? || info[:payload].empty?
+
+    [info[:type], info[:payload].downcase]
+  end
+
   def managed_rule_identity(rule)
-    parts = rule.to_s.split(",")
-    parts.length < 2 ? nil : [parts[0], parts[1]]
+    info = rule_info(rule)
+    key = managed_rule_key(rule)
+    key && info[:target] ? key + [info[:target]] : nil
   end
 
   def render_ai_rules(policy, ai_group)
@@ -304,37 +393,59 @@ module ClashPatch
   end
 
   def broad_rule?(rule)
-    parts = rule.to_s.split(",")
-    return true if parts[0] == "MATCH"
-    return true if %w[GEOSITE GEOIP].include?(parts[0])
-    return false unless parts[0] == "RULE-SET"
-
-    provider = parts[1].to_s
-    provider.match?(BROAD_PROVIDER_PATTERN) || provider.match?(/国内|国外|节点|兜底/)
+    %w[MATCH GEOSITE GEOIP RULE-SET].include?(rule_info(rule)[:type])
   end
 
   def patch_rules(config, policy, ai_group, safe_group)
     managed = render_ai_rules(policy, ai_group)
-    identities = managed.map { |rule| managed_rule_identity(rule) }.compact
+    managed_keys = managed.map { |rule| managed_rule_key(rule) }.compact
     forbidden = Array(policy["forbidden_ai_domains"])
-    ai_names = Array(config["proxy-groups"]).map do |group|
-      group["name"] if group.is_a?(Hash) && ai_name?(group["name"], policy)
-    end.compact
-    ai_names << ai_group
-    ai_names.uniq!
+    owned_ai_names = selectable_groups(config).map { |group| group["name"] }.select do |name|
+      managed_name?(name, AI_GROUP_BASE) && owned_ai_group?(config, name, policy)
+    end
+    owned_ai_names << ai_group
+    owned_ai_names.uniq!
+    owned_safe_names = selectable_groups(config).map { |group| group["name"] }.select do |name|
+      managed_name?(name, SAFE_GROUP_BASE) && owned_safe_group?(config, name)
+    end
+    owned_safe_names << safe_group
+    owned_safe_names.uniq!
 
-    rules = Array(config["rules"]).reject do |rule|
-      parts = rule.to_s.split(",")
-      target = parts[-1] == "no-resolve" ? parts[-2] : parts[-1]
-      managed_existing = identities.include?(managed_rule_identity(rule))
-      forbidden_ai = %w[DOMAIN DOMAIN-SUFFIX].include?(parts[0]) && forbidden.include?(parts[1]) && ai_names.include?(target)
-      generic_udp = parts[0] == "NETWORK" && parts[1] == "UDP"
-      managed_existing || forbidden_ai || generic_udp
+    original_rules = Array(config["rules"])
+    owned_udp_indexes = []
+    original_rules.each_with_index do |rule, index|
+      info = rule_info(rule)
+      next unless info[:type] == "NETWORK" && info[:payload].casecmp("UDP").zero? && owned_safe_names.include?(info[:target])
+
+      owned_udp_indexes << index
+      next_info = rule_info(original_rules[index + 1]) if index + 1 < original_rules.length
+      if next_info && next_info[:type] == "NETWORK" && next_info[:payload].casecmp("UDP").zero? &&
+         next_info[:target].to_s.casecmp("REJECT").zero?
+        owned_udp_indexes << index + 1
+      end
     end
 
-    anchor = rules.index { |rule| broad_rule?(rule) } || rules.length
-    rules.insert(anchor, *managed, "NETWORK,UDP,#{safe_group}", "NETWORK,UDP,REJECT")
-    config["rules"] = rules
+    user_overrides = []
+    remaining = []
+    original_rules.each_with_index do |rule, index|
+      next if owned_udp_indexes.include?(index)
+
+      info = rule_info(rule)
+      key = managed_rule_key(rule)
+      patch_owned_ai = managed_keys.include?(key) && owned_ai_names.include?(info[:target])
+      forbidden_ai = %w[DOMAIN DOMAIN-SUFFIX].include?(info[:type]) &&
+                     forbidden.any? { |domain| domain.casecmp(info[:payload]).zero? } &&
+                     owned_ai_names.include?(info[:target])
+      next if patch_owned_ai || forbidden_ai
+
+      if managed_keys.include?(key)
+        user_overrides << rule
+      else
+        remaining << rule
+      end
+    end
+
+    config["rules"] = ["NETWORK,UDP,#{safe_group}", "NETWORK,UDP,REJECT"] + user_overrides + managed + remaining
   end
 
   def normalize_reality_short_ids(value)
@@ -354,6 +465,7 @@ module ClashPatch
   end
 
   def patch(config, policy)
+    return base_result(config, :invalid_policy) unless policy.is_a?(Hash) && policy["version"] == POLICY_VERSION
     return base_result(config, :invalid) unless usable_config?(config)
 
     original = deep_copy(config)
@@ -362,7 +474,7 @@ module ClashPatch
     return base_result(config, :no_main_group) unless main_group
 
     candidate = home_candidate(patched, policy)
-    ai_group = ensure_ai_group(patched, main_group, candidate)
+    ai_group = ensure_ai_group(patched, main_group, candidate, policy)
     safe_group = ensure_safe_group(patched, candidate)
     patched["ipv6"] = false
     patched["tun"] = {} unless patched["tun"].is_a?(Hash)
@@ -402,13 +514,26 @@ module ClashPatch
     node
   end
 
+  def yaml_alias?(node)
+    return true if node.is_a?(Psych::Nodes::Alias)
+    return false unless node.respond_to?(:children)
+
+    Array(node.children).any? { |child| yaml_alias?(child) }
+  end
+
   def load_yaml(text, filename = nil)
     # REALITY short-id is schema-defined text, but a valid hexadecimal value
     # can also resemble a YAML number (for example 0906152e4 or 12345678).
     # Tag only that field as text before scalar resolution so unrelated YAML
     # 1.2 exponent values keep their numeric meaning.
-    document = Psych.parse(text, filename)
-    return nil unless document
+    stream = Psych.parse_stream(text, filename)
+    documents = stream.children
+    return nil if documents.empty?
+    raise InvalidConfigError, "YAML 必须只包含一个文档" unless documents.length == 1
+
+    document = documents.first
+    raise InvalidConfigError, "YAML 别名不受支持" if yaml_alias?(document)
+
     tag_reality_short_ids(document)
 
     class_loader = Psych::ClassLoader::Restricted.new([], [])
@@ -418,7 +543,8 @@ module ClashPatch
 
   def excluded_path?(path)
     basename = File.basename(path)
-    basename.start_with?(".") || basename.match?(/(?:\.tmp|\.bak|\.backup)\z/i)
+    basename.start_with?(".") || basename.match?(/(?:^|[._-])(?:bak|backup|clash-patch)(?:[._-]|\z)/i) ||
+      basename.match?(/(?:\.tmp|\.bak|\.backup)\z/i)
   end
 
   def profile_paths(directory)
@@ -433,25 +559,58 @@ module ClashPatch
     end.compact
   end
 
-  def backup_once(path, backup_root)
+  def backup_once(path, backup_root, content: nil)
     FileUtils.mkdir_p(backup_root)
     FileUtils.chmod(0o700, backup_root)
     key = Digest::SHA256.hexdigest(File.expand_path(path))[0, 16]
     destination = File.join(backup_root, "#{key}-#{File.basename(path)}.backup")
-    FileUtils.cp(path, destination) unless File.exist?(destination)
+    begin
+      File.open(destination, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |backup|
+        if content
+          backup.write(content)
+        else
+          File.open(path, "rb") { |source| IO.copy_stream(source, backup) }
+        end
+        backup.flush
+        backup.fsync
+      end
+    rescue Errno::EEXIST
+      # The first complete patch attempt owns the one-time backup.
+    end
     FileUtils.chmod(0o600, destination)
   end
 
-  def validate_with_mihomo(path)
-    core = mihomo_core_path
-    return true unless core
+  def mihomo_version(text)
+    match = text.to_s.match(/\bv?(\d+)\.(\d+)\.(\d+)\b/i)
+    match && match.captures.map(&:to_i)
+  end
+
+  def mihomo_version_supported?(text)
+    version = mihomo_version(text)
+    version && (version <=> MIN_MIHOMO_VERSION) >= 0
+  end
+
+  def mihomo_core_status(core_path = AUTO_CORE)
+    core = core_path.equal?(AUTO_CORE) ? mihomo_core_path : core_path
+    return :missing unless core && File.file?(core) && File.executable?(core)
+
+    output, status = Open3.capture2e(core, "-v")
+    return :unreadable unless status.success?
+
+    mihomo_version_supported?(output) ? :supported : :too_old
+  rescue SystemCallError, IOError
+    :unreadable
+  end
+
+  def validate_with_mihomo(path, core_path: AUTO_CORE)
+    core = core_path.equal?(AUTO_CORE) ? mihomo_core_path : core_path
+    return false unless mihomo_core_status(core) == :supported
 
     system(core, "-d", mihomo_validation_directory(path), "-t", "-f", path, out: File::NULL, err: File::NULL)
   end
 
   def mihomo_validation_directory(path)
-    local = File.expand_path("~/.config/clash.meta")
-    Dir.exist?(local) ? local : File.dirname(path)
+    File.dirname(File.expand_path(path))
   end
 
   def mihomo_core_path
@@ -463,32 +622,58 @@ module ClashPatch
     candidates.find { |path| File.file?(path) && File.executable?(path) }
   end
 
-  def patch_path(path, policy, dry_run: false, backup_root: nil, validator: nil)
+  def patch_path_once(path, policy, dry_run:, backup_root:, validator:)
     write_path = File.realpath(path)
-    original_text = File.read(write_path, encoding: "UTF-8")
-    config = load_yaml(original_text, path)
-    result = patch(config, policy)
-    return result.merge(path: path) unless result[:changed]
+    outcome = nil
+    File.open(write_path, "rb") do |source|
+      source.flock(File::LOCK_EX)
+      original_bytes = source.read
+      original_text = original_bytes.dup.force_encoding(Encoding::UTF_8)
+      raise InvalidConfigError, "配置不是有效的 UTF-8" unless original_text.valid_encoding?
 
-    patched_text = dump_config(result[:config])
-    return result.merge(path: path, dry_run: true) if dry_run
+      config = load_yaml(original_text, path)
+      result = patch(config, policy)
+      return result.merge(path: path) unless result[:changed]
 
-    mode = File.stat(write_path).mode & 0o777
-    Tempfile.create([File.basename(write_path), ".tmp"], File.dirname(write_path), encoding: "UTF-8") do |temporary|
-      temporary.write(patched_text)
-      temporary.flush
-      temporary.fsync
-      load_yaml(File.read(temporary.path, encoding: "UTF-8"), temporary.path)
-      unless validator.nil? || validator.call(temporary.path)
-        return base_result(config, :validation_failed).merge(path: path)
+      patched_text = dump_config(result[:config])
+      return result.merge(path: path, dry_run: true) if dry_run
+
+      mode = File.stat(write_path).mode & 0o777
+      Tempfile.create([File.basename(write_path), ".tmp"], File.dirname(write_path), encoding: "UTF-8") do |temporary|
+        temporary.write(patched_text)
+        temporary.flush
+        temporary.fsync
+        load_yaml(File.read(temporary.path, encoding: "UTF-8"), temporary.path)
+        unless validator.nil? || validator.call(temporary.path)
+          return base_result(config, :validation_failed).merge(path: path)
+        end
+
+        current_path = File.realpath(path)
+        if current_path != write_path || File.binread(write_path) != original_bytes
+          outcome = :retry
+        else
+          backup_once(path, backup_root, content: original_bytes) if backup_root
+          File.chmod(mode, temporary.path)
+          final_path = File.realpath(path)
+          if final_path != write_path || File.binread(write_path) != original_bytes
+            outcome = :retry
+          else
+            File.rename(temporary.path, write_path)
+            outcome = result.merge(path: path)
+          end
+        end
       end
-
-      backup_once(path, backup_root) if backup_root
-      File.chmod(mode, temporary.path)
-      File.rename(temporary.path, write_path)
     end
-    result.merge(path: path)
-  rescue Psych::Exception, JSON::ParserError
+    outcome
+  end
+
+  def patch_path(path, policy, dry_run: false, backup_root: nil, validator: nil)
+    MAX_PATCH_ATTEMPTS.times do
+      outcome = patch_path_once(path, policy, dry_run: dry_run, backup_root: backup_root, validator: validator)
+      return outcome unless outcome == :retry
+    end
+    base_result(nil, :concurrent_change).merge(path: path)
+  rescue Psych::Exception, JSON::ParserError, InvalidConfigError
     base_result(nil, :invalid).merge(path: path)
   rescue SystemCallError, IOError
     base_result(nil, :io_error).merge(path: path)
@@ -557,6 +742,7 @@ module ClashPatch
 
   def active_profile?(path, selected)
     selected_name = File.basename(selected.to_s)
+    selected_name = "config.yaml" if selected_name.empty?
     selected_stem = selected_name.sub(/\.ya?ml\z/i, "")
     profile_name = File.basename(path)
     profile_stem = profile_name.sub(/\.ya?ml\z/i, "")
@@ -569,7 +755,12 @@ module ClashPatch
       File.expand_path("~/Library/Caches/com.metacubex.ClashX.meta/cacheConfigs")
     ]
     cache_directories.each do |directory|
-      Dir.glob(File.join(directory, "*.yaml")).sort_by { |path| File.mtime(path) }.reverse_each do |path|
+      candidates = Dir.glob(File.join(directory, "*.yaml")).each_with_object([]) do |path, entries|
+        entries << [path, File.mtime(path)]
+      rescue SystemCallError
+        next
+      end
+      candidates.sort_by { |_path, modified| modified }.reverse_each do |path, _modified|
         config = load_yaml(File.read(path, encoding: "UTF-8"), path)
         socket = config["external-controller-unix"] if config.is_a?(Hash)
         return socket if socket.is_a?(String) && File.socket?(socket)
@@ -633,14 +824,18 @@ module ClashPatch
     return false unless put_status == 204
 
     get_status, body = request.call("GET", "/proxies/#{encoded}", nil)
-    get_status == 200 && JSON.parse(body)["now"] == candidate
-  rescue JSON::ParserError
+    parsed = JSON.parse(body) if get_status == 200
+    get_status == 200 && parsed.is_a?(Hash) && parsed["now"] == candidate
+  rescue JSON::ParserError, TypeError
     false
   end
 
   def run(directory: nil, directories: nil, policy_path:, dry_run: false, backup_root: nil, reloader: nil,
           selector: nil, selected_name: nil, active_directory: nil, validator: nil)
     policy = JSON.parse(File.read(policy_path, encoding: "UTF-8"))
+    unless policy.is_a?(Hash) && policy["version"] == POLICY_VERSION
+      raise InvalidConfigError, "不支持的策略版本"
+    end
     reloader ||= method(:reload)
     selector ||= method(:select_proxy)
     selected = selected_name.nil? ? selected_profile_name : selected_name
@@ -675,7 +870,7 @@ module ClashPatch
   end
 
   def chinese_status(result)
-    name = File.basename(result[:path].to_s)
+    name = safe_label(File.basename(result[:path].to_s))
     case result[:status]
     when :updated
       "#{name}：#{updated_state(result)}#{ai_state(result)}"
@@ -684,6 +879,8 @@ module ClashPatch
       "#{name}：无需修改#{suffix}"
     when :no_main_group then "#{name}：未修改：找不到可用的主代理组"
     when :validation_failed then "#{name}：已跳过：内核校验失败"
+    when :invalid_policy then "#{name}：已跳过：策略版本无效"
+    when :concurrent_change then "#{name}：已跳过：订阅正在刷新，稍后重试"
     when :io_error then "#{name}：已跳过：读取或写入失败"
     when :error then "#{name}：已跳过：处理失败"
     else "#{name}：已跳过：订阅内容无效"
@@ -692,10 +889,24 @@ module ClashPatch
 
   def ai_state(result)
     return "；没有台湾或日本家宽节点，未替你更换节点" unless result[:selected_home]
-    return "；AI 将使用「#{result[:selected_home]}」" unless result[:active]
-    return "；AI 已切换到「#{result[:selected_home]}」" if result[:selection_verified]
+    selected = safe_label(result[:selected_home])
+    return "；AI 将使用「#{selected}」" unless result[:active]
+    return "；AI 已切换到「#{selected}」" if result[:selection_verified]
 
-    "；AI 组已写入「#{result[:selected_home]}」，等待运行配置生效"
+    "；AI 组已写入「#{selected}」，等待运行配置生效"
+  end
+
+  def safe_label(value)
+    text = value.to_s.encode("UTF-8", invalid: :replace, undef: :replace, replace: "�")
+    text = text.gsub(/\e\][^\a]*(?:\a|\e\\)/, "")
+    text = text.gsub(/\e\[[0-?]*[ -\/]?[@-~]/, "")
+    text = text.gsub(/[\p{Cc}\p{Cf}]/, "")
+    text = text.gsub(/\b(?:password|passwd|token|secret|uuid)\s*[=:]\s*\S+/i, "[已隐藏]")
+    text = text.gsub(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/i, "[已隐藏]")
+    text = text.gsub(%r{https?://\S+}i, "[已隐藏]")
+    text = text.strip
+    text = "未命名" if text.empty?
+    text.each_char.take(120).join
   end
 
   def updated_state(result)
@@ -708,11 +919,12 @@ module ClashPatch
   def cli(argv = ARGV)
     options = {
       profile_dirs: [],
-      policy: File.expand_path("../../../references/policy.json", __dir__),
+      policy: File.expand_path("../../references/policy.json", __dir__),
       backup_root: File.expand_path("~/Library/Application Support/ClashPatch/backups"),
       dry_run: false,
       print_watch_paths: false,
-      print_tun_state: false
+      print_tun_state: false,
+      print_core_status: false
     }
     parser = OptionParser.new do |opts|
       opts.banner = "用法：patch_profiles.rb [选项]"
@@ -722,12 +934,19 @@ module ClashPatch
       opts.on("--dry-run", "只预览，不写入文件") { options[:dry_run] = true }
       opts.on("--print-watch-paths", "输出 LaunchAgent 应监视的目录") { options[:print_watch_paths] = true }
       opts.on("--print-tun-state", "输出当前运行内核的 TUN 状态") { options[:print_tun_state] = true }
+      opts.on("--print-core-status", "检查 Mihomo 内核是否满足最低版本") { options[:print_core_status] = true }
       opts.on("-h", "--help", "显示帮助") do
         puts opts
         return 0
       end
     end
     parser.parse!(argv)
+
+    if options[:print_core_status]
+      status = mihomo_core_status
+      puts status
+      return status == :supported ? 0 : 1
+    end
 
     if options[:print_tun_state]
       puts tun_state
@@ -758,6 +977,9 @@ module ClashPatch
     warn "参数错误：#{error.message}"
     warn parser
     64
+  rescue Errno::ENOENT
+    warn "Clash 补丁运行失败：找不到所需文件。"
+    1
   rescue StandardError => error
     warn "Clash 补丁运行失败：#{error.class}"
     1

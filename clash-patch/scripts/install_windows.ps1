@@ -1,5 +1,6 @@
-param(
-    [string]$AppHome = ""
+﻿param(
+    [string]$AppHome = "",
+    [string]$MihomoPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,23 +11,65 @@ function Write-Info([string]$Message) {
 
 function Backup-Once([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
-    $directory = Split-Path -Parent $Path
-    $name = Split-Path -Leaf $Path
-    $existing = @(Get-ChildItem -LiteralPath $directory -Filter "$name.clash-patch.*.backup" -ErrorAction SilentlyContinue)
-    if ($existing.Count -gt 0) { return }
-    $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-    Copy-Item -LiteralPath $Path -Destination "$Path.clash-patch.$stamp.backup"
+    $destination = "$Path.clash-patch.original.backup"
+    $sourceStream = $null
+    $backupStream = $null
+    $created = $false
+    $failure = $null
+    try {
+        $sourceStream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $backupStream = [System.IO.File]::Open($destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $created = $true
+        $sourceStream.CopyTo($backupStream)
+        $backupStream.Flush()
+    } catch {
+        $failure = $_
+    } finally {
+        if ($null -ne $backupStream) { $backupStream.Dispose() }
+        if ($null -ne $sourceStream) { $sourceStream.Dispose() }
+    }
+    if ($null -ne $failure) {
+        if ($created -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
+            Remove-Item -LiteralPath $destination -Force
+        } elseif (-not $created -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
+            return
+        }
+        throw $failure
+    }
 }
 
-function Write-Utf8Atomic([string]$Path, [string]$Content) {
+function Write-BytesAtomic([string]$Path, [byte[]]$Bytes) {
+    if (Test-Path -LiteralPath $Path -PathType Container) { throw "目标路径是目录，不能写入：$Path" }
     $directory = Split-Path -Parent $Path
     $temporary = Join-Path $directory (".clash-patch-" + [System.IO.Path]::GetRandomFileName())
     try {
-        [System.IO.File]::WriteAllText($temporary, $Content, (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllBytes($temporary, $Bytes)
         Move-Item -LiteralPath $temporary -Destination $Path -Force
     } finally {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
     }
+}
+
+function ConvertTo-Utf8Bytes([string]$Content) {
+    return (New-Object System.Text.UTF8Encoding($false)).GetBytes($Content)
+}
+
+function Write-Utf8Atomic([string]$Path, [string]$Content) {
+    Write-BytesAtomic $Path (ConvertTo-Utf8Bytes $Content)
+}
+
+function Get-BytesSha256([byte[]]$Bytes) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-FileSha256([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return "" }
+    return (Get-BytesSha256 ([System.IO.File]::ReadAllBytes($Path)))
 }
 
 function Split-YamlLines([string]$Text) {
@@ -100,7 +143,9 @@ function Replace-YamlRange([string[]]$Lines, [int]$Start, [int]$End, [string[]]$
 function Set-YamlTopLevelScalar([string]$Text, [string]$Key, [string]$Value) {
     $lines = @(Split-YamlLines $Text)
     $node = Find-YamlMappingNode $lines $Key 0 0 $lines.Count
-    $replacement = @("$Key`: $Value")
+    $comment = ""
+    if ($null -ne $node -and $node.Value -match '(\s+#.*)$') { $comment = $Matches[1] }
+    $replacement = @("$Key`: $Value$comment")
     if ($null -eq $node) {
         while ($lines.Count -gt 0 -and [string]::IsNullOrWhiteSpace($lines[$lines.Count - 1])) {
             $lines = if ($lines.Count -eq 1) { @() } else { @($lines[0..($lines.Count - 2)]) }
@@ -144,6 +189,9 @@ function Set-YamlTunMapping([string]$Text) {
     }
 
     $semanticValue = ($tun.Value -replace '\s+#.*$', '').Trim()
+    if ($semanticValue -match '^[&*]') {
+        throw "config.yaml 的 tun 节点使用了 YAML 锚点或别名，无法安全合并。原文件没有被修改。"
+    }
     if ($semanticValue -match '^\{') {
         throw "config.yaml 使用了行内 tun 写法，无法安全合并。原文件没有被修改。"
     }
@@ -182,9 +230,18 @@ function Set-YamlTunMapping([string]$Text) {
 function Test-GeneratedYaml([string]$Text, [string]$Label) {
     $lines = @(Split-YamlLines $Text)
     $topKeys = @{}
+    $seenContent = $false
     for ($i = 0; $i -lt $lines.Count; $i++) {
         $line = $lines[$i]
         if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith("#")) { continue }
+        $trimmed = $line.Trim()
+        if ($trimmed -eq "---") {
+            if ($seenContent) { throw "$Label 包含多个 YAML 文档，原文件没有被修改。" }
+            $seenContent = $true
+            continue
+        }
+        if ($trimmed -eq "...") { throw "$Label 包含 YAML 文档结束标记，原文件没有被修改。" }
+        $seenContent = $true
         if ((Get-YamlIndent $line) -ne 0) { continue }
         $entry = Get-YamlMappingEntry $line
         if ($null -ne $entry) {
@@ -210,43 +267,67 @@ function Test-GeneratedYaml([string]$Text, [string]$Label) {
     return $true
 }
 
-function Find-MihomoCore([string]$Root) {
-    try {
-        $running = Get-Process -Name "verge-mihomo" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($null -ne $running -and -not [string]::IsNullOrWhiteSpace($running.Path) -and (Test-Path -LiteralPath $running.Path)) {
-            return $running.Path
+function Test-ClashVergeRunning {
+    $names = @("clash-verge", "clash-verge-rev", "Clash Verge", "Clash Verge Rev")
+    foreach ($name in $names) {
+        if ($null -ne (Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1)) { return $true }
+    }
+    return $false
+}
+
+function Test-MihomoVersionText([string]$Text) {
+    $match = [regex]::Match($Text, '(?i)\bv?(\d+)\.(\d+)\.(\d+)\b')
+    if (-not $match.Success) { return $false }
+    $actual = [version]("{0}.{1}.{2}" -f $match.Groups[1].Value, $match.Groups[2].Value, $match.Groups[3].Value)
+    $minimum = [version]"1.19.27"
+    return $actual.CompareTo($minimum) -ge 0
+}
+
+function Test-MihomoVersion([string]$CorePath) {
+    if ([string]::IsNullOrWhiteSpace($CorePath) -or -not (Test-Path -LiteralPath $CorePath -PathType Leaf)) {
+        throw "没有找到可用的 Mihomo 内核。请更新 Clash Verge Rev，或用 -MihomoPath 指定可信的内核路径。"
+    }
+    $output = @(& $CorePath -v 2>&1)
+    $exitCode = $LASTEXITCODE
+    $versionText = $output -join "`n"
+    if ($exitCode -ne 0 -or -not (Test-MihomoVersionText $versionText)) {
+        throw "需要 Mihomo 1.19.27 或更高版本，当前内核版本无法确认或过旧。"
+    }
+    return $true
+}
+
+function Find-MihomoCore([string]$RequestedPath) {
+    if (-not [string]::IsNullOrWhiteSpace($RequestedPath)) {
+        if (-not (Test-Path -LiteralPath $RequestedPath -PathType Leaf)) {
+            throw "指定的 Mihomo 内核不存在：$RequestedPath"
         }
-    } catch { }
+        return (Resolve-Path -LiteralPath $RequestedPath).Path
+    }
 
     $installCandidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $installCandidates += (Join-Path (Join-Path $env:LOCALAPPDATA "Clash Verge") "verge-mihomo.exe")
+        $installCandidates += (Join-Path (Join-Path $env:LOCALAPPDATA "Clash Verge") "verge-mihomo-alpha.exe")
+    }
     if (-not [string]::IsNullOrWhiteSpace($env:ProgramFiles)) {
         $installCandidates += (Join-Path (Join-Path $env:ProgramFiles "Clash Verge") "verge-mihomo.exe")
+        $installCandidates += (Join-Path (Join-Path $env:ProgramFiles "Clash Verge") "verge-mihomo-alpha.exe")
+        $installCandidates += (Join-Path (Join-Path $env:ProgramFiles "Clash Verge Rev") "verge-mihomo.exe")
     }
     $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
     if (-not [string]::IsNullOrWhiteSpace($programFilesX86)) {
         $installCandidates += (Join-Path (Join-Path $programFilesX86 "Clash Verge") "verge-mihomo.exe")
+        $installCandidates += (Join-Path (Join-Path $programFilesX86 "Clash Verge") "verge-mihomo-alpha.exe")
+        $installCandidates += (Join-Path (Join-Path $programFilesX86 "Clash Verge Rev") "verge-mihomo.exe")
     }
     foreach ($candidate in $installCandidates) {
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
-    }
-
-    $relativeCandidates = @(
-        "mihomo.exe",
-        "clash-meta.exe",
-        "resources\mihomo.exe",
-        "resources\clash-meta.exe",
-        "service\mihomo.exe"
-    )
-    foreach ($relative in $relativeCandidates) {
-        $candidate = Join-Path $Root $relative
         if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
     }
     return $null
 }
 
 function Test-MihomoCandidate([string]$CorePath, [string]$Text, [string]$Directory) {
-    if ([string]::IsNullOrWhiteSpace($CorePath)) { return }
-    if ($Text -notmatch '(?m)^\s*(?:proxy-groups|proxies|proxy-providers)\s*:') { return }
+    Test-MihomoVersion $CorePath | Out-Null
     $temporary = Join-Path $Directory (".clash-patch-validate-" + [System.IO.Path]::GetRandomFileName() + ".yaml")
     try {
         [System.IO.File]::WriteAllText($temporary, $Text, (New-Object System.Text.UTF8Encoding($false)))
@@ -258,13 +339,50 @@ function Test-MihomoCandidate([string]$CorePath, [string]$Text, [string]$Directo
 }
 
 function Restore-Transaction([object[]]$Targets) {
+    $failures = @()
     for ($i = $Targets.Count - 1; $i -ge 0; $i--) {
         $target = $Targets[$i]
-        if ($target.Existed) {
-            Write-Utf8Atomic $target.Path $target.Original
-        } elseif (Test-Path -LiteralPath $target.Path) {
-            Remove-Item -LiteralPath $target.Path -Force
+        try {
+            if ($target.Existed) {
+                Write-BytesAtomic $target.Path $target.OriginalBytes
+            } elseif (Test-Path -LiteralPath $target.Path) {
+                Remove-Item -LiteralPath $target.Path -Force
+            }
+        } catch {
+            $failures += "$($target.Path)：$($_.Exception.Message)"
         }
+    }
+    if ($failures.Count -gt 0) { throw ("回滚未能恢复所有文件：" + ($failures -join "；")) }
+}
+
+function Get-InstallStateEntry([object]$State, [string]$Name) {
+    if ($null -eq $State) { return $null }
+    $property = $State.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Assert-StateTargetUnchanged([object]$Entry, [string]$Path, [string]$Label) {
+    if ($null -eq $Entry) { return }
+    $expected = [string]$Entry.InstalledSha256
+    $actual = Get-FileSha256 $Path
+    if ($actual -ne $expected) {
+        throw "$Label 在上次安装后被其他程序修改。为避免覆盖这些改动，请先卸载补丁或备份并手动处理该文件。"
+    }
+}
+
+function New-InstallStateEntry([object]$Previous, [string]$Path, [byte[]]$InstalledBytes) {
+    if ($null -ne $Previous) {
+        $existed = [bool]$Previous.Existed
+        $originalBase64 = [string]$Previous.OriginalBase64
+    } else {
+        $existed = Test-Path -LiteralPath $Path -PathType Leaf
+        $originalBase64 = if ($existed) { [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($Path)) } else { "" }
+    }
+    return [ordered]@{
+        Existed = $existed
+        OriginalBase64 = $originalBase64
+        InstalledSha256 = (Get-BytesSha256 $InstalledBytes)
     }
 }
 
@@ -322,6 +440,7 @@ if ([string]::IsNullOrWhiteSpace($AppHome) -or -not (Test-Path -LiteralPath $App
 $profilesDirectory = Join-Path $AppHome "profiles"
 $vergePath = Join-Path $AppHome "verge.yaml"
 $configPath = Join-Path $AppHome "config.yaml"
+$statePath = Join-Path $AppHome "clash-patch-install-state.json"
 $targetScript = Join-Path $profilesDirectory "Script.js"
 $enginePath = Join-Path (Join-Path $PSScriptRoot "windows") "clash_verge_global.js"
 
@@ -330,9 +449,26 @@ if (-not (Test-Path -LiteralPath $enginePath -PathType Leaf)) {
     exit 3
 }
 
-New-Item -ItemType Directory -Path $profilesDirectory -Force | Out-Null
-
 try {
+    if (Test-ClashVergeRunning) {
+        throw "Clash Verge Rev 仍在运行。请先从托盘菜单完全退出客户端，再重新安装。"
+    }
+    $corePath = Find-MihomoCore $MihomoPath
+    Test-MihomoVersion $corePath | Out-Null
+
+    $installState = $null
+    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+        $installState = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($null -eq $installState -or [int]$installState.Version -ne 1) {
+            throw "安装状态文件无效。为避免覆盖原始设置，安装已停止。"
+        }
+    }
+    $previousVerge = Get-InstallStateEntry $installState "VergeYaml"
+    $previousConfig = Get-InstallStateEntry $installState "ConfigYaml"
+    Assert-StateTargetUnchanged $previousVerge $vergePath "verge.yaml"
+    Assert-StateTargetUnchanged $previousConfig $configPath "config.yaml"
+
+    New-Item -ItemType Directory -Path $profilesDirectory -Force | Out-Null
     $scriptOutput = Build-GlobalScript $enginePath $targetScript
     $vergeInput = if (Test-Path -LiteralPath $vergePath) { Get-Content -LiteralPath $vergePath -Raw -Encoding UTF8 } else { "" }
     $vergeOutput = Set-YamlTopLevelScalar $vergeInput "enable_tun_mode" "true"
@@ -343,19 +479,30 @@ try {
 
     Test-GeneratedYaml $vergeOutput "verge.yaml" | Out-Null
     Test-GeneratedYaml $configOutput "config.yaml" | Out-Null
-    $corePath = Find-MihomoCore $AppHome
     Test-MihomoCandidate $corePath $configOutput $AppHome
 
+    $scriptBytes = ConvertTo-Utf8Bytes $scriptOutput
+    $vergeBytes = ConvertTo-Utf8Bytes $vergeOutput
+    $configBytes = ConvertTo-Utf8Bytes $configOutput
+    $stateObject = [ordered]@{
+        Version = 1
+        VergeYaml = (New-InstallStateEntry $previousVerge $vergePath $vergeBytes)
+        ConfigYaml = (New-InstallStateEntry $previousConfig $configPath $configBytes)
+    }
+    $stateBytes = ConvertTo-Utf8Bytes (($stateObject | ConvertTo-Json -Depth 5) + "`r`n")
+
     $targets = @(
-        [pscustomobject]@{ Path = $targetScript; Content = $scriptOutput; Existed = (Test-Path -LiteralPath $targetScript); Original = $(if (Test-Path -LiteralPath $targetScript) { Get-Content -LiteralPath $targetScript -Raw -Encoding UTF8 } else { "" }) },
-        [pscustomobject]@{ Path = $vergePath; Content = $vergeOutput; Existed = (Test-Path -LiteralPath $vergePath); Original = $vergeInput },
-        [pscustomobject]@{ Path = $configPath; Content = $configOutput; Existed = (Test-Path -LiteralPath $configPath); Original = $configInput }
+        [pscustomobject]@{ Path = $targetScript; Bytes = $scriptBytes; Existed = (Test-Path -LiteralPath $targetScript); OriginalBytes = $(if (Test-Path -LiteralPath $targetScript) { [System.IO.File]::ReadAllBytes($targetScript) } else { $null }) },
+        [pscustomobject]@{ Path = $vergePath; Bytes = $vergeBytes; Existed = (Test-Path -LiteralPath $vergePath); OriginalBytes = $(if (Test-Path -LiteralPath $vergePath) { [System.IO.File]::ReadAllBytes($vergePath) } else { $null }) },
+        [pscustomobject]@{ Path = $configPath; Bytes = $configBytes; Existed = (Test-Path -LiteralPath $configPath); OriginalBytes = $(if (Test-Path -LiteralPath $configPath) { [System.IO.File]::ReadAllBytes($configPath) } else { $null }) },
+        [pscustomobject]@{ Path = $statePath; Bytes = $stateBytes; Existed = (Test-Path -LiteralPath $statePath); OriginalBytes = $(if (Test-Path -LiteralPath $statePath) { [System.IO.File]::ReadAllBytes($statePath) } else { $null }) }
     )
     foreach ($target in $targets) { Backup-Once $target.Path }
 
     try {
+        if (Test-ClashVergeRunning) { throw "Clash Verge Rev 在安装期间启动，文件没有被修改。" }
         foreach ($target in $targets) {
-            Write-Utf8Atomic $target.Path $target.Content
+            Write-BytesAtomic $target.Path $target.Bytes
         }
     } catch {
         # Restore every target, including the target whose atomic move raised:

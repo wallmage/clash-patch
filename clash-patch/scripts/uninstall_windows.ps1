@@ -1,4 +1,4 @@
-param(
+﻿param(
     [string]$AppHome = ""
 )
 
@@ -8,15 +8,64 @@ function Write-Info([string]$Message) {
     Write-Host "[Clash 补丁] $Message"
 }
 
-function Write-Utf8Atomic([string]$Path, [string]$Content) {
+function Write-BytesAtomic([string]$Path, [byte[]]$Bytes) {
+    if (Test-Path -LiteralPath $Path -PathType Container) { throw "目标路径是目录，不能写入：$Path" }
     $directory = Split-Path -Parent $Path
     $temporary = Join-Path $directory (".clash-patch-uninstall-" + [System.IO.Path]::GetRandomFileName())
     try {
-        [System.IO.File]::WriteAllText($temporary, $Content, (New-Object System.Text.UTF8Encoding($false)))
+        [System.IO.File]::WriteAllBytes($temporary, $Bytes)
         Move-Item -LiteralPath $temporary -Destination $Path -Force
     } finally {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
     }
+}
+
+function Write-Utf8Atomic([string]$Path, [string]$Content) {
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Content)
+    Write-BytesAtomic $Path $bytes
+}
+
+function Get-BytesSha256([byte[]]$Bytes) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-FileSha256([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return "" }
+    return (Get-BytesSha256 ([System.IO.File]::ReadAllBytes($Path)))
+}
+
+function Restore-InstalledSetting([object]$Entry, [string]$Path, [string]$Label) {
+    if ($null -eq $Entry) { return $true }
+    $expected = [string]$Entry.InstalledSha256
+    $current = Get-FileSha256 $Path
+    if ([bool]$Entry.Existed) {
+        $originalBytes = [Convert]::FromBase64String([string]$Entry.OriginalBase64)
+        if ($current -eq (Get-BytesSha256 $originalBytes)) { return $true }
+    } elseif ([string]::IsNullOrEmpty($current)) {
+        return $true
+    }
+    if ($current -ne $expected) {
+        Write-Info "$Label 在安装后有新改动，未自动覆盖；安装状态文件将保留。"
+        return $false
+    }
+    if ([bool]$Entry.Existed) {
+        Write-BytesAtomic $Path $originalBytes
+    } elseif (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Force
+    }
+    return $true
+}
+
+function Test-ClashVergeRunning {
+    foreach ($name in @("clash-verge", "clash-verge-rev", "Clash Verge", "Clash Verge Rev")) {
+        if ($null -ne (Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1)) { return $true }
+    }
+    return $false
 }
 
 if ([string]::IsNullOrWhiteSpace($AppHome)) {
@@ -33,49 +82,79 @@ if ([string]::IsNullOrWhiteSpace($AppHome)) {
 }
 
 $target = Join-Path (Join-Path $AppHome "profiles") "Script.js"
-if (-not (Test-Path -LiteralPath $target -PathType Leaf)) {
-    Write-Info "没有发现已安装的全局自动补丁，无需移除。"
-    exit 0
-}
+$vergePath = Join-Path $AppHome "verge.yaml"
+$configPath = Join-Path $AppHome "config.yaml"
+$statePath = Join-Path $AppHome "clash-patch-install-state.json"
+$state = $null
 
-$begin = "// CLASH PATCH BEGIN"
-$end = "// CLASH PATCH END"
-$current = Get-Content -LiteralPath $target -Raw -Encoding UTF8
-$beginIndex = $current.IndexOf($begin)
-$endIndex = $current.IndexOf($end)
-if ($beginIndex -lt 0 -and $endIndex -lt 0) {
-    Write-Info "Script.js 中没有 Clash 补丁标记，原文件未修改。"
+try {
+    if (Test-ClashVergeRunning) { throw "Clash Verge Rev 仍在运行。请先从托盘菜单完全退出客户端，再重新卸载。" }
+    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+        $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($null -eq $state -or [int]$state.Version -ne 1) { throw "安装状态文件无效，无法安全恢复原始设置。" }
+    }
+
+    $scriptChanged = $false
+    if (Test-Path -LiteralPath $target -PathType Leaf) {
+        $begin = "// CLASH PATCH BEGIN"
+        $end = "// CLASH PATCH END"
+        $current = Get-Content -LiteralPath $target -Raw -Encoding UTF8
+        $beginIndex = $current.IndexOf($begin)
+        $endIndex = $current.IndexOf($end)
+        if ($beginIndex -ge 0 -or $endIndex -ge 0) {
+            if ($beginIndex -lt 0 -or $endIndex -lt $beginIndex -or
+                $current.IndexOf($begin, $beginIndex + $begin.Length) -ge 0 -or
+                $current.IndexOf($end, $endIndex + $end.Length) -ge 0) {
+                throw "Script.js 标记不完整或重复，原文件未修改。"
+            }
+
+            $prefix = $current.Substring(0, $beginIndex).TrimEnd()
+            $suffix = $current.Substring($endIndex + $end.Length).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($prefix)) {
+                $matches = [regex]::Matches($prefix, '(?m)^\s*function\s+clashPatchPreviousMain\s*\(')
+                if ($matches.Count -ne 1) { throw "无法确认原始 main 函数，原文件未修改。" }
+                $prefix = [regex]::Replace($prefix, '(?m)^\s*function\s+clashPatchPreviousMain\s*\(', 'function main(', 1).TrimEnd()
+            }
+            $remaining = @($prefix, $suffix) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+            $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+            Copy-Item -LiteralPath $target -Destination "$target.clash-patch-uninstall.$stamp.backup"
+            if ($remaining.Count -eq 0) {
+                Remove-Item -LiteralPath $target -Force
+            } else {
+                Write-Utf8Atomic $target (($remaining -join "`r`n`r`n") + "`r`n")
+            }
+            $scriptChanged = $true
+        }
+    }
+
+    $settingsRestored = $true
+    if ($null -ne $state) {
+        $settingTargets = @(
+            [pscustomobject]@{ Entry = $state.ConfigYaml; Path = $configPath; Label = "config.yaml" },
+            [pscustomobject]@{ Entry = $state.VergeYaml; Path = $vergePath; Label = "verge.yaml" }
+        )
+        foreach ($settingTarget in $settingTargets) {
+            try {
+                if (-not (Restore-InstalledSetting $settingTarget.Entry $settingTarget.Path $settingTarget.Label)) {
+                    $settingsRestored = $false
+                }
+            } catch {
+                Write-Info "$($settingTarget.Label) 恢复失败：$($_.Exception.Message)"
+                $settingsRestored = $false
+            }
+        }
+        if ($settingsRestored) { Remove-Item -LiteralPath $statePath -Force }
+    }
+
+    if (-not $scriptChanged -and $null -eq $state) {
+        Write-Info "没有发现已安装的自动补丁，无需移除。"
+        exit 0
+    }
+    if (-not $settingsRestored) { throw "部分设置在安装后有新改动，未自动覆盖；请根据保留的安装状态文件手动处理。" }
+
+    Write-Info "全局自动补丁已移除，config.yaml 与 verge.yaml 已恢复到安装前状态。现有备份没有删除。"
     exit 0
-}
-if ($beginIndex -lt 0 -or $endIndex -lt $beginIndex -or
-    $current.IndexOf($begin, $beginIndex + $begin.Length) -ge 0 -or
-    $current.IndexOf($end, $endIndex + $end.Length) -ge 0) {
-    [Console]::Error.WriteLine("[Clash 补丁] Script.js 标记不完整或重复，已停止，原文件未修改。")
+} catch {
+    [Console]::Error.WriteLine("[Clash 补丁] 卸载失败：$($_.Exception.Message)")
     exit 1
 }
-
-$stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-Copy-Item -LiteralPath $target -Destination "$target.clash-patch-uninstall.$stamp.backup"
-$prefix = $current.Substring(0, $beginIndex).TrimEnd()
-$suffixStart = $endIndex + $end.Length
-$suffix = $current.Substring($suffixStart).Trim()
-
-if (-not [string]::IsNullOrWhiteSpace($prefix)) {
-    $matches = [regex]::Matches($prefix, '(?m)^\s*function\s+clashPatchPreviousMain\s*\(')
-    if ($matches.Count -ne 1) {
-        [Console]::Error.WriteLine("[Clash 补丁] 无法确认原始 main 函数，已停止，原文件未修改。")
-        exit 1
-    }
-    $prefix = [regex]::Replace($prefix, '(?m)^\s*function\s+clashPatchPreviousMain\s*\(', 'function main(', 1).TrimEnd()
-}
-
-$remaining = @($prefix, $suffix) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-if ($remaining.Count -eq 0) {
-    Remove-Item -LiteralPath $target -Force
-} else {
-    Write-Utf8Atomic $target (($remaining -join "`r`n`r`n") + "`r`n")
-}
-
-Write-Info "全局自动补丁已移除。现有备份没有删除。"
-Write-Info "已经写入 config.yaml 的 TUN 设置不会自动撤销。"
-exit 0

@@ -68,7 +68,6 @@
     "DOMAIN,openaicom-api-bdcpf8c6d2e9atf6.z01.azurefd.net,{AI}",
     "DOMAIN,openaicomproductionae4b.blob.core.windows.net,{AI}",
     "DOMAIN,production-openaicom-storage.azureedge.net,{AI}",
-    "DOMAIN-SUFFIX,ai.com,{AI}",
     "DOMAIN,ai.google.dev,{AI}",
     "DOMAIN-SUFFIX,aistudio.google.com,{AI}",
     "DOMAIN-SUFFIX,gemini.google.com,{AI}",
@@ -82,7 +81,7 @@
     "DOMAIN,aiplatform.googleapis.com,{AI}",
     "DOMAIN-SUFFIX,generativeai.google,{AI}",
     "DOMAIN-KEYWORD,openai,{AI}",
-    "IP-CIDR,160.79.104.0/21,{AI},no-resolve",
+    "IP-CIDR,160.79.104.0/23,{AI},no-resolve",
     "IP-CIDR6,2607:6bc0::/48,{AI},no-resolve"
   ]
 }

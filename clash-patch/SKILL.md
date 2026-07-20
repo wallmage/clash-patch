@@ -24,7 +24,9 @@ description: Use when an agent needs to inspect, repair, or persist DNS, WebRTC,
 | macOS 旧版 ClashX | 不修改；建议安装最新版 ClashX Meta |
 | Windows 旧版或其他客户端 | 不修改；建议安装最新版 Clash Verge Rev |
 
-4. 安装程序必须处理所有订阅，而不是只处理当前订阅。macOS 同时检查本地与 ClashX Meta 的 iCloud 目录。
+客户端必须使用 Mihomo 1.19.27 或更高版本；找不到内核、版本过旧或无法确认版本时停止，不修改配置。
+
+4. macOS 安装程序必须处理所有订阅，而不是只处理当前订阅，并同时检查本地与 ClashX Meta 的 iCloud 目录。Windows 由全局脚本在每份订阅加载或刷新时处理，安装当下不应声称所有订阅已经处理。
 5. 检查安装结果和持久化机制。macOS 必须确认 LaunchAgent 已加载，并从运行内核读取 TUN 状态；只有明确读到关闭时才能调用 AppleScript 切换，状态未知时不得切换。无法确认开启就写成“等待用户开启”。Windows 必须确认全局扩展脚本已安装。
 6. 只有当前配置重新加载成功，而且 macOS 已通过控制器确认 AI 节点选择时，才能说相应设置已经生效。否则如实写成等待重新加载。
 7. 当前配置生效后再做浏览器验证。
@@ -40,8 +42,10 @@ bash scripts/install_macos.sh
 在 Windows PowerShell 中，从技能目录运行：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_windows.ps1
+.\scripts\install_windows.cmd
 ```
+
+运行 Windows 安装或卸载程序前，先确认 Clash Verge Rev 已从托盘完全退出。
 
 修改用户目录需要工具授权时，先用中文说明用途，再请求授权。不要绕过操作系统权限。
 
@@ -61,7 +65,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_window
 
 ## 安全出口
 
-补丁会另外创建一个不含 `DIRECT`、`REJECT`、`PASS` 或兼容出口的安全代理组。DNS 只使用带这个组标签的 DoH。通用 UDP 先交给安全代理组，紧接一条 `NETWORK,UDP,REJECT`；代理不支持 UDP 时必须停止，不能继续匹配后面的直连规则。
+补丁会另外创建一个不含 `DIRECT`、`REJECT`、`PASS`、`COMPATIBLE`、`REMATCH` 或同类出口的安全代理组。DNS 只使用带这个组标签的加密解析器。通用 UDP 先交给安全代理组，紧接一条 `NETWORK,UDP,REJECT`；代理不支持 UDP 时必须停止，不能继续匹配后面的直连规则。
 
 ## 移除持久化
 
@@ -74,10 +78,10 @@ bash scripts/uninstall_macos.sh
 或：
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\uninstall_windows.ps1
+.\scripts\uninstall_windows.cmd
 ```
 
-卸载只移除自动运行机制，不删除备份，不擅自还原已经修改的订阅。
+卸载不删除备份。macOS 会恢复安装前的 TUN 启动偏好，但不改回订阅内容；Windows 只在 `config.yaml` 与 `verge.yaml` 没有安装后新改动时恢复原始字节，检测到新改动就保留文件并提示。
 
 ## 自动验证
 

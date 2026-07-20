@@ -8,6 +8,8 @@ $root = Split-Path -Parent $PSScriptRoot
 $installer = Join-Path (Join-Path $root "clash-patch/scripts") "install_windows.ps1"
 $uninstaller = Join-Path (Join-Path $root "clash-patch/scripts") "uninstall_windows.ps1"
 $sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("clash-patch-windows-test-" + [System.Guid]::NewGuid().ToString("N"))
+$onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+$fakeCore = Join-Path $sandbox $(if ($onWindows) { "mihomo-test.cmd" } else { "mihomo-test.sh" })
 
 $tokens = $null
 $parseErrors = $null
@@ -22,7 +24,7 @@ function Assert-True([bool]$Condition, [string]$Message) {
 }
 
 function Invoke-Installer([string]$AppHome) {
-    $output = & $PowerShellPath -NoLogo -NoProfile -File $installer -AppHome $AppHome 2>&1 | Out-String
+    $output = & $PowerShellPath -NoLogo -NoProfile -File $installer -AppHome $AppHome -MihomoPath $fakeCore 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) { throw "Windows installer returned $LASTEXITCODE`n$output" }
 }
 
@@ -33,6 +35,13 @@ function Invoke-Uninstaller([string]$AppHome) {
 
 try {
     New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
+    if ($onWindows) {
+        $fakeCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nexit /b 0`r`n"
+    } else {
+        $fakeCoreText = "#!/bin/sh`nif [ `"`${1:-}`" = `"-v`" ]; then`n  echo 'Mihomo Meta v1.19.27 test arm64'`nfi`nexit 0`n"
+    }
+    [System.IO.File]::WriteAllText($fakeCore, $fakeCoreText, [System.Text.Encoding]::ASCII)
+    if (-not $onWindows) { & /bin/chmod 700 $fakeCore }
 
     $unitStage = Set-YamlTopLevelScalar "ipv6 : true`ntun: null`n" "ipv6" "false"
     Assert-True ($unitStage -match '(?m)^tun:') "scalar transform lost tun node: $($unitStage | ConvertTo-Json -Compress)"
@@ -54,19 +63,50 @@ try {
     Assert-True ([regex]::Matches($quotedOutput, '(?m)^["'']?tun["'']?\s*:').Count -eq 1) "quoted tun key was duplicated"
     Assert-True ([regex]::Matches($quotedOutput, '(?m)^["'']?ipv6["'']?\s*:').Count -eq 1) "quoted ipv6 key was duplicated"
 
+    $commented = Set-YamlTopLevelScalar "ipv6: true # keep this note`n" "ipv6" "false"
+    Assert-True ($commented.Contains("# keep this note")) "top-level scalar edit discarded an inline comment"
+    $anchorRejected = $false
+    try { Set-YamlTunMapping "tun: &defaults`n  enable: false`n" | Out-Null } catch { $anchorRejected = $true }
+    Assert-True $anchorRejected "anchored tun mapping was modified instead of rejected"
+
+    Assert-True (Test-MihomoVersionText "Mihomo Meta v1.19.27") "minimum Mihomo version was rejected"
+    Assert-True (-not (Test-MihomoVersionText "Mihomo Meta v1.19.26")) "old Mihomo version was accepted"
+
+    $backupSource = Join-Path $sandbox "backup-source.txt"
+    $backupBytes = [byte[]](0xEF, 0xBB, 0xBF, 0x66, 0x69, 0x72, 0x73, 0x74)
+    [System.IO.File]::WriteAllBytes($backupSource, $backupBytes)
+    Backup-Once $backupSource
+    [System.IO.File]::WriteAllText($backupSource, "second")
+    Backup-Once $backupSource
+    $savedBackup = [System.IO.File]::ReadAllBytes("$backupSource.clash-patch.original.backup")
+    Assert-True (([Convert]::ToBase64String($savedBackup)) -eq ([Convert]::ToBase64String($backupBytes))) "exclusive backup was overwritten"
+
     $transactionDir = Join-Path $sandbox "transaction"
     New-Item -ItemType Directory -Path $transactionDir -Force | Out-Null
     $existingPath = Join-Path $transactionDir "existing.txt"
     $newPath = Join-Path $transactionDir "new.txt"
-    [System.IO.File]::WriteAllText($existingPath, "original")
+    $originalBytes = [byte[]](0xEF, 0xBB, 0xBF, 0x6F, 0x72, 0x69, 0x67, 0x69, 0x6E, 0x61, 0x6C)
+    [System.IO.File]::WriteAllBytes($existingPath, $originalBytes)
     [System.IO.File]::WriteAllText($existingPath, "changed")
     [System.IO.File]::WriteAllText($newPath, "created")
     Restore-Transaction @(
-        [pscustomobject]@{ Path = $existingPath; Existed = $true; Original = "original" },
-        [pscustomobject]@{ Path = $newPath; Existed = $false; Original = "" }
+        [pscustomobject]@{ Path = $existingPath; Existed = $true; OriginalBytes = $originalBytes },
+        [pscustomobject]@{ Path = $newPath; Existed = $false; OriginalBytes = $null }
     )
-    Assert-True ((Get-Content -LiteralPath $existingPath -Raw) -eq "original") "transaction did not restore original content"
+    Assert-True (([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($existingPath))) -eq ([Convert]::ToBase64String($originalBytes))) "transaction did not restore exact original bytes"
     Assert-True (-not (Test-Path -LiteralPath $newPath)) "transaction did not remove newly created file"
+
+    $continuePath = Join-Path $transactionDir "continue.txt"
+    [System.IO.File]::WriteAllText($continuePath, "changed")
+    $restoreFailed = $false
+    try {
+        Restore-Transaction @(
+            [pscustomobject]@{ Path = $continuePath; Existed = $true; OriginalBytes = [System.Text.Encoding]::UTF8.GetBytes("restored") },
+            [pscustomobject]@{ Path = $transactionDir; Existed = $true; OriginalBytes = [byte[]](1, 2, 3) }
+        )
+    } catch { $restoreFailed = $true }
+    Assert-True $restoreFailed "rollback did not report a restore failure"
+    Assert-True ((Get-Content -LiteralPath $continuePath -Raw) -eq "restored") "rollback stopped before restoring earlier targets"
 
     $nullCase = Join-Path $sandbox "null-case"
     New-Item -ItemType Directory -Path $nullCase -Force | Out-Null
@@ -93,8 +133,10 @@ try {
     $composeCase = Join-Path $sandbox "compose-case"
     $composeProfiles = Join-Path $composeCase "profiles"
     New-Item -ItemType Directory -Path $composeProfiles -Force | Out-Null
-    [System.IO.File]::WriteAllText((Join-Path $composeCase "config.yaml"), "ipv6: true`ntun: null`n")
-    [System.IO.File]::WriteAllText((Join-Path $composeCase "verge.yaml"), "enable_tun_mode: false`n")
+    $composeConfigOriginal = "ipv6: true`ntun: null`n"
+    $composeVergeOriginal = "enable_tun_mode: false`nenable_dns_settings: true`n"
+    [System.IO.File]::WriteAllText((Join-Path $composeCase "config.yaml"), $composeConfigOriginal)
+    [System.IO.File]::WriteAllText((Join-Path $composeCase "verge.yaml"), $composeVergeOriginal)
     $originalScript = "function main(config) { config.friend = true; return config; }`n"
     [System.IO.File]::WriteAllText((Join-Path $composeProfiles "Script.js"), $originalScript)
     Invoke-Installer $composeCase
@@ -107,6 +149,8 @@ try {
     $restoredScript = Get-Content -LiteralPath (Join-Path $composeProfiles "Script.js") -Raw
     Assert-True ($restoredScript.Contains($originalScript.Trim())) "uninstaller did not restore the composed script"
     Assert-True ($restoredScript.Contains("const friendAfterPatch = true;")) "uninstaller discarded code after the managed block"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $composeCase "config.yaml") -Raw) -eq $composeConfigOriginal) "uninstaller did not restore config.yaml"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $composeCase "verge.yaml") -Raw) -eq $composeVergeOriginal) "uninstaller did not restore verge.yaml"
 
     $badMarkerCase = Join-Path $sandbox "bad-marker-case"
     $badMarkerProfiles = Join-Path $badMarkerCase "profiles"

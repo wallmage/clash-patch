@@ -14,8 +14,10 @@ class SkillContractTest < Minitest::Test
     clash-patch/references/policy.json
     clash-patch/scripts/install_macos.sh
     clash-patch/scripts/install_windows.ps1
+    clash-patch/scripts/install_windows.cmd
     clash-patch/scripts/uninstall_macos.sh
     clash-patch/scripts/uninstall_windows.ps1
+    clash-patch/scripts/uninstall_windows.cmd
     clash-patch/scripts/macos/patch_profiles.rb
     clash-patch/scripts/windows/clash_verge_global.js
     .github/workflows/test.yml
@@ -118,7 +120,8 @@ class SkillContractTest < Minitest::Test
     assert_includes source, "RunAtLoad"
     assert_includes source, "WatchPaths"
     refute_includes source, "KeepAlive"
-    assert_includes source, "~/.config/clash.meta"
+    patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
+    assert_includes patcher, 'File.join(home, ".config", "clash.meta")'
     assert_includes source, "launchctl"
     assert_match(/[\p{Han}]/, source)
     assert_includes source, "plutil"
@@ -129,6 +132,42 @@ class SkillContractTest < Minitest::Test
     assert_includes source, "osascript"
     assert_includes source, "--print-tun-state"
     refute_includes source, "read_tun_enabled"
+  end
+
+  def test_installers_preflight_and_uninstallers_restore_owned_settings
+    mac_install = File.read(File.join(SKILL, "scripts/install_macos.sh"))
+    mac_uninstall = File.read(File.join(SKILL, "scripts/uninstall_macos.sh"))
+    windows_install = File.binread(File.join(SKILL, "scripts/install_windows.ps1"))
+    windows_uninstall = File.binread(File.join(SKILL, "scripts/uninstall_windows.ps1"))
+    patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
+
+    assert_operator mac_install.index('id -u'), :<, mac_install.index('/bin/mkdir -p')
+    assert_operator mac_install.index('--print-core-status'), :<, mac_install.index('/bin/mkdir -p')
+    assert_operator mac_install.index('plutil -extract Label'), :<, mac_install.index('plutil -create')
+    assert_includes mac_install, "install-state.plist"
+    assert_includes mac_uninstall, "restoreTunProxy"
+    assert_includes mac_uninstall, "RestoreTunPresent"
+    assert_includes patcher, "File::EXCL"
+
+    assert_equal "\xEF\xBB\xBF".b, windows_install.byteslice(0, 3)
+    assert_equal "\xEF\xBB\xBF".b, windows_uninstall.byteslice(0, 3)
+    assert_includes windows_install.force_encoding("UTF-8"), "MihomoPath"
+    assert_includes windows_install, "Test-MihomoVersion"
+    assert_includes windows_install, "OriginalBytes"
+    assert_includes windows_install, "install-state.json"
+    assert_includes windows_uninstall, "InstalledSha256"
+  end
+
+  def test_ci_covers_production_runtimes_and_pins_actions
+    workflow = File.read(File.join(ROOT, ".github/workflows/test.yml"))
+    uses = workflow.scan(/^\s*- uses:\s*(\S+)/).flatten
+
+    refute_empty uses
+    uses.each { |entry| assert_match(/@[0-9a-f]{40}\z/, entry, entry) }
+    assert_includes workflow, "runs-on: macos-15"
+    assert_includes workflow, "/usr/bin/ruby tests/test_macos_patcher.rb"
+    assert_includes workflow, "shell: powershell"
+    assert_includes workflow, "Get-Command powershell.exe"
   end
 
   def test_license_is_mit

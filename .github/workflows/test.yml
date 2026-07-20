@@ -12,11 +12,11 @@ jobs:
   ruby-and-node:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: ruby/setup-ruby@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ruby/setup-ruby@003a5c4d8d6321bd302e38f6f0ec593f77f06600 # v1.319.0
         with:
           ruby-version: "3.3"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "22"
       - name: Ruby regression suite
@@ -34,10 +34,26 @@ jobs:
           sh -n clash-patch/scripts/install_macos.sh
           sh -n clash-patch/scripts/uninstall_macos.sh
 
-  windows-installer:
-    runs-on: windows-latest
+  macos-system-ruby:
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - name: PowerShell installer and uninstaller regressions
-        shell: pwsh
-        run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command pwsh).Source
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Confirm the supported system Ruby
+        run: /usr/bin/ruby -e 'abort "expected Ruby 2.6" unless RUBY_VERSION.start_with?("2.6.")'
+      - name: Ruby regressions on the production runtime
+        run: /usr/bin/ruby tests/test_macos_patcher.rb
+      - name: Contract regressions on the production runtime
+        run: /usr/bin/ruby tests/test_skill_contract.rb
+      - name: macOS syntax checks
+        run: |
+          /usr/bin/ruby -c clash-patch/scripts/macos/patch_profiles.rb
+          sh -n clash-patch/scripts/install_macos.sh
+          sh -n clash-patch/scripts/uninstall_macos.sh
+
+  windows-installer:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: PowerShell 5.1 installer and uninstaller regressions
+        shell: powershell
+        run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command powershell.exe).Source

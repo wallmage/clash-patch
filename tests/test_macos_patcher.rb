@@ -1,5 +1,6 @@
 require "json"
 require "minitest/autorun"
+require "socket"
 require "tmpdir"
 require "yaml"
 
@@ -20,6 +21,19 @@ class MacosPatcherTest < Minitest::Test
   def test_patcher_files_exist
     assert File.file?(PATCHER_PATH), "macOS patcher is missing"
     assert File.file?(POLICY_PATH), "canonical policy is missing"
+  end
+
+  def test_unknown_policy_version_is_rejected_without_mutating_config
+    config = base_config
+    snapshot = Marshal.load(Marshal.dump(config))
+    policy = Marshal.load(Marshal.dump(@policy))
+    policy["version"] = 2
+
+    result = ClashPatch.patch(config, policy)
+
+    assert_equal :invalid_policy, result.fetch(:status)
+    assert_equal snapshot, config
+    assert_equal snapshot, result.fetch(:config)
   end
 
   def test_applies_dns_tun_ai_and_webrtc_policy
@@ -43,8 +57,8 @@ class MacosPatcherTest < Minitest::Test
     assert_includes patched.fetch("rules"), udp
     assert_equal "NETWORK,UDP,REJECT", patched.fetch("rules")[patched.fetch("rules").index(udp) + 1]
     assert_operator patched.fetch("rules").index(udp), :<, patched.fetch("rules").index("GEOSITE,CN,DIRECT")
-    refute patched.fetch("rules").any? { |rule| rule == "DOMAIN,raw.githubusercontent.com,AI" }
-    refute patched.fetch("rules").any? { |rule| rule == "DOMAIN,storage.googleapis.com,AI" }
+    assert_includes patched.fetch("rules"), "DOMAIN,raw.githubusercontent.com,AI"
+    assert_includes patched.fetch("rules"), "DOMAIN,storage.googleapis.com,AI"
   end
 
   def test_prefers_japan_when_taiwan_home_is_absent
@@ -76,15 +90,64 @@ class MacosPatcherTest < Minitest::Test
     assert_equal original, after
   end
 
-  def test_places_generic_udp_after_narrow_rule_set
+  def test_places_udp_guard_before_narrow_rule_set
     config = base_config
     config["rules"].insert(2, "RULE-SET,private-special,DIRECT")
     rules = ClashPatch.patch(config, @policy).fetch(:config).fetch("rules")
 
     udp_index = rules.index { |rule| rule.start_with?("NETWORK,UDP,") && rule != "NETWORK,UDP,REJECT" }
-    assert_operator rules.index("RULE-SET,private-special,DIRECT"), :<, udp_index
+    assert_equal 0, udp_index
     assert_equal "NETWORK,UDP,REJECT", rules[udp_index + 1]
     assert_operator udp_index, :<, rules.index("GEOSITE,CN,DIRECT")
+    assert_operator udp_index, :<, rules.index("RULE-SET,private-special,DIRECT")
+  end
+
+  def test_preserves_user_ai_target_ahead_of_managed_rule
+    config = base_config
+    config["proxy-groups"] << { "name" => "MyGroup", "type" => "select", "proxies" => ["台湾家宽 01"] }
+    user_rule = "DOMAIN-SUFFIX,openai.com,MyGroup"
+    config["rules"].insert(0, user_rule)
+
+    result = ClashPatch.patch(config, @policy)
+    rules = result.fetch(:config).fetch("rules")
+    managed_rule = "DOMAIN-SUFFIX,openai.com,#{result.fetch(:ai_group)}"
+
+    assert_equal 1, rules.count(user_rule)
+    assert_operator rules.index(user_rule), :<, rules.index(managed_rule)
+  end
+
+  def test_udp_guard_precedes_leaking_rules_without_deleting_them
+    config = base_config
+    user_rules = [
+      "NETWORK,udp,DIRECT",
+      "NETWORK, UDP, DIRECT",
+      "DST-PORT,3478,DIRECT",
+      "PROCESS-NAME,chrome,DIRECT"
+    ]
+    config["rules"] = user_rules + config.fetch("rules")
+
+    result = ClashPatch.patch(config, @policy)
+    rules = result.fetch(:config).fetch("rules")
+    guard = "NETWORK,UDP,#{result.fetch(:safe_group)}"
+
+    assert_equal 0, rules.index(guard)
+    assert_equal "NETWORK,UDP,REJECT", rules[1]
+    user_rules.each do |rule|
+      assert_includes rules, rule
+      assert_operator rules.index(guard), :<, rules.index(rule)
+    end
+  end
+
+  def test_managed_ai_rules_precede_every_rule_set
+    config = base_config
+    config["rules"] = ["RULE-SET,gfw,DIRECT", "RULE-SET,geolocation-!cn,Main", "MATCH,Main"]
+
+    result = ClashPatch.patch(config, @policy)
+    rules = result.fetch(:config).fetch("rules")
+    managed = "DOMAIN-SUFFIX,openai.com,#{result.fetch(:ai_group)}"
+
+    assert_operator rules.index(managed), :<, rules.index("RULE-SET,gfw,DIRECT")
+    assert_operator rules.index(managed), :<, rules.index("RULE-SET,geolocation-!cn,Main")
   end
 
   def test_is_idempotent
@@ -165,17 +228,131 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_refresh_during_validation_is_reloaded_before_write
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      backup_root = File.join(directory, "backups")
+      File.write(profile, YAML.dump(base_config))
+      calls = 0
+      validator = lambda do |_candidate|
+        calls += 1
+        if calls == 1
+          refreshed = base_config
+          refreshed["friend-marker"] = "new subscription content"
+          File.write(profile, YAML.dump(refreshed))
+        end
+        true
+      end
+
+      result = ClashPatch.patch_path(profile, @policy, backup_root: backup_root, validator: validator)
+      written = ClashPatch.load_yaml(File.read(profile))
+      backup = ClashPatch.load_yaml(File.read(Dir.glob(File.join(backup_root, "*.backup")).fetch(0)))
+
+      assert_equal :updated, result.fetch(:status)
+      assert_equal "new subscription content", written.fetch("friend-marker")
+      assert_equal "new subscription content", backup.fetch("friend-marker")
+      assert_operator calls, :>=, 2
+    end
+  end
+
+  def test_repeated_refreshes_leave_latest_subscription_untouched
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
+      calls = 0
+      validator = lambda do |_candidate|
+        calls += 1
+        refreshed = base_config
+        refreshed["friend-marker"] = "refresh-#{calls}"
+        File.write(profile, YAML.dump(refreshed))
+        true
+      end
+
+      result = ClashPatch.patch_path(profile, @policy, validator: validator)
+      latest = ClashPatch.load_yaml(File.read(profile))
+
+      assert_equal :concurrent_change, result.fetch(:status)
+      assert_equal "refresh-#{calls}", latest.fetch("friend-marker")
+      refute latest.key?("ipv6")
+    end
+  end
+
+  def test_refresh_while_backup_is_created_is_not_overwritten
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      backup_root = File.join(directory, "backups")
+      File.write(profile, YAML.dump(base_config))
+      refreshed = base_config
+      refreshed["friend-marker"] = "refresh-during-backup"
+      original_backup = ClashPatch.method(:backup_once)
+      injected = false
+      backup_with_refresh = lambda do |path, root, content: nil|
+        original_backup.call(path, root, content: content)
+        next if injected
+
+        injected = true
+        File.write(profile, YAML.dump(refreshed))
+      end
+
+      result = ClashPatch.stub(:backup_once, backup_with_refresh) do
+        ClashPatch.patch_path(profile, @policy, backup_root: backup_root, validator: ->(_candidate) { true })
+      end
+      written = ClashPatch.load_yaml(File.read(profile))
+
+      assert_equal :updated, result.fetch(:status)
+      assert_equal "refresh-during-backup", written.fetch("friend-marker")
+      assert_equal false, written.fetch("ipv6")
+    end
+  end
+
   def test_profile_scan_excludes_runtime_and_backup_files
     Dir.mktmpdir do |directory|
       File.write(File.join(directory, "friend.yaml"), "rules: []\n")
       File.write(File.join(directory, "config.yaml"), "rules: []\n")
       File.write(File.join(directory, "UPPER.YML"), "rules: []\n")
       File.write(File.join(directory, "friend.yaml.backup"), "rules: []\n")
+      File.write(File.join(directory, "friend.backup.yaml"), "rules: []\n")
+      File.write(File.join(directory, "friend.bak.yml"), "rules: []\n")
+      File.write(File.join(directory, "friend.clash-patch.yaml"), "rules: []\n")
       FileUtils.mkdir_p(File.join(directory, "providers"))
       File.write(File.join(directory, "providers", "cache.yaml"), "rules: []\n")
 
       expected = %w[UPPER.YML config.yaml friend.yaml].map { |name| File.join(directory, name) }
       assert_equal expected, ClashPatch.profile_paths(directory)
+    end
+  end
+
+  def test_multi_document_yaml_is_skipped_without_rewrite
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "multi.yaml")
+      original = YAML.dump(base_config) + "---\nfriend: second-document\n"
+      File.write(profile, original)
+
+      result = ClashPatch.patch_path(profile, @policy)
+
+      assert_equal :invalid, result.fetch(:status)
+      assert_equal original, File.read(profile)
+    end
+  end
+
+  def test_yaml_alias_cycle_is_skipped_without_crashing_run
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "cycle.yaml")
+      original = <<~YAML
+        proxies:
+          - { name: node, type: ss, server: example.com }
+        proxy-groups:
+          - { name: Main, type: select, proxies: [node] }
+        rules: [MATCH,Main]
+        cycle: &cycle
+          self: *cycle
+      YAML
+      File.write(profile, original)
+
+      result = ClashPatch.patch_path(profile, @policy)
+
+      assert_equal :invalid, result.fetch(:status)
+      assert_equal original, File.read(profile)
     end
   end
 
@@ -375,6 +552,22 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_status_labels_remove_terminal_controls_and_secret_shapes
+    result = {
+      path: "/profiles/\e[31m11111111-2222-3333-4444-555555555555.yaml",
+      status: :updated,
+      active: false,
+      selected_home: "node\e]0;owned\a password=secret-value 11111111-2222-3333-4444-555555555555"
+    }
+
+    output = ClashPatch.chinese_status(result)
+
+    refute_includes output, "\e"
+    refute_includes output, "\a"
+    refute_includes output, "11111111-2222-3333-4444-555555555555"
+    refute_includes output, "secret-value"
+  end
+
   def test_backup_directory_and_files_use_private_permissions
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
@@ -452,6 +645,66 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_dns_policy_rejects_plaintext_and_dynamic_group_targets
+    config = base_config
+    config["proxy-providers"] = { "provider1" => { "type" => "http", "url" => "https://example.invalid/sub" } }
+    config["proxy-groups"] << { "name" => "ProviderGroup", "type" => "select", "use" => ["provider1"] }
+    config["proxy-groups"] << {
+      "name" => "IncludeAllGroup", "type" => "select", "include-all" => true,
+      "exclude-type" => "Indirect"
+    }
+    config["dns"]["nameserver-policy"] = {
+      "+.encrypted.example" => ["https://1.1.1.1/dns-query#台湾家宽 01"],
+      "+.plaintext.example" => ["1.1.1.1#台湾家宽 01"],
+      "+.provider.example" => ["https://1.1.1.1/dns-query#ProviderGroup"],
+      "+.include-all.example" => ["https://1.1.1.1/dns-query#IncludeAllGroup"]
+    }
+
+    result = ClashPatch.patch(config, @policy)
+    policies = result.fetch(:config).dig("dns", "nameserver-policy")
+    safe_suffix = "##{result.fetch(:safe_group)}"
+
+    assert_equal ["https://1.1.1.1/dns-query#台湾家宽 01"], policies.fetch("+.encrypted.example")
+    %w[+.plaintext.example +.provider.example +.include-all.example].each do |pattern|
+      assert policies.fetch(pattern).all? { |endpoint| endpoint.end_with?(safe_suffix) }, pattern
+    end
+  end
+
+  def test_null_proxy_providers_do_not_crash_dns_validation
+    config = base_config
+    config["proxy-providers"] = nil
+    config["proxy-groups"] << { "name" => "NullProviderGroup", "type" => "select", "use" => ["missing"] }
+    config["dns"]["nameserver-policy"] = {
+      "+.null-provider.example" => ["https://1.1.1.1/dns-query#NullProviderGroup"]
+    }
+
+    result = ClashPatch.patch(config, @policy)
+
+    assert_equal :updated, result.fetch(:status)
+    assert result.fetch(:config).dig("dns", "nameserver-policy", "+.null-provider.example").all? do |endpoint|
+      endpoint.end_with?("##{result.fetch(:safe_group)}")
+    end
+  end
+
+  def test_direct_and_rematch_home_names_are_never_selected
+    config = base_config
+    config["proxies"].unshift(
+      { "name" => "台湾家宽 DIRECT", "type" => "direct" },
+      { "name" => "台湾家宽 REMATCH", "type" => "rematch", "target-rematch-name" => "again" }
+    )
+    config["proxy-groups"].find { |group| group["name"] == "Main" }["proxies"].unshift(
+      "台湾家宽 DIRECT", "台湾家宽 REMATCH"
+    )
+
+    result = ClashPatch.patch(config, @policy)
+    safe = result.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == result.fetch(:safe_group) }
+
+    assert_equal "台湾家宽 01", result.fetch(:selected_home)
+    refute_includes safe.fetch("proxies"), "台湾家宽 DIRECT"
+    refute_includes safe.fetch("proxies"), "台湾家宽 REMATCH"
+    assert_includes safe.fetch("exclude-type"), "Rematch"
+  end
+
   def test_owned_ai_group_is_single_member_and_collision_safe
     config = base_config
     config["proxy-groups"] << { "name" => "🤖 AI · Clash Patch", "type" => "url-test", "proxies" => ["台湾家宽 01"] }
@@ -463,6 +716,61 @@ class MacosPatcherTest < Minitest::Test
     assert_equal "🤖 AI · Clash Patch 3", result.fetch(:ai_group)
     managed = result.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == result.fetch(:ai_group) }
     assert_equal ["台湾家宽 01"], managed.fetch("proxies")
+  end
+
+  def test_user_owned_branded_select_group_is_preserved
+    config = base_config
+    user_group = {
+      "name" => "🤖 AI · Clash Patch",
+      "type" => "select",
+      "proxies" => ["Main", "日本家宽 01"],
+      "icon" => "https://example.invalid/user-icon.png"
+    }
+    config["proxy-groups"] << user_group
+
+    first = ClashPatch.patch(config, @policy)
+    second = ClashPatch.patch(first.fetch(:config), @policy)
+    preserved = first.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == user_group["name"] }
+
+    assert_equal user_group, preserved
+    assert_equal "🤖 AI · Clash Patch 2", first.fetch(:ai_group)
+    refute second.fetch(:changed)
+  end
+
+  def test_branded_user_group_with_ai_rules_is_not_mistaken_for_patch_ownership
+    config = base_config
+    user_group = {
+      "name" => "🤖 AI · Clash Patch",
+      "type" => "select",
+      "proxies" => ["Main", "日本家宽 01"],
+      "icon" => "https://example.invalid/user-icon.png"
+    }
+    config["proxy-groups"] << user_group
+    config["rules"].unshift(
+      "DOMAIN-SUFFIX,anthropic.com,🤖 AI · Clash Patch",
+      "DOMAIN-SUFFIX,openai.com,🤖 AI · Clash Patch"
+    )
+
+    result = ClashPatch.patch(config, @policy)
+
+    assert_equal user_group, result.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == user_group["name"] }
+    assert_equal "🤖 AI · Clash Patch 2", result.fetch(:ai_group)
+  end
+
+  def test_managed_suffix_ten_is_idempotent
+    config = base_config
+    base = "🤖 AI · Clash Patch"
+    config["proxy-groups"] << { "name" => base, "type" => "select", "proxies" => ["Main"] }
+    (2..9).each do |suffix|
+      config["proxy-groups"] << { "name" => "#{base} #{suffix}", "type" => "select", "proxies" => ["Main"] }
+    end
+
+    first = ClashPatch.patch(config, @policy)
+    second = ClashPatch.patch(first.fetch(:config), @policy)
+
+    assert_equal "#{base} 10", first.fetch(:ai_group)
+    refute second.fetch(:changed)
+    assert_equal first.fetch(:config), second.fetch(:config)
   end
 
   def test_rule_template_inserts_group_name_literally
@@ -510,6 +818,7 @@ class MacosPatcherTest < Minitest::Test
   def test_active_profile_matching_accepts_extension_and_case
     assert ClashPatch.active_profile?("/profiles/Config.YAML", "config.yaml")
     assert ClashPatch.active_profile?("/profiles/config.yaml", "CONFIG")
+    assert ClashPatch.active_profile?("/profiles/config.yaml", "")
     refute ClashPatch.active_profile?("/profiles/other.yaml", "config")
   end
 
@@ -531,6 +840,23 @@ class MacosPatcherTest < Minitest::Test
     expected_path = "/proxies/%F0%9F%A4%96%20AI%20%C2%B7%20Clash%20Patch"
     assert_equal [expected_path, expected_path], calls.map { |call| call[1] }
     refute calls.any? { |call| call[1].include?("+") }
+
+    wrong_shape = ->(method, *_args) { method == "PUT" ? [204, ""] : [200, "[]"] }
+    assert_equal false, ClashPatch.select_proxy("group", "node", socket: "/tmp/fake.sock", requester: wrong_shape)
+  end
+
+  def test_controller_socket_ignores_disappearing_cache_files
+    Dir.mktmpdir do |home|
+      old_home = ENV["HOME"]
+      ENV["HOME"] = home
+      cache = File.join(home, "Library", "Caches", "com.MetaCubeX.ClashX.meta", "cacheConfigs")
+      FileUtils.mkdir_p(cache)
+      File.symlink(File.join(cache, "missing-target"), File.join(cache, "vanished.yaml"))
+
+      assert_nil ClashPatch.controller_socket
+    ensure
+      ENV["HOME"] = old_home
+    end
   end
 
   def test_tun_state_uses_authoritative_runtime_config
@@ -562,6 +888,44 @@ class MacosPatcherTest < Minitest::Test
       assert_includes watch_paths, current
       assert_includes watch_paths, File.dirname(legacy)
       assert_includes watch_paths, legacy
+    end
+  end
+
+  def test_mihomo_validation_uses_the_profile_directory
+    Dir.mktmpdir do |home|
+      Dir.mktmpdir do |icloud|
+        old_home = ENV["HOME"]
+        ENV["HOME"] = home
+        FileUtils.mkdir_p(File.join(home, ".config", "clash.meta"))
+        profile = File.join(icloud, "friend.yaml")
+        File.write(profile, "rules: []\n")
+
+        assert_equal icloud, ClashPatch.mihomo_validation_directory(profile)
+      ensure
+        ENV["HOME"] = old_home
+      end
+    end
+  end
+
+  def test_mihomo_version_gate_and_missing_core_fail_closed
+    assert ClashPatch.mihomo_version_supported?("Mihomo Meta v1.19.27 linux amd64")
+    assert ClashPatch.mihomo_version_supported?("mihomo v1.20.0")
+    refute ClashPatch.mihomo_version_supported?("Mihomo Meta v1.19.26")
+    refute ClashPatch.mihomo_version_supported?("unknown")
+    refute ClashPatch.validate_with_mihomo("/tmp/missing.yaml", core_path: nil)
+  end
+
+  def test_cli_default_policy_path_works_from_the_repository
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
+
+      output, error, status = Open3.capture3(
+        RbConfig.ruby, PATCHER_PATH, "--profile-dir", directory, "--dry-run"
+      )
+
+      assert status.success?, "stdout=#{output.inspect} stderr=#{error.inspect}"
+      assert_includes output, "演练"
     end
   end
 

@@ -5,6 +5,7 @@ policy_path = File.join(root, "clash-patch/references/policy.json")
 engine_path = File.join(root, "clash-patch/scripts/windows/clash_verge_global.js")
 policy = JSON.parse(File.read(policy_path))
 mapping = {
+  "version" => "version",
   "resolvers" => "resolvers",
   "proxy_bootstrap_resolvers" => "proxyBootstrapResolvers",
   "default_bootstrap_resolvers" => "defaultBootstrapResolvers",

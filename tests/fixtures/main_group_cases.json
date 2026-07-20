@@ -153,6 +153,60 @@
         "rules": []
       },
       "expected_main_group": "Provider-Fallback"
+    },
+    {
+      "name": "reject-pass-compatible-and-lowercase-direct-groups-are-skipped",
+      "config": {
+        "proxies": [{ "name": "node", "type": "ss", "server": "node.example" }],
+        "proxy-groups": [
+          { "name": "RejectOnly", "type": "select", "proxies": ["REJECT"] },
+          { "name": "PassOnly", "type": "select", "proxies": ["pass"] },
+          { "name": "CompatibleOnly", "type": "select", "proxies": ["compatible"] },
+          { "name": "LowerDirectOnly", "type": "select", "proxies": ["direct"] },
+          { "name": "Usable", "type": "select", "proxies": ["node"] }
+        ],
+        "rules": []
+      },
+      "expected_main_group": "Usable"
+    },
+    {
+      "name": "arbitrary-rule-set-references-are-counted",
+      "config": {
+        "proxies": [{ "name": "node", "type": "ss", "server": "node.example" }],
+        "proxy-groups": [
+          { "name": "Custom", "type": "select", "proxies": ["node"] },
+          { "name": "Proxy", "type": "select", "proxies": ["node"] }
+        ],
+        "rules": ["RULE-SET,gfw,Custom", "RULE-SET,geolocation-!cn,Custom", "MATCH,DIRECT"]
+      },
+      "expected_main_group": "Custom"
+    },
+    {
+      "name": "broad-reference-tie-uses-group-order",
+      "config": {
+        "proxies": [{ "name": "node", "type": "ss", "server": "node.example" }],
+        "proxy-groups": [
+          { "name": "First", "type": "select", "proxies": ["node"] },
+          { "name": "Second", "type": "select", "proxies": ["node"] }
+        ],
+        "rules": [
+          "RULE-SET,one,Second", "RULE-SET,two,First",
+          "GEOSITE,example,Second", "GEOIP,US,First", "MATCH,DIRECT"
+        ]
+      },
+      "expected_main_group": "First"
+    },
+    {
+      "name": "non-select-match-target-falls-through",
+      "config": {
+        "proxies": [{ "name": "node", "type": "ss", "server": "node.example" }],
+        "proxy-groups": [
+          { "name": "Auto", "type": "url-test", "proxies": ["node"], "url": "https://example.invalid" },
+          { "name": "Proxy", "type": "select", "proxies": ["node"] }
+        ],
+        "rules": ["MATCH,Auto"]
+      },
+      "expected_main_group": "Proxy"
     }
   ]
 }
