@@ -65,7 +65,7 @@ bash scripts/install_macos.sh
 
 ## 安全出口
 
-补丁会另外创建一个不含 `DIRECT`、`REJECT`、`PASS`、`COMPATIBLE`、`REMATCH` 或同类出口的安全代理组。DNS 只使用带这个组标签的加密解析器。通用 UDP 先交给安全代理组，紧接一条 `NETWORK,UDP,REJECT`；代理不支持 UDP 时必须停止，不能继续匹配后面的直连规则。
+补丁会另外创建一个不含 `DIRECT`、`DNS`、`REJECT`、`PASS`、`COMPATIBLE`、`REMATCH` 或同类出口的安全代理组。DNS 只使用带这个组标签的加密解析器。通用 UDP 先交给安全代理组，紧接一条 `NETWORK,UDP,REJECT`；代理不支持 UDP 时必须停止，不能继续匹配后面的直连规则。要明确告诉用户：这会影响 WebRTC、游戏、语音和视频通话、QUIC。
 
 ## 移除持久化
 
@@ -81,9 +81,11 @@ bash scripts/uninstall_macos.sh
 .\scripts\uninstall_windows.cmd
 ```
 
-卸载不删除备份。macOS 会恢复安装前的 TUN 启动偏好，但不改回订阅内容；Windows 只在 `config.yaml` 与 `verge.yaml` 没有安装后新改动时恢复原始字节，检测到新改动就保留文件并提示。
+卸载不删除备份。macOS 只在状态明确记录了原值时恢复 TUN 启动偏好；从无状态旧版升级时保留当前值并说明无法确认旧值。卸载不改回订阅内容。Windows 只在 `config.yaml` 与 `verge.yaml` 没有安装后新改动时恢复原始字节，检测到新改动就保留文件并提示。
 
 ## 自动验证
+
+以下链接属于第三方服务，会收到浏览器的公网 IP，并发起 WebRTC 或 DNS 测试请求；不会收到订阅或配置文件。执行前要向用户说明。
 
 如果当前环境有 Computer Use，必须实际打开并完成三项测试：
 

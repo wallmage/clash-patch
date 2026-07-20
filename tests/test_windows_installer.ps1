@@ -43,6 +43,20 @@ function Invoke-Uninstaller([string]$AppHome) {
     if ($LASTEXITCODE -ne 0) { throw "Windows uninstaller returned $LASTEXITCODE`n$output" }
 }
 
+function Assert-InstallerRejectsScript([string]$Name, [string]$Script, [string]$MessageFragment) {
+    $case = Join-Path $sandbox $Name
+    $profiles = Join-Path $case "profiles"
+    New-Item -ItemType Directory -Path $profiles -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $case "config.yaml"), "ipv6: true`ntun: null`n")
+    [System.IO.File]::WriteAllText((Join-Path $case "verge.yaml"), "enable_tun_mode: false`n")
+    $scriptPath = Join-Path $profiles "Script.js"
+    [System.IO.File]::WriteAllText($scriptPath, $Script)
+    $output = & $PowerShellPath -NoLogo -NoProfile -File $installer -AppHome $case -MihomoPath $fakeCore 2>&1 | Out-String
+    Assert-True ($LASTEXITCODE -eq 1) "$Name was accepted"
+    Assert-True ($output.Contains($MessageFragment)) "$Name rejection did not explain the problem: $output"
+    Assert-True ((Get-Content -LiteralPath $scriptPath -Raw) -eq $Script) "$Name rejection changed Script.js"
+}
+
 try {
     New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
     if ($onWindows) {
@@ -78,6 +92,12 @@ try {
     $anchorRejected = $false
     try { Set-YamlTunMapping "tun: &defaults`n  enable: false`n" | Out-Null } catch { $anchorRejected = $true }
     Assert-True $anchorRejected "anchored tun mapping was modified instead of rejected"
+    $scalarAnchorRejected = $false
+    try { Set-YamlTopLevelScalar "enable_tun_mode: &shared false`nfriend: *shared`n" "enable_tun_mode" "true" | Out-Null } catch { $scalarAnchorRejected = $true }
+    Assert-True $scalarAnchorRejected "anchored top-level scalar was modified and left a dangling alias"
+    $commentedDocumentRejected = $false
+    try { Test-GeneratedYaml "friend: true`n--- # second document`nother: false`n" "verge.yaml" | Out-Null } catch { $commentedDocumentRejected = $true }
+    Assert-True $commentedDocumentRejected "commented YAML document marker was ignored"
 
     Assert-True (Test-MihomoVersionText "Mihomo Meta v1.19.27") "minimum Mihomo version was rejected"
     Assert-True (-not (Test-MihomoVersionText "Mihomo Meta v1.19.26")) "old Mihomo version was accepted"
@@ -196,6 +216,46 @@ try {
     Assert-True ((Get-Content -LiteralPath $asyncScriptPath -Raw) -eq $asyncScript) "async main rejection changed Script.js"
     Assert-True ((Get-Content -LiteralPath (Join-Path $asyncCase "config.yaml") -Raw) -eq $asyncConfig) "async main rejection changed config.yaml"
     Assert-True ((Get-Content -LiteralPath (Join-Path $asyncCase "verge.yaml") -Raw) -eq $asyncVerge) "async main rejection changed verge.yaml"
+
+    $templateMarkerCase = Join-Path $sandbox "template-marker-case"
+    $templateMarkerProfiles = Join-Path $templateMarkerCase "profiles"
+    New-Item -ItemType Directory -Path $templateMarkerProfiles -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $templateMarkerCase "config.yaml"), "ipv6: true`ntun: null`n")
+    [System.IO.File]::WriteAllText((Join-Path $templateMarkerCase "verge.yaml"), "enable_tun_mode: false`n")
+    $templateScript = @'
+function main(config) {
+  const markerPayload = `
+// CLASH PATCH BEGIN
+friend payload
+// CLASH PATCH END
+`;
+  config.markerPayload = markerPayload;
+  return config;
+}
+'@
+    $templateScriptPath = Join-Path $templateMarkerProfiles "Script.js"
+    [System.IO.File]::WriteAllText($templateScriptPath, $templateScript)
+    Invoke-Installer $templateMarkerCase
+    $templateComposed = Get-Content -LiteralPath $templateScriptPath -Raw
+    Assert-True ($templateComposed.Contains("friend payload")) "marker text inside a template literal was treated as a managed boundary"
+    Invoke-Uninstaller $templateMarkerCase
+    Assert-True ((Get-Content -LiteralPath $templateScriptPath -Raw).Contains("friend payload")) "uninstaller discarded marker text inside a template literal"
+
+    Assert-InstallerRejectsScript "reserved-symbol-case" "const clashPatchTransform = 1;`nfunction main(config) { return config; }`n" "保留标识符"
+    Assert-InstallerRejectsScript "recursive-main-case" "function main(config) { return config.retry ? main(config) : config; }`n" "递归"
+
+    $invalidStateCase = Join-Path $sandbox "invalid-state-case"
+    New-Item -ItemType Directory -Path $invalidStateCase -Force | Out-Null
+    $invalidStateConfig = "ipv6: true`ntun: null`n"
+    $invalidStateVerge = "enable_tun_mode: false`n"
+    [System.IO.File]::WriteAllText((Join-Path $invalidStateCase "config.yaml"), $invalidStateConfig)
+    [System.IO.File]::WriteAllText((Join-Path $invalidStateCase "verge.yaml"), $invalidStateVerge)
+    [System.IO.File]::WriteAllText((Join-Path $invalidStateCase "clash-patch-install-state.json"), '{"Version":1}')
+    $invalidStateOutput = & $PowerShellPath -NoLogo -NoProfile -File $installer -AppHome $invalidStateCase -MihomoPath $fakeCore 2>&1 | Out-String
+    Assert-True ($LASTEXITCODE -eq 1) "installer accepted incomplete state"
+    Assert-True ($invalidStateOutput.Contains("安装状态文件无效")) "incomplete state rejection was unclear"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $invalidStateCase "config.yaml") -Raw) -eq $invalidStateConfig) "invalid state changed config.yaml"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $invalidStateCase "verge.yaml") -Raw) -eq $invalidStateVerge) "invalid state changed verge.yaml"
 
     $badMarkerCase = Join-Path $sandbox "bad-marker-case"
     $badMarkerProfiles = Join-Path $badMarkerCase "profiles"

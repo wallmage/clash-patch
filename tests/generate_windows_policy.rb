@@ -14,6 +14,7 @@ mapping = {
   "taiwan_tokens" => "taiwanTokens",
   "japan_tokens" => "japanTokens",
   "forbidden_ai_domains" => "forbiddenAiDomains",
+  "legacy_ai_rules" => "legacyAiRules",
   "ai_rules" => "aiRules"
 }
 embedded = mapping.each_with_object({}) { |(source, target), result| result[target] = policy.fetch(source) }

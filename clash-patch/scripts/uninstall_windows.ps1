@@ -80,6 +80,121 @@ function Get-FileSha256([string]$Path) {
     return (Get-BytesSha256 ([System.IO.File]::ReadAllBytes($Path)))
 }
 
+function Get-InstallStateEntry([object]$State, [string]$Name) {
+    if ($null -eq $State) { return $null }
+    $property = $State.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Assert-InstallStateEntry([object]$Entry, [string]$Label) {
+    if ($null -eq $Entry) { throw "安装状态文件无效：缺少 $Label。" }
+    if (-not ($Entry.Existed -is [bool])) { throw "安装状态文件无效：$Label.Existed 不是布尔值。" }
+    if (-not ($Entry.OriginalBase64 -is [string])) { throw "安装状态文件无效：$Label.OriginalBase64 不是字符串。" }
+    if (-not ($Entry.InstalledSha256 -is [string]) -or [string]$Entry.InstalledSha256 -notmatch '^[0-9a-fA-F]{64}$') {
+        throw "安装状态文件无效：$Label.InstalledSha256 不是 SHA-256。"
+    }
+    $encoded = [string]$Entry.OriginalBase64
+    try {
+        $decoded = [Convert]::FromBase64String($encoded)
+    } catch {
+        throw "安装状态文件无效：$Label.OriginalBase64 不是 Base64。"
+    }
+    if ([Convert]::ToBase64String($decoded) -cne $encoded) {
+        throw "安装状态文件无效：$Label.OriginalBase64 不是规范 Base64。"
+    }
+    if (-not [bool]$Entry.Existed -and $encoded.Length -ne 0) {
+        throw "安装状态文件无效：$Label 不存在却保存了原始内容。"
+    }
+}
+
+function Assert-InstallState([object]$State) {
+    if ($null -eq $State) { throw "安装状态文件无效。" }
+    $version = $State.Version
+    $numericVersion = $version -is [int] -or $version -is [long]
+    if (-not $numericVersion -or [long]$version -ne 1) { throw "安装状态文件无效：版本不受支持。" }
+    Assert-InstallStateEntry (Get-InstallStateEntry $State "VergeYaml") "VergeYaml"
+    Assert-InstallStateEntry (Get-InstallStateEntry $State "ConfigYaml") "ConfigYaml"
+}
+
+function Get-JavaScriptAnalysis([string]$Text) {
+    $mask = New-Object System.Text.StringBuilder
+    $markers = @()
+    $state = "code"
+    $index = 0
+    while ($index -lt $Text.Length) {
+        $character = [string]$Text[$index]
+        $next = if ($index + 1 -lt $Text.Length) { [string]$Text[$index + 1] } else { "" }
+        if ($state -eq "code") {
+            if ($character -eq "/" -and $next -eq "/") {
+                $finish = $index + 2
+                while ($finish -lt $Text.Length -and $Text[$finish] -ne "`r" -and $Text[$finish] -ne "`n") { $finish++ }
+                $comment = $Text.Substring($index, $finish - $index).Trim()
+                if ($comment -eq "// CLASH PATCH BEGIN") {
+                    $markers += [pscustomobject]@{ Kind = "begin"; Start = $index; End = $finish }
+                } elseif ($comment -eq "// CLASH PATCH END") {
+                    $markers += [pscustomobject]@{ Kind = "end"; Start = $index; End = $finish }
+                }
+                while ($index -lt $finish) { [void]$mask.Append(" "); $index++ }
+                continue
+            }
+            if ($character -eq "/" -and $next -eq "*") {
+                $finish = $index + 2
+                while ($finish + 1 -lt $Text.Length -and -not ($Text[$finish] -eq "*" -and $Text[$finish + 1] -eq "/")) { $finish++ }
+                if ($finish + 1 -ge $Text.Length) { throw "JavaScript 块注释没有结束，原脚本未修改。" }
+                $finish += 2
+                while ($index -lt $finish) {
+                    $masked = [string]$Text[$index]
+                    [void]$mask.Append($(if ($masked -eq "`r" -or $masked -eq "`n") { $masked } else { " " }))
+                    $index++
+                }
+                continue
+            }
+            if ($character -eq "'") { $state = "single"; [void]$mask.Append(" "); $index++; continue }
+            if ($character -eq '"') { $state = "double"; [void]$mask.Append(" "); $index++; continue }
+            if ($character -eq '`') { $state = "template"; [void]$mask.Append(" "); $index++; continue }
+            [void]$mask.Append($character)
+            $index++
+            continue
+        }
+        if ($character -eq "\") {
+            [void]$mask.Append(" ")
+            $index++
+            if ($index -lt $Text.Length) {
+                $escaped = [string]$Text[$index]
+                [void]$mask.Append($(if ($escaped -eq "`r" -or $escaped -eq "`n") { $escaped } else { " " }))
+                $index++
+            }
+            continue
+        }
+        if (($state -eq "single" -and $character -eq "'") -or
+            ($state -eq "double" -and $character -eq '"') -or
+            ($state -eq "template" -and $character -eq '`')) {
+            $state = "code"
+            [void]$mask.Append(" ")
+            $index++
+            continue
+        }
+        if (($state -eq "single" -or $state -eq "double") -and ($character -eq "`r" -or $character -eq "`n")) {
+            throw "JavaScript 字符串没有结束，原脚本未修改。"
+        }
+        [void]$mask.Append($(if ($character -eq "`r" -or $character -eq "`n") { $character } else { " " }))
+        $index++
+    }
+    if ($state -ne "code") { throw "JavaScript 字符串没有结束，原脚本未修改。" }
+    return [pscustomobject]@{ Code = $mask.ToString(); Markers = @($markers) }
+}
+
+function Rename-JavaScriptMain([string]$Text, [string]$From, [string]$To) {
+    $analysis = Get-JavaScriptAnalysis $Text
+    $pattern = '(?m)^\s*function\s+' + [regex]::Escape($From) + '\s*\('
+    $matches = [regex]::Matches($analysis.Code, $pattern)
+    if ($matches.Count -ne 1) { throw "无法确认原始 main 函数，原文件未修改。" }
+    $relative = $matches[0].Value.IndexOf($From, [StringComparison]::Ordinal)
+    $nameIndex = $matches[0].Index + $relative
+    return $Text.Substring(0, $nameIndex) + $To + $Text.Substring($nameIndex + $From.Length)
+}
+
 function Restore-InstalledSetting([object]$Entry, [string]$Path, [string]$Label) {
     if ($null -eq $Entry) { return $true }
     $expected = [string]$Entry.InstalledSha256
@@ -132,7 +247,7 @@ try {
     if (Test-ClashVergeRunning) { throw "Clash Verge Rev 仍在运行。请先从托盘菜单完全退出客户端，再重新卸载。" }
     if (Test-Path -LiteralPath $statePath -PathType Leaf) {
         $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($null -eq $state -or [int]$state.Version -ne 1) { throw "安装状态文件无效，无法安全恢复原始设置。" }
+        Assert-InstallState $state
     }
 
     $scriptChanged = $false
@@ -140,21 +255,22 @@ try {
         $begin = "// CLASH PATCH BEGIN"
         $end = "// CLASH PATCH END"
         $current = Get-Content -LiteralPath $target -Raw -Encoding UTF8
-        $beginIndex = $current.IndexOf($begin)
-        $endIndex = $current.IndexOf($end)
-        if ($beginIndex -ge 0 -or $endIndex -ge 0) {
-            if ($beginIndex -lt 0 -or $endIndex -lt $beginIndex -or
-                $current.IndexOf($begin, $beginIndex + $begin.Length) -ge 0 -or
-                $current.IndexOf($end, $endIndex + $end.Length) -ge 0) {
+        $analysis = Get-JavaScriptAnalysis $current
+        $beginMarkers = @($analysis.Markers | Where-Object { $_.Kind -eq "begin" })
+        $endMarkers = @($analysis.Markers | Where-Object { $_.Kind -eq "end" })
+        if ($beginMarkers.Count -gt 0 -or $endMarkers.Count -gt 0) {
+            if ($beginMarkers.Count -ne 1 -or $endMarkers.Count -ne 1 -or $endMarkers[0].Start -lt $beginMarkers[0].Start) {
                 throw "Script.js 标记不完整或重复，原文件未修改。"
             }
+            $managedBlock = $current.Substring($beginMarkers[0].Start, $endMarkers[0].End - $beginMarkers[0].Start)
+            if (-not $managedBlock.Contains("CLASH PATCH POLICY BEGIN") -or -not $managedBlock.Contains("function clashPatchTransform")) {
+                throw "Script.js 中的同名标记不是本工具创建的，原文件未修改。"
+            }
 
-            $prefix = $current.Substring(0, $beginIndex).TrimEnd()
-            $suffix = $current.Substring($endIndex + $end.Length).Trim()
+            $prefix = $current.Substring(0, $beginMarkers[0].Start).TrimEnd()
+            $suffix = $current.Substring($endMarkers[0].End).Trim()
             if (-not [string]::IsNullOrWhiteSpace($prefix)) {
-                $matches = [regex]::Matches($prefix, '(?m)^\s*function\s+clashPatchPreviousMain\s*\(')
-                if ($matches.Count -ne 1) { throw "无法确认原始 main 函数，原文件未修改。" }
-                $prefix = [regex]::Replace($prefix, '(?m)^\s*function\s+clashPatchPreviousMain\s*\(', 'function main(', 1).TrimEnd()
+                $prefix = (Rename-JavaScriptMain $prefix "clashPatchPreviousMain" "main").TrimEnd()
             }
             $remaining = @($prefix, $suffix) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
             New-UninstallBackup $target | Out-Null

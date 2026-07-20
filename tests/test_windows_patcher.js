@@ -126,6 +126,7 @@ test('exports the canonical policy without divergence', { skip: !available }, ()
     taiwan_tokens: 'taiwanTokens',
     japan_tokens: 'japanTokens',
     forbidden_ai_domains: 'forbiddenAiDomains',
+    legacy_ai_rules: 'legacyAiRules',
     ai_rules: 'aiRules'
   };
   for (const [jsonKey, jsKey] of Object.entries(mapping)) {
@@ -299,6 +300,53 @@ test('DNS policy rejects plaintext and dynamic group targets', { skip: !availabl
   }
 });
 
+test('DNS policy accounts for exclusion, empty fallback, and DNS outbounds', { skip: !available }, () => {
+  const config = baseConfig();
+  config.proxies.push({ name: 'InternalDNS', type: 'dns' });
+  config['proxy-groups'].push(
+    { name: 'FilteredToCompatible', type: 'select', proxies: ['台湾家宽 01'], 'exclude-filter': '台湾' },
+    {
+      name: 'FilteredToSafeProxy', type: 'select', proxies: ['台湾家宽 01'],
+      'exclude-filter': '台湾', 'empty-fallback': '日本家宽 01'
+    },
+    { name: 'DnsOutboundGroup', type: 'select', proxies: ['InternalDNS'] }
+  );
+  config.dns['nameserver-policy'] = {
+    '+.compatible.example': ['https://1.1.1.1/dns-query#FilteredToCompatible'],
+    '+.fallback.example': ['https://1.1.1.1/dns-query#FilteredToSafeProxy'],
+    '+.dns-out.example': ['https://1.1.1.1/dns-query#DnsOutboundGroup']
+  };
+
+  const patched = engine.clashPatchTransform(config, 'fixture');
+  const policies = patched.dns['nameserver-policy'];
+  const safeName = engine.clashPatchSafeGroupName(patched);
+  const safeSuffix = `#${safeName}`;
+  const safeGroup = patched['proxy-groups'].find((group) => group.name === safeName);
+  assert.ok(policies['+.compatible.example'].every((endpoint) => endpoint.endsWith(safeSuffix)));
+  assert.deepEqual(policies['+.fallback.example'], ['https://1.1.1.1/dns-query#FilteredToSafeProxy']);
+  assert.ok(policies['+.dns-out.example'].every((endpoint) => endpoint.endsWith(safeSuffix)));
+  assert.ok(!safeGroup.proxies.includes('InternalDNS'));
+  assert.match(safeGroup['exclude-type'], /Dns/);
+});
+
+test('DNS policy rejects privacy-weakening resolver options', { skip: !available }, () => {
+  const config = baseConfig();
+  const target = '台湾家宽 01';
+  config.dns['nameserver-policy'] = {
+    '+.h3.example': [`https://1.1.1.1/dns-query#${target}&h3=true`],
+    '+.skip-cert.example': [`https://1.1.1.1/dns-query#${target}&skip-cert-verify=true`],
+    '+.ecs.example': [`https://1.1.1.1/dns-query#${target}&ecs=203.0.113.0/24&ecs-override=true`]
+  };
+
+  const patched = engine.clashPatchTransform(config, 'fixture');
+  const policies = patched.dns['nameserver-policy'];
+  const safeSuffix = `#${engine.clashPatchSafeGroupName(patched)}`;
+  assert.deepEqual(policies['+.h3.example'], [`https://1.1.1.1/dns-query#${target}&h3=true`]);
+  for (const pattern of ['+.skip-cert.example', '+.ecs.example']) {
+    assert.ok(policies[pattern].every((endpoint) => endpoint.endsWith(safeSuffix)), pattern);
+  }
+});
+
 test('null proxy providers do not crash DNS validation', { skip: !available }, () => {
   const config = baseConfig();
   config['proxy-providers'] = null;
@@ -376,9 +424,57 @@ test('branded user group with AI rules is not mistaken for patch ownership', { s
     'DOMAIN-SUFFIX,anthropic.com,🤖 AI · Clash Patch',
     'DOMAIN-SUFFIX,openai.com,🤖 AI · Clash Patch'
   );
+  const first = engine.clashPatchTransform(config, 'fixture');
+  const second = engine.clashPatchTransform(first, 'fixture');
+  assert.deepEqual(first['proxy-groups'].find((group) => group.name === userGroup.name), userGroup);
+  assert.deepEqual(second['proxy-groups'].find((group) => group.name === userGroup.name), userGroup);
+  assert.ok(first['proxy-groups'].some((group) => group.name === '🤖 AI · Clash Patch 2'));
+  assert.deepEqual(second, first);
+});
+
+test('inline proxy names reserve managed group names', { skip: !available }, () => {
+  const config = baseConfig();
+  config.proxies.unshift(
+    { name: '🤖 AI · Clash Patch', type: 'ss', server: 'ai.example', port: 443 },
+    { name: '🛡 安全代理 · Clash Patch', type: 'ss', server: 'safe.example', port: 443 }
+  );
   const patched = engine.clashPatchTransform(config, 'fixture');
-  assert.deepEqual(patched['proxy-groups'].find((group) => group.name === userGroup.name), userGroup);
   assert.ok(patched['proxy-groups'].some((group) => group.name === '🤖 AI · Clash Patch 2'));
+  assert.ok(patched['proxy-groups'].some((group) => group.name === '🛡 安全代理 · Clash Patch 2'));
+});
+
+test('migrates legacy owned AI rules and DNS pattern', { skip: !available }, () => {
+  const old = engine.clashPatchTransform(baseConfig(), 'fixture');
+  const aiGroup = old['proxy-groups'].find((group) => group.name.startsWith('🤖 AI · Clash Patch')).name;
+  old.rules = old.rules.map((rule) => rule === `IP-CIDR,160.79.104.0/23,${aiGroup},no-resolve`
+    ? `IP-CIDR,160.79.104.0/21,${aiGroup},no-resolve` : rule);
+  old.rules.unshift(`DOMAIN-SUFFIX,ai.com,${aiGroup}`);
+  old.dns['nameserver-policy']['+.ai.com'] = old.dns.nameserver.slice();
+
+  const patched = engine.clashPatchTransform(old, 'fixture');
+  assert.ok(!patched.rules.includes(`DOMAIN-SUFFIX,ai.com,${aiGroup}`));
+  assert.ok(!patched.rules.includes(`IP-CIDR,160.79.104.0/21,${aiGroup},no-resolve`));
+  assert.ok(patched.rules.includes(`IP-CIDR,160.79.104.0/23,${aiGroup},no-resolve`));
+  assert.equal(Object.prototype.hasOwnProperty.call(patched.dns['nameserver-policy'], '+.ai.com'), false);
+});
+
+test('preserves user legacy AI rules and DNS pattern', { skip: !available }, () => {
+  const config = baseConfig();
+  config['proxy-groups'].push({ name: 'Friend', type: 'select', proxies: ['台湾家宽 01'] });
+  config.rules.unshift('DOMAIN-SUFFIX,ai.com,Friend', 'IP-CIDR,160.79.104.0/21,Friend,no-resolve');
+  config.dns['nameserver-policy']['+.ai.com'] = ['https://1.1.1.1/dns-query#Friend'];
+  const patched = engine.clashPatchTransform(config, 'fixture');
+  assert.ok(patched.rules.includes('DOMAIN-SUFFIX,ai.com,Friend'));
+  assert.ok(patched.rules.includes('IP-CIDR,160.79.104.0/21,Friend,no-resolve'));
+  assert.deepEqual(patched.dns['nameserver-policy']['+.ai.com'], ['https://1.1.1.1/dns-query#Friend']);
+});
+
+test('patches config without a rules array', { skip: !available }, () => {
+  const config = baseConfig();
+  delete config.rules;
+  const patched = engine.clashPatchTransform(config, 'fixture');
+  assert.ok(Array.isArray(patched.rules));
+  assert.ok(patched.rules.some((rule) => rule.startsWith('DOMAIN-SUFFIX,openai.com,')));
 });
 
 test('managed suffix ten is idempotent', { skip: !available }, () => {

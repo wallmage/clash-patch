@@ -305,6 +305,37 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_atomic_refresh_after_final_identity_check_is_not_overwritten
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      refreshed_path = File.join(directory, "refreshed.yaml")
+      File.write(profile, YAML.dump(base_config))
+      refreshed = base_config
+      refreshed["friend-marker"] = "latest atomic refresh"
+      File.write(refreshed_path, YAML.dump(refreshed))
+      original_check = ClashPatch.method(:locked_source_current?)
+      checks = 0
+      checker = lambda do |source, logical_path, write_path|
+        checks += 1
+        if checks == 2
+          File.rename(refreshed_path, write_path)
+          true
+        else
+          original_check.call(source, logical_path, write_path)
+        end
+      end
+
+      result = ClashPatch.stub(:locked_source_current?, checker) do
+        ClashPatch.patch_path(profile, @policy)
+      end
+      written = ClashPatch.load_yaml(File.read(profile))
+
+      assert_equal :updated, result.fetch(:status)
+      assert_equal "latest atomic refresh", written.fetch("friend-marker")
+      assert_equal false, written.fetch("ipv6")
+    end
+  end
+
   def test_profile_scan_excludes_runtime_and_backup_files
     Dir.mktmpdir do |directory|
       File.write(File.join(directory, "friend.yaml"), "rules: []\n")
@@ -353,6 +384,26 @@ class MacosPatcherTest < Minitest::Test
 
       assert_equal :invalid, result.fetch(:status)
       assert_equal original, File.read(profile)
+    end
+  end
+
+  def test_deep_yaml_isolated_to_one_profile_in_batch
+    Dir.mktmpdir do |directory|
+      deep_path = File.join(directory, "deep.yaml")
+      good_path = File.join(directory, "good.yaml")
+      depth = 1_600
+      lines = (0...depth).map { |index| "#{'  ' * index}level#{index}:" }
+      lines << "#{'  ' * depth}leaf: value"
+      File.write(deep_path, lines.join("\n") + "\n")
+      File.write(good_path, YAML.dump(base_config))
+
+      results = ClashPatch.run(directories: [directory], policy_path: POLICY_PATH,
+                               selected_name: "good", reloader: ->(_path) { true })
+      by_name = results.each_with_object({}) { |result, memo| memo[File.basename(result.fetch(:path))] = result }
+
+      assert_includes %i[invalid error], by_name.fetch("deep.yaml").fetch(:status)
+      assert_equal :updated, by_name.fetch("good.yaml").fetch(:status)
+      assert_equal false, ClashPatch.load_yaml(File.read(good_path)).fetch("ipv6")
     end
   end
 
@@ -577,6 +628,15 @@ class MacosPatcherTest < Minitest::Test
     assert_includes output, "[路径已隐藏]"
   end
 
+  def test_safe_labels_hide_all_proxy_uri_schemes
+    output = ClashPatch.safe_label("ss://secret@example trojan://password@example vless://uuid@example")
+
+    refute_includes output, "secret"
+    refute_includes output, "password"
+    refute_includes output, "uuid"
+    assert_equal 3, output.scan("[已隐藏]").length
+  end
+
   def test_backup_directory_and_files_use_private_permissions
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
@@ -679,6 +739,57 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_dns_policy_accounts_for_exclusion_empty_fallback_and_dns_outbounds
+    config = base_config
+    config["proxies"] << { "name" => "InternalDNS", "type" => "dns" }
+    config["proxy-groups"].push(
+      {
+        "name" => "FilteredToCompatible", "type" => "select", "proxies" => ["台湾家宽 01"],
+        "exclude-filter" => "台湾"
+      },
+      {
+        "name" => "FilteredToSafeProxy", "type" => "select", "proxies" => ["台湾家宽 01"],
+        "exclude-filter" => "台湾", "empty-fallback" => "日本家宽 01"
+      },
+      { "name" => "DnsOutboundGroup", "type" => "select", "proxies" => ["InternalDNS"] }
+    )
+    config["dns"]["nameserver-policy"] = {
+      "+.compatible.example" => ["https://1.1.1.1/dns-query#FilteredToCompatible"],
+      "+.fallback.example" => ["https://1.1.1.1/dns-query#FilteredToSafeProxy"],
+      "+.dns-out.example" => ["https://1.1.1.1/dns-query#DnsOutboundGroup"]
+    }
+
+    result = ClashPatch.patch(config, @policy)
+    policies = result.fetch(:config).dig("dns", "nameserver-policy")
+    safe_suffix = "##{result.fetch(:safe_group)}"
+    safe_group = result.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == result.fetch(:safe_group) }
+
+    assert policies.fetch("+.compatible.example").all? { |endpoint| endpoint.end_with?(safe_suffix) }
+    assert_equal ["https://1.1.1.1/dns-query#FilteredToSafeProxy"], policies.fetch("+.fallback.example")
+    assert policies.fetch("+.dns-out.example").all? { |endpoint| endpoint.end_with?(safe_suffix) }
+    refute_includes safe_group.fetch("proxies"), "InternalDNS"
+    assert_includes safe_group.fetch("exclude-type"), "Dns"
+  end
+
+  def test_dns_policy_rejects_privacy_weakening_resolver_options
+    config = base_config
+    target = "台湾家宽 01"
+    config["dns"]["nameserver-policy"] = {
+      "+.h3.example" => ["https://1.1.1.1/dns-query##{target}&h3=true"],
+      "+.skip-cert.example" => ["https://1.1.1.1/dns-query##{target}&skip-cert-verify=true"],
+      "+.ecs.example" => ["https://1.1.1.1/dns-query##{target}&ecs=203.0.113.0/24&ecs-override=true"]
+    }
+
+    result = ClashPatch.patch(config, @policy)
+    policies = result.fetch(:config).dig("dns", "nameserver-policy")
+    safe_suffix = "##{result.fetch(:safe_group)}"
+
+    assert_equal ["https://1.1.1.1/dns-query##{target}&h3=true"], policies.fetch("+.h3.example")
+    %w[+.skip-cert.example +.ecs.example].each do |pattern|
+      assert policies.fetch(pattern).all? { |endpoint| endpoint.end_with?(safe_suffix) }, pattern
+    end
+  end
+
   def test_null_proxy_providers_do_not_crash_dns_validation
     config = base_config
     config["proxy-providers"] = nil
@@ -760,10 +871,74 @@ class MacosPatcherTest < Minitest::Test
       "DOMAIN-SUFFIX,openai.com,🤖 AI · Clash Patch"
     )
 
+    first = ClashPatch.patch(config, @policy)
+    second = ClashPatch.patch(first.fetch(:config), @policy)
+
+    assert_equal user_group, first.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == user_group["name"] }
+    assert_equal user_group, second.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == user_group["name"] }
+    assert_equal "🤖 AI · Clash Patch 2", first.fetch(:ai_group)
+    assert_equal "🤖 AI · Clash Patch 2", second.fetch(:ai_group)
+    refute second.fetch(:changed)
+  end
+
+  def test_inline_proxy_names_reserve_managed_group_names
+    config = base_config
+    config["proxies"].unshift(
+      { "name" => "🤖 AI · Clash Patch", "type" => "ss", "server" => "ai.example", "port" => 443 },
+      { "name" => "🛡 安全代理 · Clash Patch", "type" => "ss", "server" => "safe.example", "port" => 443 }
+    )
+
     result = ClashPatch.patch(config, @policy)
 
-    assert_equal user_group, result.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == user_group["name"] }
     assert_equal "🤖 AI · Clash Patch 2", result.fetch(:ai_group)
+    assert_equal "🛡 安全代理 · Clash Patch 2", result.fetch(:safe_group)
+  end
+
+  def test_migrates_legacy_owned_ai_rules_and_dns_pattern
+    old = ClashPatch.patch(base_config, @policy).fetch(:config)
+    ai_group = old.fetch("proxy-groups").find { |group| group["name"].start_with?("🤖 AI · Clash Patch") }.fetch("name")
+    old["rules"].map! do |rule|
+      rule == "IP-CIDR,160.79.104.0/23,#{ai_group},no-resolve" ?
+        "IP-CIDR,160.79.104.0/21,#{ai_group},no-resolve" : rule
+    end
+    old["rules"].unshift("DOMAIN-SUFFIX,ai.com,#{ai_group}")
+    old.dig("dns", "nameserver-policy")["+.ai.com"] = old.dig("dns", "nameserver").dup
+
+    result = ClashPatch.patch(old, @policy)
+    rules = result.fetch(:config).fetch("rules")
+    dns_policy = result.fetch(:config).dig("dns", "nameserver-policy")
+
+    refute_includes rules, "DOMAIN-SUFFIX,ai.com,#{ai_group}"
+    refute_includes rules, "IP-CIDR,160.79.104.0/21,#{ai_group},no-resolve"
+    assert_includes rules, "IP-CIDR,160.79.104.0/23,#{ai_group},no-resolve"
+    refute dns_policy.key?("+.ai.com")
+  end
+
+  def test_preserves_user_legacy_ai_rules_and_dns_pattern
+    config = base_config
+    config["proxy-groups"] << { "name" => "Friend", "type" => "select", "proxies" => ["台湾家宽 01"] }
+    config["rules"].unshift(
+      "DOMAIN-SUFFIX,ai.com,Friend",
+      "IP-CIDR,160.79.104.0/21,Friend,no-resolve"
+    )
+    config["dns"]["nameserver-policy"]["+.ai.com"] = ["https://1.1.1.1/dns-query#Friend"]
+
+    result = ClashPatch.patch(config, @policy)
+
+    assert_includes result.fetch(:config).fetch("rules"), "DOMAIN-SUFFIX,ai.com,Friend"
+    assert_includes result.fetch(:config).fetch("rules"), "IP-CIDR,160.79.104.0/21,Friend,no-resolve"
+    assert_equal ["https://1.1.1.1/dns-query#Friend"], result.fetch(:config).dig("dns", "nameserver-policy", "+.ai.com")
+  end
+
+  def test_patches_config_without_rules_array
+    config = base_config
+    config.delete("rules")
+
+    result = ClashPatch.patch(config, @policy)
+
+    assert_equal :updated, result.fetch(:status)
+    assert_instance_of Array, result.fetch(:config).fetch("rules")
+    assert result.fetch(:config).fetch("rules").any? { |rule| rule.start_with?("DOMAIN-SUFFIX,openai.com,") }
   end
 
   def test_managed_suffix_ten_is_idempotent
@@ -829,6 +1004,42 @@ class MacosPatcherTest < Minitest::Test
     assert ClashPatch.active_profile?("/profiles/config.yaml", "CONFIG")
     assert ClashPatch.active_profile?("/profiles/config.yaml", "")
     refute ClashPatch.active_profile?("/profiles/other.yaml", "config")
+  end
+
+  def test_single_custom_profile_directory_is_active
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
+      reloads = []
+
+      results = ClashPatch.run(directories: [directory], policy_path: POLICY_PATH, selected_name: "friend",
+                               reloader: ->(path) { reloads << path; true })
+
+      assert_equal true, results.fetch(0).fetch(:active)
+      assert_equal [profile], reloads
+    end
+  end
+
+  def test_selected_profile_chooses_the_matching_icloud_container
+    Dir.mktmpdir do |home|
+      current = File.join(home, "Library", "Mobile Documents", "iCloud~com~metacubex~ClashX", "Documents")
+      legacy = File.join(home, "Library", "Mobile Documents", "iCloud~com~west2online~ClashX", "Documents")
+      FileUtils.mkdir_p(current)
+      FileUtils.mkdir_p(legacy)
+      File.write(File.join(current, "other.yaml"), YAML.dump(base_config))
+      selected = File.join(legacy, "friend.yaml")
+      File.write(selected, YAML.dump(base_config))
+      reloads = []
+
+      results = ClashPatch.stub(:icloud_enabled?, true) do
+        ClashPatch.run(directories: [current, legacy], policy_path: POLICY_PATH, selected_name: "friend",
+                       reloader: ->(path) { reloads << path; true })
+      end
+      active = results.find { |result| result[:active] }
+
+      assert_equal selected, active.fetch(:path)
+      assert_equal [selected], reloads
+    end
   end
 
   def test_reload_requires_http_204

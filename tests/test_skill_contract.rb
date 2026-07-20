@@ -117,6 +117,14 @@ class SkillContractTest < Minitest::Test
     %w[LaunchAgent WatchPaths 全局扩展脚本 DNS WebRTC 家宽 台湾 日本].each do |term|
       assert_includes source, term
     end
+    %w[游戏 语音 视频 QUIC 第三方].each { |term| assert_includes source, term }
+  end
+
+  def test_policy_documents_dns_filters_migration_and_legacy_tun_state
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    %w[exclude-filter empty-fallback skip-cert-verify ecs 160.79.104.0/21 ai.com RestoreTunKnown].each do |term|
+      assert_includes policy, term
+    end
   end
 
   def test_macos_installer_is_event_driven_and_not_resident
@@ -152,9 +160,21 @@ class SkillContractTest < Minitest::Test
     assert_operator mac_install.index('id -u'), :<, mac_install.index('/bin/mkdir -p')
     assert_operator mac_install.index('--print-core-status'), :<, mac_install.index('/bin/mkdir -p')
     assert_operator mac_install.index('plutil -extract Label'), :<, mac_install.index('plutil -create')
+    assert_operator mac_install.index('ProgramArguments.0'), :<, mac_install.index('plutil -create')
+    assert_operator mac_install.index('ProgramArguments.1'), :<, mac_install.index('plutil -create')
     assert_includes mac_install, "install-state.plist"
+    assert_includes mac_install, "RestoreTunKnown"
+    assert_includes mac_install, "rollback_install"
+    assert_includes mac_install, "COMMIT_STARTED"
+    assert_includes mac_install, "COMMIT_COMPLETE"
+    assert_includes mac_install, "AGENT_WAS_LOADED"
+    assert_operator mac_install.index('COMMIT_STARTED=1'), :<, mac_install.rindex('launchctl bootstrap')
+    assert_operator mac_install.rindex('launchctl bootstrap'), :<, mac_install.index('COMMIT_COMPLETE=1')
     assert_includes mac_uninstall, "restoreTunProxy"
     assert_includes mac_uninstall, "RestoreTunPresent"
+    assert_includes mac_uninstall, "RestoreTunKnown"
+    assert_operator mac_uninstall.index('ProgramArguments.0'), :<, mac_uninstall.index('launchctl bootout')
+    assert_operator mac_uninstall.index('ProgramArguments.1'), :<, mac_uninstall.index('launchctl bootout')
     assert_includes patcher, "File::EXCL"
 
     assert_equal "\xEF\xBB\xBF".b, windows_install.byteslice(0, 3)
@@ -199,6 +219,8 @@ class SkillContractTest < Minitest::Test
     windows = File.read(File.join(SKILL, "scripts/uninstall_windows.ps1"))
     assert_includes mac, "bootout"
     assert_operator mac.index("plutil -extract Label"), :<, mac.index("launchctl bootout")
+    assert_operator mac.index("ProgramArguments.0"), :<, mac.index("launchctl bootout")
+    assert_operator mac.index("ProgramArguments.1"), :<, mac.index("launchctl bootout")
     assert_includes windows, "CLASH PATCH BEGIN"
     refute_match(/Remove-Item[^\n]+backups/i, windows)
     refute_match(%r{/bin/rm[^\n]+backups}i, mac)

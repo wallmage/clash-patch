@@ -45,6 +45,10 @@
     "raw.githubusercontent.com",
     "storage.googleapis.com"
   ],
+  "legacy_ai_rules": [
+    "DOMAIN-SUFFIX,ai.com,{AI}",
+    "IP-CIDR,160.79.104.0/21,{AI},no-resolve"
+  ],
   "ai_rules": [
     "DOMAIN-SUFFIX,anthropic.com,{AI}",
     "DOMAIN-SUFFIX,claude.ai,{AI}",

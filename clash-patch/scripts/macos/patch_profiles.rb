@@ -18,9 +18,9 @@ module ClashPatch
   MAX_PATCH_ATTEMPTS = 3
   POLICY_VERSION = 1
   AUTO_CORE = Object.new.freeze
-  DIRECT_TYPES = %w[direct reject pass compatible rematch].freeze
+  DIRECT_TYPES = %w[direct dns reject pass compatible rematch].freeze
   DIRECT_NAMES = %w[DIRECT REJECT REJECT-DROP PASS PASS-RULE COMPATIBLE REMATCH].freeze
-  EXCLUDED_SAFE_TYPES = "Direct|Reject|Pass|Compatible|Rematch".freeze
+  EXCLUDED_SAFE_TYPES = "Direct|Dns|Reject|Pass|Compatible|Rematch".freeze
 
   class InvalidConfigError < StandardError; end
 
@@ -74,7 +74,7 @@ module ClashPatch
   def usable_config?(config)
     return false unless config.is_a?(Hash)
     return false unless config["proxy-groups"].is_a?(Array)
-    return false unless config["rules"].is_a?(Array)
+    return false if config.key?("rules") && !config["rules"].is_a?(Array)
 
     config["proxies"].is_a?(Array) || config["proxy-providers"].is_a?(Hash)
   end
@@ -159,6 +159,7 @@ module ClashPatch
 
   def unique_group_name(config, base)
     names = Array(config["proxy-groups"]).map { |group| group["name"] if group.is_a?(Hash) }.compact
+    names.concat(Array(config["proxies"]).map { |proxy| proxy["name"] if proxy.is_a?(Hash) }.compact)
     return base unless names.include?(base)
 
     suffix = 2
@@ -166,8 +167,32 @@ module ClashPatch
     "#{base} #{suffix}"
   end
 
+  def managed_ai_group_fingerprint?(group)
+    return false unless group.is_a?(Hash) && group.keys.sort == %w[name proxies type]
+    return false unless group["type"].to_s.downcase == "select"
+
+    proxies = group["proxies"]
+    proxies.is_a?(Array) && proxies.length == 1 && proxies.first.is_a?(String) && proxies.first != group["name"]
+  end
+
+  def managed_safe_group_fingerprint?(group)
+    expected_keys = %w[empty-fallback exclude-type include-all name proxies type]
+    legacy_exclusions = [EXCLUDED_SAFE_TYPES, "Direct|Reject|Pass|Compatible|Rematch", "Direct|Reject|Pass|Compatible"]
+    return false unless group.is_a?(Hash) && group.keys.sort == expected_keys.sort
+    return false unless group["type"].to_s.downcase == "select" && group["include-all"] == true
+    return false unless group["empty-fallback"].to_s.casecmp("REJECT").zero?
+    return false unless legacy_exclusions.include?(group["exclude-type"])
+
+    proxies = group["proxies"]
+    proxies.is_a?(Array) && proxies.all? { |name| name.is_a?(String) && name != group["name"] }
+  end
+
   def owned_ai_group?(config, name, policy)
-    keys = Array(policy["ai_rules"]).map { |template| managed_rule_key(template) }.compact.uniq
+    group = selectable_groups(config).find { |item| item["name"] == name }
+    return false unless managed_ai_group_fingerprint?(group)
+
+    templates = Array(policy["ai_rules"]) + Array(policy["legacy_ai_rules"])
+    keys = templates.map { |template| managed_rule_key(template) }.compact.uniq
     matches = Array(config["rules"]).count do |rule|
       info = rule_info(rule)
       info[:target] == name && keys.include?(managed_rule_key(rule))
@@ -192,6 +217,9 @@ module ClashPatch
   end
 
   def owned_safe_group?(config, name)
+    group = selectable_groups(config).find { |item| item["name"] == name }
+    return false unless managed_safe_group_fingerprint?(group)
+
     guarded = Array(config["rules"]).each_cons(2).any? do |first, second|
       first_info = rule_info(first)
       second_info = rule_info(second)
@@ -270,6 +298,16 @@ module ClashPatch
     end.uniq
   end
 
+  def legacy_ai_dns_patterns(policy)
+    Array(policy["legacy_ai_rules"]).each_with_object([]) do |template, patterns|
+      type, value, = template.split(",")
+      case type
+      when "DOMAIN-SUFFIX" then patterns << "+.#{value}"
+      when "DOMAIN" then patterns << value
+      end
+    end.uniq
+  end
+
   def safe_proxy_target?(config, target)
     Array(config["proxies"]).any? do |proxy|
       proxy.is_a?(Hash) && proxy["name"] == target && !DIRECT_TYPES.include?(proxy["type"].to_s.downcase)
@@ -282,10 +320,31 @@ module ClashPatch
     group = Array(config["proxy-groups"]).find { |item| item.is_a?(Hash) && item["name"] == target }
     return false unless group
 
-    members = Array(group["proxies"])
-    return false if members.empty?
     return false unless Array(group["use"]).empty?
     return false if group["include-all"] == true || group["include-all-proxies"] == true || group["include-all-providers"] == true
+
+    members = Array(group["proxies"])
+    exclusion = group["exclude-filter"].to_s
+    unless exclusion.empty?
+      # Mihomo applies exclude-filter to explicit members too. Accept only the
+      # common RE2-compatible subset so a runtime regex cannot remove every
+      # safe member while our check still sees one.
+      return false if exclusion.match?(/\(\?(?!i\))/) || exclusion.match?(/\\[1-9]/)
+
+      begin
+        matcher = Regexp.new(exclusion)
+      rescue RegexpError
+        return false
+      end
+      members = members.reject { |member| matcher.match?(member.to_s) }
+    end
+
+    if members.empty?
+      # Mihomo defaults an empty group to COMPATIBLE. Only an explicitly named
+      # safe inline proxy is acceptable here; proxy groups are not allowed by
+      # Mihomo's empty-fallback field.
+      return safe_proxy_target?(config, group["empty-fallback"])
+    end
 
     members.all? do |member|
       safe_proxy_target?(config, member) || group_cannot_reach_direct?(config, member, visiting + [target])
@@ -304,6 +363,14 @@ module ClashPatch
 
   def safe_resolver_endpoint?(config, endpoint)
     return false unless endpoint.to_s.match?(/\A(?:https|tls|quic):\/\//i)
+
+    options = endpoint.to_s.split("#", 2)[1].to_s.split("&").drop(1)
+    options.each do |option|
+      key, value = option.split("=", 2)
+      normalized = key.to_s.downcase
+      return false if %w[ecs ecs-override].include?(normalized)
+      return false if normalized == "skip-cert-verify" && value.to_s.casecmp("true").zero?
+    end
 
     target = resolver_target(endpoint)
     return false if target.nil? || direct_name?(target)
@@ -329,9 +396,19 @@ module ClashPatch
 
     existing = dns["nameserver-policy"].is_a?(Hash) ? dns["nameserver-policy"] : {}
     policies = {}
+    legacy_patterns = legacy_ai_dns_patterns(policy)
+    owned_safe_names = selectable_groups(config).map { |group| group["name"] }.select do |name|
+      managed_name?(name, SAFE_GROUP_BASE) && owned_safe_group?(config, name)
+    end
+    owned_safe_names << safe_group
+    owned_safe_names.uniq!
     existing.each do |combined, endpoints|
       combined.to_s.split(",").map(&:strip).reject(&:empty?).each do |pattern|
         values = Array(endpoints).map(&:to_s)
+        legacy_owned = legacy_patterns.include?(pattern) && !values.empty? &&
+                       values.all? { |value| owned_safe_names.include?(resolver_target(value)) }
+        next if legacy_owned
+
         policies[pattern] = !values.empty? && values.all? { |value| safe_resolver_endpoint?(config, value) } ? values : deep_copy(safe_resolvers)
       end
     end
@@ -399,6 +476,7 @@ module ClashPatch
   def patch_rules(config, policy, ai_group, safe_group)
     managed = render_ai_rules(policy, ai_group)
     managed_keys = managed.map { |rule| managed_rule_key(rule) }.compact
+    legacy_keys = Array(policy["legacy_ai_rules"]).map { |rule| managed_rule_key(rule) }.compact
     forbidden = Array(policy["forbidden_ai_domains"])
     owned_ai_names = selectable_groups(config).map { |group| group["name"] }.select do |name|
       managed_name?(name, AI_GROUP_BASE) && owned_ai_group?(config, name, policy)
@@ -433,10 +511,11 @@ module ClashPatch
       info = rule_info(rule)
       key = managed_rule_key(rule)
       patch_owned_ai = managed_keys.include?(key) && owned_ai_names.include?(info[:target])
+      legacy_owned_ai = legacy_keys.include?(key) && owned_ai_names.include?(info[:target])
       forbidden_ai = %w[DOMAIN DOMAIN-SUFFIX].include?(info[:type]) &&
                      forbidden.any? { |domain| domain.casecmp(info[:payload]).zero? } &&
                      owned_ai_names.include?(info[:target])
-      next if patch_owned_ai || forbidden_ai
+      next if patch_owned_ai || legacy_owned_ai || forbidden_ai
 
       if managed_keys.include?(key)
         user_overrides << rule
@@ -449,17 +528,21 @@ module ClashPatch
   end
 
   def normalize_reality_short_ids(value)
-    case value
-    when Hash
-      value.each do |key, child|
-        if key.to_s == "short-id" && child.is_a?(String) && child.match?(/\A[0-9a-fA-F]{1,16}\z/)
-          value[key] = child.dup
-        else
-          normalize_reality_short_ids(child)
+    stack = [value]
+    until stack.empty?
+      current = stack.pop
+      case current
+      when Hash
+        current.each do |key, child|
+          if key.to_s == "short-id" && child.is_a?(String) && child.match?(/\A[0-9a-fA-F]{1,16}\z/)
+            current[key] = child.dup
+          else
+            stack << child
+          end
         end
+      when Array
+        stack.concat(current)
       end
-    when Array
-      value.each { |child| normalize_reality_short_ids(child) }
     end
     value
   end
@@ -470,6 +553,7 @@ module ClashPatch
 
     original = deep_copy(config)
     patched = deep_copy(config)
+    patched["rules"] ||= []
     main_group = detect_main_group(patched, policy)
     return base_result(config, :no_main_group) unless main_group
 
@@ -499,26 +583,34 @@ module ClashPatch
   end
 
   def tag_reality_short_ids(node)
-    case node
-    when Psych::Nodes::Mapping
-      node.children.each_slice(2) do |key, value|
-        if key.is_a?(Psych::Nodes::Scalar) && key.value == "short-id" &&
-           value.is_a?(Psych::Nodes::Scalar) && value.value.match?(/\A[0-9a-fA-F]{1,16}\z/)
-          value.tag = "tag:yaml.org,2002:str"
+    stack = [node]
+    until stack.empty?
+      current = stack.pop
+      case current
+      when Psych::Nodes::Mapping
+        current.children.each_slice(2) do |key, value|
+          if key.is_a?(Psych::Nodes::Scalar) && key.value == "short-id" &&
+             value.is_a?(Psych::Nodes::Scalar) && value.value.match?(/\A[0-9a-fA-F]{1,16}\z/)
+            value.tag = "tag:yaml.org,2002:str"
+          end
+          stack << value
         end
-        tag_reality_short_ids(value)
+      when Psych::Nodes::Document, Psych::Nodes::Sequence, Psych::Nodes::Stream
+        stack.concat(current.children)
       end
-    when Psych::Nodes::Document, Psych::Nodes::Sequence, Psych::Nodes::Stream
-      node.children.each { |child| tag_reality_short_ids(child) }
     end
     node
   end
 
   def yaml_alias?(node)
-    return true if node.is_a?(Psych::Nodes::Alias)
-    return false unless node.respond_to?(:children)
+    stack = [node]
+    until stack.empty?
+      current = stack.pop
+      return true if current.is_a?(Psych::Nodes::Alias)
 
-    Array(node.children).any? { |child| yaml_alias?(child) }
+      stack.concat(Array(current.children)) if current.respond_to?(:children)
+    end
+    false
   end
 
   def load_yaml(text, filename = nil)
@@ -622,10 +714,20 @@ module ClashPatch
     candidates.find { |path| File.file?(path) && File.executable?(path) }
   end
 
+  def locked_source_current?(source, path, write_path)
+    return false unless File.realpath(path) == write_path
+
+    source_stat = source.stat
+    path_stat = File.stat(write_path)
+    source_stat.dev == path_stat.dev && source_stat.ino == path_stat.ino
+  rescue SystemCallError, IOError
+    false
+  end
+
   def patch_path_once(path, policy, dry_run:, backup_root:, validator:)
     write_path = File.realpath(path)
     outcome = nil
-    File.open(write_path, "rb") do |source|
+    File.open(write_path, dry_run ? "rb" : "r+b") do |source|
       source.flock(File::LOCK_EX)
       original_bytes = source.read
       original_text = original_bytes.dup.force_encoding(Encoding::UTF_8)
@@ -638,7 +740,6 @@ module ClashPatch
       patched_text = dump_config(result[:config])
       return result.merge(path: path, dry_run: true) if dry_run
 
-      mode = File.stat(write_path).mode & 0o777
       Tempfile.create([File.basename(write_path), ".tmp"], File.dirname(write_path), encoding: "UTF-8") do |temporary|
         temporary.write(patched_text)
         temporary.flush
@@ -648,18 +749,26 @@ module ClashPatch
           return base_result(config, :validation_failed).merge(path: path)
         end
 
-        current_path = File.realpath(path)
-        if current_path != write_path || File.binread(write_path) != original_bytes
+        source.rewind
+        if !locked_source_current?(source, path, write_path) || source.read != original_bytes
           outcome = :retry
         else
           backup_once(path, backup_root, content: original_bytes) if backup_root
-          File.chmod(mode, temporary.path)
-          final_path = File.realpath(path)
-          if final_path != write_path || File.binread(write_path) != original_bytes
+          source.rewind
+          if !locked_source_current?(source, path, write_path) || source.read != original_bytes
             outcome = :retry
           else
-            File.rename(temporary.path, write_path)
-            outcome = result.merge(path: path)
+            # Write through the locked descriptor. If the subscription client
+            # atomically replaces the path after our identity check, this
+            # descriptor still names the old inode and cannot overwrite the
+            # newly refreshed file. The post-write identity check then retries.
+            patched_bytes = File.binread(temporary.path)
+            source.rewind
+            source.write(patched_bytes)
+            source.truncate(patched_bytes.bytesize)
+            source.flush
+            source.fsync
+            outcome = locked_source_current?(source, path, write_path) ? result.merge(path: path) : :retry
           end
         end
       end
@@ -673,7 +782,7 @@ module ClashPatch
       return outcome unless outcome == :retry
     end
     base_result(nil, :concurrent_change).merge(path: path)
-  rescue Psych::Exception, JSON::ParserError, InvalidConfigError
+  rescue Psych::Exception, JSON::ParserError, InvalidConfigError, SystemStackError
     base_result(nil, :invalid).merge(path: path)
   rescue SystemCallError, IOError
     base_result(nil, :io_error).merge(path: path)
@@ -747,6 +856,20 @@ module ClashPatch
     profile_name = File.basename(path)
     profile_stem = profile_name.sub(/\.ya?ml\z/i, "")
     profile_name.casecmp(selected_name).zero? || profile_stem.casecmp(selected_stem).zero?
+  end
+
+  def active_profile_root(roots, selected, directory = nil)
+    return directory if directory
+    return roots.first if roots.length == 1
+
+    matching = roots.select { |root| profile_paths(root).any? { |path| active_profile?(path, selected) } }
+    candidates = matching.empty? ? roots : matching
+    preferred = if icloud_enabled?
+                  candidates.find { |path| path.include?("/Library/Mobile Documents/") }
+                else
+                  candidates.find { |path| path.end_with?("/.config/clash.meta") }
+                end
+    preferred || matching.first
   end
 
   def controller_socket
@@ -840,15 +963,7 @@ module ClashPatch
     selector ||= method(:select_proxy)
     selected = selected_name.nil? ? selected_profile_name : selected_name
     roots = directories || (directory ? [directory] : default_profile_directories)
-    active_root = active_directory
-    if active_root.nil?
-      active_root = directory if directory
-      active_root ||= if icloud_enabled?
-                        roots.find { |path| path.include?("/Library/Mobile Documents/") }
-                      else
-                        roots.find { |path| path.end_with?("/.config/clash.meta") }
-                      end
-    end
+    active_root = active_directory || active_profile_root(roots, selected, directory)
 
     results = roots.flat_map do |root|
       profile_paths(root).map do |path|
@@ -903,7 +1018,7 @@ module ClashPatch
     text = text.gsub(/[\p{Cc}\p{Cf}]/, "")
     text = text.gsub(/\b(?:password|passwd|token|secret|uuid)\s*[=:]\s*\S+/i, "[已隐藏]")
     text = text.gsub(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/i, "[已隐藏]")
-    text = text.gsub(%r{https?://\S+}i, "[已隐藏]")
+    text = text.gsub(%r{\b[A-Za-z][A-Za-z0-9+.-]*://\S+}, "[已隐藏]")
     text = text.gsub(%r{(?<![A-Za-z0-9])/(?:[^/\s]+/)+[^/\s]*}, "[路径已隐藏]")
     text = text.gsub(/\b[A-Za-z]:[\\\/](?:[^\\\/\s]+[\\\/])+[^\\\/\s]*/, "[路径已隐藏]")
     text = text.strip
