@@ -123,7 +123,7 @@ if ([string]::IsNullOrWhiteSpace($AppHome)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($AppHome) -or -not (Test-Path -LiteralPath $AppHome -PathType Container)) {
-    Write-Error "没有找到受支持的 Clash Verge Rev。请安装最新版 Clash Verge Rev，打开一次后再运行 Clash 补丁。"
+    [Console]::Error.WriteLine("[Clash 补丁] 没有找到受支持的 Clash Verge Rev。请安装最新版 Clash Verge Rev，打开一次后再运行 Clash 补丁。")
     exit 2
 }
 
@@ -135,7 +135,7 @@ $targetScript = Join-Path $profilesDirectory "Script.js"
 $enginePath = Join-Path $PSScriptRoot "windows\clash_verge_global.js"
 
 if (-not (Test-Path -LiteralPath $enginePath -PathType Leaf)) {
-    Write-Error "安装包不完整：缺少 Windows 全局扩展脚本。"
+    [Console]::Error.WriteLine("[Clash 补丁] 安装包不完整：缺少 Windows 全局扩展脚本。")
     exit 3
 }
 
@@ -162,6 +162,6 @@ try {
     Write-Info "AI 规则会优先选择台湾家宽，其次选择日本家宽；如果两者都没有，不会替你改成其他地区。"
     exit 0
 } catch {
-    Write-Error "安装失败：$($_.Exception.Message)"
+    [Console]::Error.WriteLine("[Clash 补丁] 安装失败：$($_.Exception.Message)")
     exit 1
 }

@@ -1,6 +1,6 @@
 ---
 name: clash-patch
-description: Use when an agent needs to inspect, repair, or persist DNS、WebRTC、AI 分流设置 for ClashX Meta or Clash Verge Rev subscriptions on macOS or Windows.
+description: Use when an agent needs to inspect, repair, or persist DNS, WebRTC, and AI routing settings for ClashX Meta or Clash Verge Rev subscriptions on macOS or Windows.
 ---
 
 # Clash 补丁
@@ -85,6 +85,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_window
 - `已更新并生效`
 - `无需修改`
 - `已更新，等待重新加载`
+- `已更新，选择该订阅时生效`
 - `已跳过：订阅内容无效`
 - `未修改：客户端不受支持`
 - `未验证：需要手动测试`

@@ -42,6 +42,7 @@ if [ ! -f "$PATCHER_SOURCE" ] || [ ! -f "$POLICY_SOURCE" ]; then
 fi
 
 /bin/mkdir -p "$INSTALL_DIR" "$BACKUP_DIR" "$HOME/Library/LaunchAgents"
+/bin/chmod 700 "$INSTALL_DIR" "$BACKUP_DIR"
 /bin/cp "$PATCHER_SOURCE" "$PATCHER_TARGET"
 /bin/cp "$POLICY_SOURCE" "$POLICY_TARGET"
 /bin/chmod 700 "$PATCHER_TARGET"

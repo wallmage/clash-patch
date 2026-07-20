@@ -123,21 +123,46 @@ function clashPatchSelectableGroups(config) {
   });
 }
 
+// AI-named groups are never main-group candidates: the managed DNS and UDP
+// rules must not make the AI group target itself.
 function clashPatchDetectMain(config) {
   const groups = clashPatchSelectableGroups(config);
-  const names = groups.map(function (group) { return group.name; });
+  const candidates = groups.filter(function (group) { return !clashPatchAiName(group.name); });
+  const names = candidates.map(function (group) { return group.name; });
+
   const matchRule = config.rules.slice().reverse().find(function (rule) { return String(rule).indexOf("MATCH,") === 0; });
   const matchTarget = matchRule ? String(matchRule).split(",")[1] : null;
   if (matchTarget && matchTarget !== "DIRECT" && names.indexOf(matchTarget) !== -1) return matchTarget;
+
+  const references = {};
+  config.rules.forEach(function (rule) {
+    if (!clashPatchBroadRule(rule)) return;
+    const parts = String(rule).split(",");
+    let target = parts[parts.length - 1];
+    if (target === "no-resolve") target = parts[parts.length - 2];
+    if (names.indexOf(target) !== -1) references[target] = (references[target] || 0) + 1;
+  });
+  let frequentName = null;
+  let frequentCount = 0;
+  names.forEach(function (name) {
+    const count = references[name] || 0;
+    if (count > frequentCount) {
+      frequentCount = count;
+      frequentName = name;
+    }
+  });
+  if (frequentName && frequentCount > 1) return frequentName;
 
   for (let i = 0; i < CLASH_PATCH_POLICY.mainGroupNames.length; i += 1) {
     const preferred = CLASH_PATCH_POLICY.mainGroupNames[i].toLowerCase();
     const found = names.find(function (name) { return name.toLowerCase() === preferred; });
     if (found) return found;
   }
-  for (let i = 0; i < groups.length; i += 1) {
-    const members = Array.isArray(groups[i].proxies) ? groups[i].proxies : [];
-    if (members.length && !members.every(function (member) { return member === "DIRECT"; })) return groups[i].name;
+  for (let i = 0; i < candidates.length; i += 1) {
+    const uses = Array.isArray(candidates[i].use) ? candidates[i].use : [];
+    if (uses.length) return candidates[i].name;
+    const members = Array.isArray(candidates[i].proxies) ? candidates[i].proxies : [];
+    if (members.length && !members.every(function (member) { return member === "DIRECT"; })) return candidates[i].name;
   }
   return null;
 }
@@ -185,13 +210,14 @@ function clashPatchEnsureAiGroup(config, mainGroup, candidate) {
     group = { name: name, type: "select", proxies: [mainGroup] };
     config["proxy-groups"].push(group);
   }
-  const proxies = Array.isArray(group.proxies) ? group.proxies.slice() : [];
-  if (candidate) {
+  // Invariant: a proxy group must never list itself as a member.
+  const proxies = (Array.isArray(group.proxies) ? group.proxies : []).filter(function (member) { return member !== group.name; });
+  if (candidate && candidate !== group.name) {
     const index = proxies.indexOf(candidate);
     if (index !== -1) proxies.splice(index, 1);
     proxies.unshift(candidate);
-    if (proxies.indexOf(mainGroup) === -1) proxies.push(mainGroup);
-  } else if (!proxies.length) {
+    if (mainGroup !== group.name && proxies.indexOf(mainGroup) === -1) proxies.push(mainGroup);
+  } else if (!proxies.length && mainGroup !== group.name) {
     proxies.push(mainGroup);
   }
   group.proxies = proxies;
@@ -312,6 +338,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     CLASH_PATCH_POLICY: CLASH_PATCH_POLICY,
     clashPatchCompose: clashPatchCompose,
+    clashPatchDetectMain: clashPatchDetectMain,
     clashPatchTransform: clashPatchTransform,
     main: main
   };

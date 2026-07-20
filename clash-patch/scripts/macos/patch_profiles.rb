@@ -39,15 +39,20 @@ module ClashPatch
     end
   end
 
+  # AI-named groups are never main-group candidates: the managed DNS and UDP
+  # rules must not make the AI group target itself.
   def detect_main_group(config, policy)
-    selectable = selectable_groups(config)
-    names = selectable.map { |group| group["name"] }
+    candidates = selectable_groups(config).reject { |group| ai_name?(group["name"], policy) }
+    names = candidates.map { |group| group["name"] }
+
     match_rule = Array(config["rules"]).reverse.find { |rule| rule.to_s.start_with?("MATCH,") }
     match_target = match_rule.to_s.split(",", 2)[1]
-    return match_target if names.include?(match_target) && match_target != "DIRECT"
+    return match_target if match_target != "DIRECT" && names.include?(match_target)
 
     references = Hash.new(0)
     Array(config["rules"]).each do |rule|
+      next unless broad_rule?(rule)
+
       parts = rule.to_s.split(",")
       target = parts[-1]
       target = parts[-2] if target == "no-resolve"
@@ -61,7 +66,9 @@ module ClashPatch
       return found if found
     end
 
-    selectable.each do |group|
+    candidates.each do |group|
+      return group["name"] unless Array(group["use"]).empty?
+
       members = Array(group["proxies"])
       return group["name"] unless members.empty? || members.all? { |member| member == "DIRECT" }
     end
@@ -118,12 +125,13 @@ module ClashPatch
       config["proxy-groups"] << group
     end
 
-    proxies = Array(group["proxies"]).dup
-    if candidate
+    # Invariant: a proxy group must never list itself as a member.
+    proxies = Array(group["proxies"]).dup - [group["name"]]
+    if candidate && candidate != group["name"]
       proxies.delete(candidate)
       proxies.unshift(candidate)
-      proxies << main_group unless proxies.include?(main_group)
-    elsif proxies.empty?
+      proxies << main_group if main_group != group["name"] && !proxies.include?(main_group)
+    elsif proxies.empty? && main_group != group["name"]
       proxies << main_group
     end
     group["proxies"] = proxies
@@ -299,9 +307,11 @@ module ClashPatch
 
   def backup_once(path, backup_root)
     FileUtils.mkdir_p(backup_root)
+    FileUtils.chmod(0o700, backup_root)
     key = Digest::SHA256.hexdigest(File.expand_path(path))[0, 16]
     destination = File.join(backup_root, "#{key}-#{File.basename(path)}.backup")
     FileUtils.cp(path, destination) unless File.exist?(destination)
+    FileUtils.chmod(0o600, destination)
   end
 
   def patch_path(path, policy, dry_run: false, backup_root: nil)
@@ -358,16 +368,17 @@ module ClashPatch
     )
   end
 
-  def run(directory:, policy_path:, dry_run: false, backup_root: nil)
+  def run(directory:, policy_path:, dry_run: false, backup_root: nil, reloader: nil, selected_name: nil)
     policy = JSON.parse(File.read(policy_path, encoding: "UTF-8"))
+    reloader ||= method(:reload)
+    selected = selected_name.nil? ? selected_profile_name : selected_name
     results = profile_paths(directory).map do |path|
-      patch_path(path, policy, dry_run: dry_run, backup_root: backup_root)
+      result = patch_path(path, policy, dry_run: dry_run, backup_root: backup_root)
+      result[:active] = File.basename(path, File.extname(path)) == selected
+      result
     end
-    selected = selected_profile_name
-    active = results.find do |result|
-      result[:changed] && File.basename(result[:path], File.extname(result[:path])) == selected
-    end
-    active[:reloaded] = reload(active[:path]) if active && !dry_run
+    active = results.find { |result| result[:changed] && result[:active] }
+    active[:reloaded] = reloader.call(active[:path]) if active && !dry_run
     results
   end
 
@@ -376,11 +387,18 @@ module ClashPatch
     case result[:status]
     when :updated
       node = result[:selected_home] ? "；AI 已选择「#{result[:selected_home]}」" : "；没有台湾或日本家宽节点，未替你更换节点"
-      "#{name}：已更新#{node}"
+      "#{name}：#{updated_state(result)}#{node}"
     when :unchanged then "#{name}：无需修改"
     when :no_main_group then "#{name}：未修改，找不到可用的主代理组"
     else "#{name}：已跳过，订阅内容无效"
     end
+  end
+
+  def updated_state(result)
+    return "将更新（演练，未写入文件）" if result[:dry_run]
+    return "已更新，选择该订阅时生效" unless result[:active]
+
+    result[:reloaded] ? "已更新并生效" : "已更新，等待重新加载"
   end
 
   def cli(argv = ARGV)
