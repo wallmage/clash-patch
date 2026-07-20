@@ -24,9 +24,10 @@ description: Use when an agent needs to inspect, repair, or persist DNS, WebRTC,
 | macOS 旧版 ClashX | 不修改；建议安装最新版 ClashX Meta |
 | Windows 旧版或其他客户端 | 不修改；建议安装最新版 Clash Verge Rev |
 
-4. 安装程序必须处理所有订阅，而不是只处理当前订阅。
-5. 检查安装结果和持久化机制。macOS 必须确认 LaunchAgent 已加载；Windows 必须确认全局扩展脚本已安装。
-6. 如果当前配置已经重新加载，再做浏览器验证；没有重新加载时，先重新加载订阅或重启内核。
+4. 安装程序必须处理所有订阅，而不是只处理当前订阅。macOS 同时检查本地与 ClashX Meta 的 iCloud 目录。
+5. 检查安装结果和持久化机制。macOS 必须确认 LaunchAgent 已加载，并从运行内核读取 TUN 状态；只有明确读到关闭时才能调用 AppleScript 切换，状态未知时不得切换。无法确认开启就写成“等待用户开启”。Windows 必须确认全局扩展脚本已安装。
+6. 只有当前配置重新加载成功，而且 macOS 已通过控制器确认 AI 节点选择时，才能说相应设置已经生效。否则如实写成等待重新加载。
+7. 当前配置生效后再做浏览器验证。
 
 ## 执行命令
 
@@ -46,15 +47,37 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_window
 
 ## AI 节点通知
 
-如果订阅含有台湾家宽节点，优先把它放在 AI 组第一位；否则选择日本家宽。通知用户：
+补丁使用自己管理的 AI 选择组，不修改订阅原有的同名组。如果订阅含有台湾家宽节点，AI 组只放这个节点；否则只放日本家宽。只有当前配置已重新加载，且 macOS 已通过控制器切换并回读成功时，才能发送下面这条“已切换”通知：
 
 > 已将 OpenAI、ChatGPT、Codex、Claude 和 Anthropic 流量切换到「{节点名称}」。家宽节点使用住宅网络运营商的 IP，通常比机房节点更少触发代理或异常流量检查。台湾使用 UTC+8，日本只快一小时，而且两地距离较近，通常延迟更低。
+
+如果文件已经修改但当前配置尚未重新加载，改为说明：“重新加载或选择该订阅后，AI 流量将使用「{节点名称}」”，不得提前说已经切换。
 
 如果台湾和日本家宽都没有，不得选择其他地区的家宽，也不得替用户更换当前节点。通知用户：
 
 > 当前订阅没有台湾或日本家宽节点，Clash 补丁没有替你更换节点。建议选择提供台湾或日本家宽的订阅：两地距离近，台湾时区相同，日本只差一小时，通常更适合稳定使用 AI 服务。
 
 不要承诺家宽节点一定可用、永不风控或绝对匿名。
+
+## 安全出口
+
+补丁会另外创建一个不含 `DIRECT`、`REJECT`、`PASS` 或兼容出口的安全代理组。DNS 只使用带这个组标签的 DoH。通用 UDP 先交给安全代理组，紧接一条 `NETWORK,UDP,REJECT`；代理不支持 UDP 时必须停止，不能继续匹配后面的直连规则。
+
+## 移除持久化
+
+用户只想关闭自动补丁时运行：
+
+```bash
+bash scripts/uninstall_macos.sh
+```
+
+或：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\uninstall_windows.ps1
+```
+
+卸载只移除自动运行机制，不删除备份，不擅自还原已经修改的订阅。
 
 ## 自动验证
 
@@ -86,8 +109,12 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_window
 - `无需修改`
 - `已更新，等待重新加载`
 - `已更新，选择该订阅时生效`
+- `未修改：找不到可用的主代理组`
 - `已跳过：订阅内容无效`
+- `已跳过：内核校验失败`
+- `已跳过：读取或写入失败`
+- `已跳过：处理失败`
 - `未修改：客户端不受支持`
 - `未验证：需要手动测试`
 
-同时说明 AI 组、主代理组、家宽选择、持久化状态、三项测试结果和下一步。不要修改或添加个人化的 Apple、iCloud 或测速网站规则。
+同时说明补丁专用 AI 组、安全代理组、主代理组、家宽选择、TUN、持久化状态、三项测试结果和下一步。不要修改或添加个人化的 Apple、iCloud 或测速网站规则。

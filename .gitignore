@@ -1,6 +1,6 @@
 .DS_Store
 docs/
-tests/
+tests/baseline.md
 dist/
 *.zip
 *.log

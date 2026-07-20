@@ -1,23 +1,54 @@
 // Clash Patch — Clash Verge Rev global enhancement script.
 // This file intentionally has no Node.js runtime dependency.
 
+// CLASH PATCH POLICY BEGIN
 const CLASH_PATCH_POLICY = {
-  resolvers: [
+  "resolvers": [
     "https://1.1.1.1/dns-query",
     "https://1.0.0.1/dns-query",
     "https://8.8.8.8/dns-query"
   ],
-  proxyBootstrapResolvers: [
-    "https://223.5.5.5/dns-query",
-    "https://1.1.1.1/dns-query"
+  "proxyBootstrapResolvers": [
+    "https://1.1.1.1/dns-query",
+    "https://8.8.8.8/dns-query"
   ],
-  defaultBootstrapResolvers: ["223.5.5.5", "1.1.1.1"],
-  mainGroupNames: ["Proxy", "PROXY", "Final", "Fallback", "节点选择", "节点列表", "兜底分流"],
-  aiGroupNames: ["AI", "OpenAI", "人工智能", "🤖 AI"],
-  taiwanTokens: ["台湾", "台灣", "Taiwan", "TW", "🇹🇼"],
-  japanTokens: ["日本", "Japan", "JP", "🇯🇵"],
-  forbiddenAiDomains: ["raw.githubusercontent.com", "storage.googleapis.com"],
-  aiRules: [
+  "defaultBootstrapResolvers": [
+    "1.1.1.1",
+    "8.8.8.8"
+  ],
+  "mainGroupNames": [
+    "Proxy",
+    "PROXY",
+    "Final",
+    "Fallback",
+    "节点选择",
+    "节点列表",
+    "兜底分流"
+  ],
+  "aiGroupNames": [
+    "AI",
+    "OpenAI",
+    "人工智能",
+    "🤖 AI"
+  ],
+  "taiwanTokens": [
+    "台湾",
+    "台灣",
+    "Taiwan",
+    "TW",
+    "🇹🇼"
+  ],
+  "japanTokens": [
+    "日本",
+    "Japan",
+    "JP",
+    "🇯🇵"
+  ],
+  "forbiddenAiDomains": [
+    "raw.githubusercontent.com",
+    "storage.googleapis.com"
+  ],
+  "aiRules": [
     "DOMAIN-SUFFIX,anthropic.com,{AI}",
     "DOMAIN-SUFFIX,claude.ai,{AI}",
     "DOMAIN-SUFFIX,claude.com,{AI}",
@@ -29,27 +60,10 @@ const CLASH_PATCH_POLICY = {
     "DOMAIN-SUFFIX,openai.com,{AI}",
     "DOMAIN-SUFFIX,chatgpt.com,{AI}",
     "DOMAIN-SUFFIX,chatgpt.livekit.cloud,{AI}",
-    "DOMAIN-SUFFIX,host.livekit.cloud,{AI}",
-    "DOMAIN-SUFFIX,turn.livekit.cloud,{AI}",
     "DOMAIN-SUFFIX,oaistatic.com,{AI}",
     "DOMAIN-SUFFIX,oaiusercontent.com,{AI}",
     "DOMAIN-SUFFIX,oaistatsig.com,{AI}",
-    "DOMAIN-SUFFIX,ct.sendgrid.net,{AI}",
-    "DOMAIN-SUFFIX,intercom.io,{AI}",
-    "DOMAIN-SUFFIX,intercomcdn.com,{AI}",
     "DOMAIN-SUFFIX,cdn.openaimerge.com,{AI}",
-    "DOMAIN-SUFFIX,workos.com,{AI}",
-    "DOMAIN-SUFFIX,workoscdn.com,{AI}",
-    "DOMAIN,workos.imgix.net,{AI}",
-    "DOMAIN-SUFFIX,challenges.cloudflare.com,{AI}",
-    "DOMAIN,js.stripe.com,{AI}",
-    "DOMAIN-SUFFIX,browser-intake-datadoghq.com,{AI}",
-    "DOMAIN-SUFFIX,sentry.io,{AI}",
-    "DOMAIN-SUFFIX,auth0.com,{AI}",
-    "DOMAIN-SUFFIX,api.statsig.com,{AI}",
-    "DOMAIN-SUFFIX,events.statsigapi.net,{AI}",
-    "DOMAIN-SUFFIX,featuregates.org,{AI}",
-    "DOMAIN-SUFFIX,client-api.arkoselabs.com,{AI}",
     "DOMAIN,openai-api.arkoselabs.com,{AI}",
     "DOMAIN,chat.openai.com.cdn.cloudflare.net,{AI}",
     "DOMAIN,openaiapi-site.azureedge.net,{AI}",
@@ -57,13 +71,7 @@ const CLASH_PATCH_POLICY = {
     "DOMAIN,openaicom-api-bdcpf8c6d2e9atf6.z01.azurefd.net,{AI}",
     "DOMAIN,openaicomproductionae4b.blob.core.windows.net,{AI}",
     "DOMAIN,production-openaicom-storage.azureedge.net,{AI}",
-    "DOMAIN,static.cloudflareinsights.com,{AI}",
     "DOMAIN-SUFFIX,ai.com,{AI}",
-    "DOMAIN-SUFFIX,algolia.net,{AI}",
-    "DOMAIN-SUFFIX,identrust.com,{AI}",
-    "DOMAIN-SUFFIX,launchdarkly.com,{AI}",
-    "DOMAIN-SUFFIX,observeit.net,{AI}",
-    "DOMAIN-SUFFIX,segment.io,{AI}",
     "DOMAIN,ai.google.dev,{AI}",
     "DOMAIN-SUFFIX,aistudio.google.com,{AI}",
     "DOMAIN-SUFFIX,gemini.google.com,{AI}",
@@ -77,35 +85,16 @@ const CLASH_PATCH_POLICY = {
     "DOMAIN,aiplatform.googleapis.com,{AI}",
     "DOMAIN-SUFFIX,generativeai.google,{AI}",
     "DOMAIN-KEYWORD,openai,{AI}",
-    "IP-CIDR,24.199.123.28/32,{AI},no-resolve",
-    "IP-CIDR,64.23.132.171/32,{AI},no-resolve",
     "IP-CIDR,160.79.104.0/21,{AI},no-resolve",
-    "IP-CIDR6,2607:6bc0::/48,{AI},no-resolve",
-    "IP-CIDR,102.37.57.54/32,{AI},no-resolve",
-    "IP-CIDR,13.71.25.29/32,{AI},no-resolve",
-    "IP-CIDR,135.220.40.201/32,{AI},no-resolve",
-    "IP-CIDR,172.203.39.49/32,{AI},no-resolve",
-    "IP-CIDR,172.207.173.200/32,{AI},no-resolve",
-    "IP-CIDR,172.214.226.198/32,{AI},no-resolve",
-    "IP-CIDR,191.233.251.27/32,{AI},no-resolve",
-    "IP-CIDR,20.162.96.163/32,{AI},no-resolve",
-    "IP-CIDR,20.168.48.117/32,{AI},no-resolve",
-    "IP-CIDR,20.184.36.134/32,{AI},no-resolve",
-    "IP-CIDR,20.203.144.245/32,{AI},no-resolve",
-    "IP-CIDR,20.74.221.21/32,{AI},no-resolve",
-    "IP-CIDR,4.151.200.38/32,{AI},no-resolve",
-    "IP-CIDR,4.155.146.196/32,{AI},no-resolve",
-    "IP-CIDR,4.197.172.116/32,{AI},no-resolve",
-    "IP-CIDR,4.217.235.100/32,{AI},no-resolve",
-    "IP-CIDR,4.245.198.13/32,{AI},no-resolve",
-    "IP-CIDR,40.118.236.137/32,{AI},no-resolve",
-    "IP-CIDR,51.4.112.173/32,{AI},no-resolve",
-    "IP-CIDR,52.143.181.161/32,{AI},no-resolve",
-    "IP-CIDR,68.155.152.41/32,{AI},no-resolve",
-    "IP-CIDR,72.146.20.246/32,{AI},no-resolve",
-    "IP-CIDR,74.248.148.7/32,{AI},no-resolve"
+    "IP-CIDR6,2607:6bc0::/48,{AI},no-resolve"
   ]
 };
+// CLASH PATCH POLICY END
+
+const CLASH_PATCH_AI_GROUP = "🤖 AI · Clash Patch";
+const CLASH_PATCH_SAFE_GROUP = "🛡 安全代理 · Clash Patch";
+const CLASH_PATCH_DIRECT_NAMES = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"];
+const CLASH_PATCH_DIRECT_TYPES = ["direct", "reject", "pass", "compatible"];
 
 function clashPatchClone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -123,11 +112,24 @@ function clashPatchSelectableGroups(config) {
   });
 }
 
+function clashPatchManagedName(name, base) {
+  if (typeof name !== "string") return false;
+  if (name === base) return true;
+  if (name.indexOf(base + " ") !== 0) return false;
+  return /^[2-9][0-9]*$/.test(name.slice(base.length + 1));
+}
+
+function clashPatchManagedGroupName(name) {
+  return clashPatchManagedName(name, CLASH_PATCH_AI_GROUP) || clashPatchManagedName(name, CLASH_PATCH_SAFE_GROUP);
+}
+
 // AI-named groups are never main-group candidates: the managed DNS and UDP
 // rules must not make the AI group target itself.
 function clashPatchDetectMain(config) {
   const groups = clashPatchSelectableGroups(config);
-  const candidates = groups.filter(function (group) { return !clashPatchAiName(group.name); });
+  const candidates = groups.filter(function (group) {
+    return !clashPatchAiName(group.name) && !clashPatchManagedGroupName(group.name);
+  });
   const names = candidates.map(function (group) { return group.name; });
 
   const matchRule = config.rules.slice().reverse().find(function (rule) { return String(rule).indexOf("MATCH,") === 0; });
@@ -202,25 +204,65 @@ function clashPatchHomeCandidate(config) {
   }) || null;
 }
 
+function clashPatchUniqueGroupName(config, base) {
+  const names = (config["proxy-groups"] || []).map(function (group) { return group && group.name; });
+  if (names.indexOf(base) === -1) return base;
+  let suffix = 2;
+  while (names.indexOf(base + " " + suffix) !== -1) suffix += 1;
+  return base + " " + suffix;
+}
+
+function clashPatchFindManagedSelect(config, base) {
+  return clashPatchSelectableGroups(config).find(function (group) {
+    return clashPatchManagedName(group.name, base);
+  });
+}
+
+function clashPatchResetGroup(group) {
+  Object.keys(group).forEach(function (key) {
+    if (key !== "name" && key !== "type") delete group[key];
+  });
+  group.type = "select";
+}
+
 function clashPatchEnsureAiGroup(config, mainGroup, candidate) {
-  let group = clashPatchSelectableGroups(config).find(function (item) { return clashPatchAiName(item.name); });
+  let group = clashPatchFindManagedSelect(config, CLASH_PATCH_AI_GROUP);
   if (!group) {
-    let name = "🤖 AI";
-    if (config["proxy-groups"].some(function (item) { return item && item.name === name; })) name = "🤖 AI 2";
-    group = { name: name, type: "select", proxies: [mainGroup] };
+    group = { name: clashPatchUniqueGroupName(config, CLASH_PATCH_AI_GROUP), type: "select" };
     config["proxy-groups"].push(group);
   }
-  // Invariant: a proxy group must never list itself as a member.
-  const proxies = (Array.isArray(group.proxies) ? group.proxies : []).filter(function (member) { return member !== group.name; });
-  if (candidate && candidate !== group.name) {
-    const index = proxies.indexOf(candidate);
-    if (index !== -1) proxies.splice(index, 1);
-    proxies.unshift(candidate);
-    if (mainGroup !== group.name && proxies.indexOf(mainGroup) === -1) proxies.push(mainGroup);
-  } else if (!proxies.length && mainGroup !== group.name) {
-    proxies.push(mainGroup);
+  clashPatchResetGroup(group);
+  group.proxies = [candidate || mainGroup].filter(function (name) { return name !== group.name; });
+  return group.name;
+}
+
+function clashPatchSafeInlineProxies(config) {
+  const names = [];
+  (config.proxies || []).forEach(function (proxy) {
+    if (!proxy || typeof proxy.name !== "string") return;
+    if (CLASH_PATCH_DIRECT_TYPES.indexOf(String(proxy.type || "").toLowerCase()) !== -1) return;
+    if (names.indexOf(proxy.name) === -1) names.push(proxy.name);
+  });
+  return names;
+}
+
+function clashPatchEnsureSafeGroup(config, candidate) {
+  let group = clashPatchFindManagedSelect(config, CLASH_PATCH_SAFE_GROUP);
+  if (!group) {
+    group = { name: clashPatchUniqueGroupName(config, CLASH_PATCH_SAFE_GROUP), type: "select" };
+    config["proxy-groups"].push(group);
   }
-  group.proxies = proxies;
+  const proxies = clashPatchSafeInlineProxies(config);
+  const index = candidate ? proxies.indexOf(candidate) : -1;
+  if (index !== -1) {
+    proxies.splice(index, 1);
+    proxies.unshift(candidate);
+  }
+  clashPatchResetGroup(group);
+  group.proxies = proxies.filter(function (name) { return name !== group.name; });
+  group["include-all"] = true;
+  group["exclude-type"] = "Direct|Reject|Pass|Compatible";
+  group["empty-fallback"] = "REJECT";
   return group.name;
 }
 
@@ -238,7 +280,46 @@ function clashPatchDnsPatterns() {
   return patterns;
 }
 
-function clashPatchDns(config, mainGroup, aiGroup) {
+function clashPatchDirectName(name) {
+  return CLASH_PATCH_DIRECT_NAMES.some(function (candidate) {
+    return candidate.toLowerCase() === String(name || "").toLowerCase();
+  });
+}
+
+function clashPatchSafeProxyTarget(config, target) {
+  return (config.proxies || []).some(function (proxy) {
+    return proxy && proxy.name === target && CLASH_PATCH_DIRECT_TYPES.indexOf(String(proxy.type || "").toLowerCase()) === -1;
+  });
+}
+
+function clashPatchGroupCannotReachDirect(config, target, visiting) {
+  visiting = visiting || [];
+  if (clashPatchDirectName(target) || visiting.indexOf(target) !== -1) return false;
+  const group = (config["proxy-groups"] || []).find(function (item) { return item && item.name === target; });
+  if (!group) return false;
+
+  const members = Array.isArray(group.proxies) ? group.proxies : [];
+  const memberSafe = members.every(function (member) {
+    return clashPatchSafeProxyTarget(config, member) || clashPatchGroupCannotReachDirect(config, member, visiting.concat([target]));
+  });
+  const uses = Array.isArray(group.use) ? group.use : [];
+  const providers = config["proxy-providers"] || {};
+  const providerSafe = uses.length > 0 && uses.every(function (name) {
+    return Object.prototype.hasOwnProperty.call(providers, name);
+  });
+  const includeAllSafe = group["include-all"] === true && String(group["exclude-type"] || "").toLowerCase().indexOf("direct") !== -1;
+  return memberSafe && (members.length > 0 || providerSafe || includeAllSafe);
+}
+
+function clashPatchSafeResolverEndpoint(config, endpoint) {
+  const fragment = String(endpoint).split("#")[1];
+  if (!fragment) return false;
+  const target = fragment.split("&")[0];
+  if (!target || target.indexOf("=") !== -1 || clashPatchDirectName(target)) return false;
+  return clashPatchSafeProxyTarget(config, target) || clashPatchGroupCannotReachDirect(config, target, []);
+}
+
+function clashPatchDns(config, safeGroup) {
   const dns = config.dns && typeof config.dns === "object" && !Array.isArray(config.dns) ? config.dns : {};
   config.dns = dns;
   dns.enable = true;
@@ -246,27 +327,25 @@ function clashPatchDns(config, mainGroup, aiGroup) {
   dns["respect-rules"] = true;
   dns["use-hosts"] = true;
   dns["use-system-hosts"] = true;
-  const mainResolvers = clashPatchTaggedResolvers(mainGroup);
-  const aiResolvers = clashPatchTaggedResolvers(aiGroup);
+  const safeResolvers = clashPatchTaggedResolvers(safeGroup);
   dns["default-nameserver"] = CLASH_PATCH_POLICY.defaultBootstrapResolvers.slice();
   dns["proxy-server-nameserver"] = CLASH_PATCH_POLICY.proxyBootstrapResolvers.slice();
-  dns.nameserver = mainResolvers.slice();
-  if (Object.prototype.hasOwnProperty.call(dns, "fallback")) dns.fallback = mainResolvers.slice();
-  if (Object.prototype.hasOwnProperty.call(dns, "direct-nameserver")) dns["direct-nameserver"] = mainResolvers.slice();
+  dns.nameserver = safeResolvers.slice();
+  if (Object.prototype.hasOwnProperty.call(dns, "fallback")) dns.fallback = safeResolvers.slice();
+  if (Object.prototype.hasOwnProperty.call(dns, "direct-nameserver")) dns["direct-nameserver"] = safeResolvers.slice();
 
   const existing = dns["nameserver-policy"] && typeof dns["nameserver-policy"] === "object" ? dns["nameserver-policy"] : {};
   const policies = {};
   Object.keys(existing).forEach(function (combined) {
     String(combined).split(",").map(function (item) { return item.trim(); }).filter(Boolean).forEach(function (pattern) {
       const values = (Array.isArray(existing[combined]) ? existing[combined] : [existing[combined]]).map(String);
-      const safe = values.some(function (value) {
-        const fragment = value.split("#")[1];
-        return fragment && fragment.split("&")[0] !== "DIRECT";
+      const safe = values.length > 0 && values.every(function (value) {
+        return clashPatchSafeResolverEndpoint(config, value);
       });
-      policies[pattern] = safe ? values : mainResolvers.slice();
+      policies[pattern] = safe ? values : safeResolvers.slice();
     });
   });
-  clashPatchDnsPatterns().forEach(function (pattern) { policies[pattern] = aiResolvers.slice(); });
+  clashPatchDnsPatterns().forEach(function (pattern) { policies[pattern] = safeResolvers.slice(); });
   dns["nameserver-policy"] = policies;
 }
 
@@ -283,8 +362,14 @@ function clashPatchBroadRule(rule) {
   return /(?:^|[-_])(ai|cn|china|direct|domestic|global|notcn|proxy)(?:$|[-_])/i.test(provider) || /国内|国外|节点|兜底/.test(provider);
 }
 
-function clashPatchRules(config, mainGroup, aiGroup) {
-  const managed = CLASH_PATCH_POLICY.aiRules.map(function (template) { return template.replace("{AI}", aiGroup); });
+function clashPatchRenderAiRules(aiGroup) {
+  return CLASH_PATCH_POLICY.aiRules.map(function (template) {
+    return template.replace(/\{AI\}/g, function () { return aiGroup; });
+  });
+}
+
+function clashPatchRules(config, aiGroup, safeGroup) {
+  const managed = clashPatchRenderAiRules(aiGroup);
   const identities = managed.map(clashPatchRuleIdentity);
   const aiNames = (config["proxy-groups"] || []).filter(function (group) { return group && clashPatchAiName(group.name); }).map(function (group) { return group.name; });
   if (aiNames.indexOf(aiGroup) === -1) aiNames.push(aiGroup);
@@ -299,7 +384,7 @@ function clashPatchRules(config, mainGroup, aiGroup) {
   });
   let anchor = rules.findIndex(clashPatchBroadRule);
   if (anchor === -1) anchor = rules.length;
-  rules.splice.apply(rules, [anchor, 0].concat(managed, ["NETWORK,UDP," + mainGroup]));
+  rules.splice.apply(rules, [anchor, 0].concat(managed, ["NETWORK,UDP," + safeGroup, "NETWORK,UDP,REJECT"]));
   config.rules = rules;
 }
 
@@ -310,6 +395,7 @@ function clashPatchTransform(config, profileName) {
   if (!mainGroup) return config;
   const candidate = clashPatchHomeCandidate(patched);
   const aiGroup = clashPatchEnsureAiGroup(patched, mainGroup, candidate);
+  const safeGroup = clashPatchEnsureSafeGroup(patched, candidate);
   patched.ipv6 = false;
   patched.tun = patched.tun && typeof patched.tun === "object" ? patched.tun : {};
   patched.tun.enable = true;
@@ -318,8 +404,8 @@ function clashPatchTransform(config, profileName) {
   patched.tun["auto-route"] = true;
   patched.tun["auto-detect-interface"] = true;
   patched.tun["strict-route"] = true;
-  clashPatchDns(patched, mainGroup, aiGroup);
-  clashPatchRules(patched, mainGroup, aiGroup);
+  clashPatchDns(patched, safeGroup);
+  clashPatchRules(patched, aiGroup, safeGroup);
   return patched;
 }
 
@@ -339,6 +425,11 @@ if (typeof module !== "undefined" && module.exports) {
     CLASH_PATCH_POLICY: CLASH_PATCH_POLICY,
     clashPatchCompose: clashPatchCompose,
     clashPatchDetectMain: clashPatchDetectMain,
+    clashPatchRenderAiRules: clashPatchRenderAiRules,
+    clashPatchSafeGroupName: function (config) {
+      const group = clashPatchFindManagedSelect(config, CLASH_PATCH_SAFE_GROUP);
+      return group ? group.name : null;
+    },
     clashPatchTransform: clashPatchTransform,
     main: main
   };

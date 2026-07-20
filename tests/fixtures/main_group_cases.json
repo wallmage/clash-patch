@@ -1,0 +1,158 @@
+{
+  "comment": "Cross-engine main-group detection cases, consumed by tests/test_macos_patcher.rb and tests/test_windows_patcher.js. expected_main_group null means no valid main group exists and the configuration must remain unchanged.",
+  "cases": [
+    {
+      "name": "match-target-wins",
+      "config": {
+        "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
+        "proxy-groups": [
+          { "name": "Main", "type": "select", "proxies": ["台湾家宽 01"] },
+          { "name": "AI", "type": "select", "proxies": ["Main"] }
+        ],
+        "rules": ["GEOSITE,CN,DIRECT", "MATCH,Main"]
+      },
+      "expected_main_group": "Main"
+    },
+    {
+      "name": "match-direct-broad-references-win",
+      "config": {
+        "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
+        "proxy-groups": [
+          { "name": "节点选择", "type": "select", "proxies": ["台湾家宽 01"] },
+          { "name": "AI", "type": "select", "proxies": ["节点选择"] }
+        ],
+        "rules": ["GEOSITE,GOOGLE,节点选择", "GEOIP,US,节点选择", "GEOSITE,CN,DIRECT", "MATCH,DIRECT"]
+      },
+      "expected_main_group": "节点选择"
+    },
+    {
+      "name": "no-match-uses-common-name",
+      "config": {
+        "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
+        "proxy-groups": [
+          { "name": "Streaming", "type": "select", "proxies": ["台湾家宽 01"] },
+          { "name": "节点选择", "type": "select", "proxies": ["台湾家宽 01"] }
+        ],
+        "rules": ["GEOSITE,CN,DIRECT"]
+      },
+      "expected_main_group": "节点选择"
+    },
+    {
+      "name": "fallback-skips-ai-and-direct-only-groups",
+      "config": {
+        "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
+        "proxy-groups": [
+          { "name": "AI", "type": "select", "proxies": ["台湾家宽 01"] },
+          { "name": "DirectOnly", "type": "select", "proxies": ["DIRECT"] },
+          { "name": "LastResort", "type": "select", "proxies": ["台湾家宽 01"] }
+        ],
+        "rules": []
+      },
+      "expected_main_group": "LastResort"
+    },
+    {
+      "name": "ai-only-group-rejected",
+      "config": {
+        "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
+        "proxy-groups": [
+          { "name": "AI", "type": "select", "proxies": ["台湾家宽 01"] }
+        ],
+        "rules": ["MATCH,AI"]
+      },
+      "expected_main_group": null
+    },
+    {
+      "name": "no-valid-main-group",
+      "config": {
+        "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
+        "proxy-groups": [
+          { "name": "AI", "type": "select", "proxies": ["台湾家宽 01"] },
+          { "name": "DirectOnly", "type": "select", "proxies": ["DIRECT"] }
+        ],
+        "rules": ["MATCH,DIRECT"]
+      },
+      "expected_main_group": null
+    },
+    {
+      "name": "narrow-streaming-rules-do-not-outrank",
+      "config": {
+        "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
+        "proxy-groups": [
+          { "name": "Streaming", "type": "select", "proxies": ["台湾家宽 01"] },
+          { "name": "节点选择", "type": "select", "proxies": ["台湾家宽 01"] }
+        ],
+        "rules": [
+          "DOMAIN-SUFFIX,youtube.com,Streaming",
+          "DOMAIN-SUFFIX,googlevideo.com,Streaming",
+          "DOMAIN-SUFFIX,netflix.com,Streaming",
+          "DOMAIN-SUFFIX,nflxvideo.net,Streaming",
+          "DOMAIN-SUFFIX,disneyplus.com,Streaming",
+          "DOMAIN-KEYWORD,stream,Streaming",
+          "GEOSITE,CN,DIRECT",
+          "MATCH,DIRECT"
+        ]
+      },
+      "expected_main_group": "节点选择"
+    },
+    {
+      "name": "ai-broad-references-excluded",
+      "config": {
+        "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
+        "proxy-groups": [
+          { "name": "AI", "type": "select", "proxies": ["台湾家宽 01"] },
+          { "name": "Final", "type": "select", "proxies": ["台湾家宽 01"] }
+        ],
+        "rules": ["GEOIP,US,AI", "GEOSITE,GOOGLE,AI", "MATCH,DIRECT"]
+      },
+      "expected_main_group": "Final"
+    },
+    {
+      "name": "match-target-ai-falls-through",
+      "config": {
+        "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
+        "proxy-groups": [
+          { "name": "AI", "type": "select", "proxies": ["台湾家宽 01"] },
+          { "name": "Proxy", "type": "select", "proxies": ["台湾家宽 01"] }
+        ],
+        "rules": ["MATCH,AI"]
+      },
+      "expected_main_group": "Proxy"
+    },
+    {
+      "name": "single-broad-reference-not-enough",
+      "config": {
+        "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
+        "proxy-groups": [
+          { "name": "Special", "type": "select", "proxies": ["台湾家宽 01"] },
+          { "name": "Proxy", "type": "select", "proxies": ["台湾家宽 01"] }
+        ],
+        "rules": ["GEOIP,US,Special", "MATCH,DIRECT"]
+      },
+      "expected_main_group": "Proxy"
+    },
+    {
+      "name": "broad-no-resolve-target-counted",
+      "config": {
+        "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
+        "proxy-groups": [
+          { "name": "节点选择", "type": "select", "proxies": ["台湾家宽 01"] },
+          { "name": "AI", "type": "select", "proxies": ["节点选择"] }
+        ],
+        "rules": ["GEOIP,US,节点选择,no-resolve", "GEOSITE,GOOGLE,节点选择", "MATCH,DIRECT"]
+      },
+      "expected_main_group": "节点选择"
+    },
+    {
+      "name": "provider-only-selector-usable-as-fallback",
+      "config": {
+        "proxy-providers": { "provider1": { "type": "http", "url": "https://example.invalid/sub", "interval": 3600 } },
+        "proxy-groups": [
+          { "name": "AI", "type": "select", "use": ["provider1"] },
+          { "name": "Provider-Fallback", "type": "select", "use": ["provider1"] }
+        ],
+        "rules": []
+      },
+      "expected_main_group": "Provider-Fallback"
+    }
+  ]
+}
