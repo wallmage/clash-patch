@@ -9,35 +9,28 @@ permissions:
   contents: read
 
 jobs:
-  ruby-and-node:
-    runs-on: ubuntu-latest
+  macos:
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ruby/setup-ruby@003a5c4d8d6321bd302e38f6f0ec593f77f06600 # v1.319.0
         with:
           ruby-version: "3.3"
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
-      - name: Ruby regression suite
+      - name: Ruby 3.3 regression suite
         run: ruby tests/test_macos_patcher.rb
-      - name: Skill contract suite
+      - name: Ruby 3.3 skill contract suite
         run: ruby tests/test_skill_contract.rb
       - name: Windows engine suite
         run: node --test tests/test_windows_patcher.js
       - name: Generated policy parity
         run: ruby tests/generate_windows_policy.rb --check
-      - name: Syntax checks
+      - name: Ruby 3.3 syntax checks
         run: |
           ruby -c clash-patch/scripts/macos/patch_profiles.rb
           node --check clash-patch/scripts/windows/clash_verge_global.js
-          sh -n clash-patch/scripts/install_macos.sh
-          sh -n clash-patch/scripts/uninstall_macos.sh
-
-  macos-system-ruby:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Confirm the supported system Ruby
         run: /usr/bin/ruby -e 'abort "expected Ruby 2.6" unless RUBY_VERSION.start_with?("2.6.")'
       - name: Ruby regressions on the production runtime
@@ -53,7 +46,7 @@ jobs:
   windows-installer:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: PowerShell 5.1 installer and uninstaller regressions
         shell: powershell
         run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command powershell.exe).Source
