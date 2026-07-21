@@ -77,7 +77,7 @@ class MacosPatcherTest < Minitest::Test
     assert patched.dig("dns", "nameserver").all? { |value| value.end_with?("#Main") }
   end
 
-  def test_creates_ai_group_following_main_when_subscription_has_none
+  def test_creates_ai_group_with_all_inline_nodes_when_subscription_has_none
     config = base_config
     config["proxy-groups"].reject! { |group| group["name"] == "AI" }
 
@@ -87,9 +87,70 @@ class MacosPatcherTest < Minitest::Test
     assert_equal "🤖 AI · Clash Patch", result.fetch(:ai_group)
     assert_equal "Main", result.fetch(:route_group)
     ai_group = patched.fetch("proxy-groups").find { |group| group["name"] == result.fetch(:ai_group) }
-    assert_equal ["Main"], ai_group.fetch("proxies")
+    assert_equal ["台湾家宽 01", "日本家宽 01", "美国家宽 01"], ai_group.fetch("proxies")
+    refute ai_group.key?("use")
     refute patched.fetch("proxy-groups").any? { |group| ClashPatch.managed_name?(group["name"], ClashPatch::SAFE_GROUP_BASE) }
     assert_includes patched.fetch("rules"), "DOMAIN-SUFFIX,openai.com,🤖 AI · Clash Patch"
+  end
+
+  def test_new_ai_group_includes_every_proxy_provider
+    config = base_config
+    config["proxy-groups"].reject! { |group| group["name"] == "AI" }
+    config["proxy-providers"] = {
+      "airport-a" => { "type" => "http", "url" => "https://example.invalid/a" },
+      "airport-b" => { "type" => "file", "path" => "./providers/b.yaml" }
+    }
+
+    result = ClashPatch.patch(config, @policy)
+    ai_group = result.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == result.fetch(:ai_group) }
+
+    assert_equal ["台湾家宽 01", "日本家宽 01", "美国家宽 01"], ai_group.fetch("proxies")
+    assert_equal ["airport-a", "airport-b"], ai_group.fetch("use")
+  end
+
+  def test_new_ai_group_supports_provider_only_subscriptions
+    config = base_config
+    config["proxies"] = []
+    config["proxy-groups"] = [{ "name" => "Main", "type" => "select", "use" => ["airport-a"] }]
+    config["proxy-providers"] = {
+      "airport-a" => { "type" => "http", "url" => "https://example.invalid/a" }
+    }
+    config["rules"] = ["MATCH,Main"]
+
+    first = ClashPatch.patch(config, @policy)
+    ai_group = first.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == first.fetch(:ai_group) }
+
+    assert_empty ai_group.fetch("proxies")
+    assert_equal ["airport-a"], ai_group.fetch("use")
+    assert_equal first.fetch(:config), ClashPatch.patch(first.fetch(:config), @policy).fetch(:config)
+  end
+
+  def test_does_not_create_ai_group_without_nodes_or_providers
+    config = base_config
+    config["proxies"] = []
+    config.delete("proxy-providers")
+    config["proxy-groups"] = [{ "name" => "Main", "type" => "select", "proxies" => ["Ghost"] }]
+    config["rules"] = ["MATCH,Main"]
+
+    result = ClashPatch.patch(config, @policy)
+
+    assert_equal :no_ai_nodes, result.fetch(:status)
+    assert_equal config, result.fetch(:config)
+  end
+
+  def test_migrates_owned_single_main_ai_group_to_independent_node_selector
+    config = base_config
+    config["proxy-groups"].reject! { |group| group["name"] == "AI" }
+    ai_name = "🤖 AI · Clash Patch"
+    config["proxy-groups"] << { "name" => ai_name, "type" => "select", "proxies" => ["Main"] }
+    config["rules"] = ClashPatch.render_ai_rules(@policy, ai_name) + config.fetch("rules")
+
+    result = ClashPatch.patch(config, @policy)
+    ai_group = result.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == ai_name }
+
+    assert result.fetch(:ai_group_reset)
+    assert_equal ["台湾家宽 01", "日本家宽 01", "美国家宽 01"], ai_group.fetch("proxies")
+    refute_includes ai_group.fetch("proxies"), "Main"
   end
 
   def test_removes_groups_created_by_an_older_patch
@@ -182,7 +243,7 @@ class MacosPatcherTest < Minitest::Test
     assert_equal ["Main"], result.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == "AI" }.fetch("proxies")
   end
 
-  def test_does_not_select_other_country_home_node
+  def test_new_ai_group_lists_other_country_nodes_without_auto_selecting
     config = base_config
     config["proxies"].select! { |proxy| proxy["name"] == "美国家宽 01" }
     config["proxy-groups"].find { |group| group["name"] == "Main" }["proxies"] = ["美国家宽 01"]
@@ -191,7 +252,8 @@ class MacosPatcherTest < Minitest::Test
     ai_group = result.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == "🤖 AI · Clash Patch" }
 
     refute result.key?(:selected_home)
-    assert_equal ["Main"], ai_group.fetch("proxies")
+    assert_equal ["美国家宽 01"], ai_group.fetch("proxies")
+    refute ai_group.key?("now")
   end
 
   def test_preserves_unmanaged_narrow_rules
@@ -936,7 +998,7 @@ class MacosPatcherTest < Minitest::Test
     refute result.fetch(:config).fetch("proxy-groups").any? { |group| ClashPatch.managed_name?(group["name"], ClashPatch::SAFE_GROUP_BASE) }
   end
 
-  def test_owned_ai_group_is_single_member_and_collision_safe
+  def test_owned_ai_group_is_independent_and_collision_safe
     config = base_config
     config["proxy-groups"].reject! { |group| group["name"] == "AI" }
     config["proxy-groups"] << { "name" => "🤖 AI · Clash Patch", "type" => "url-test", "proxies" => ["台湾家宽 01"] }
@@ -947,7 +1009,7 @@ class MacosPatcherTest < Minitest::Test
     assert_equal names.uniq, names
     assert_equal "🤖 AI · Clash Patch 3", result.fetch(:ai_group)
     managed = result.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == result.fetch(:ai_group) }
-    assert_equal ["Main"], managed.fetch("proxies")
+    assert_equal ["台湾家宽 01", "日本家宽 01", "美国家宽 01"], managed.fetch("proxies")
   end
 
   def test_user_owned_branded_select_group_is_preserved
@@ -1035,7 +1097,7 @@ class MacosPatcherTest < Minitest::Test
     assert_includes rules, "IP-CIDR,160.79.104.0/23,#{ai_group},no-resolve"
     refute dns_policy.key?("+.ai.com")
     assert result.fetch(:ai_group_reset)
-    assert_includes ClashPatch.chinese_status(result.merge(path: "/profiles/friend.yaml", active: false)), "改为跟随主代理组，节点由你选择"
+    assert_includes ClashPatch.chinese_status(result.merge(path: "/profiles/friend.yaml", active: false)), "升级 AI 分组"
   end
 
   def test_preserves_user_legacy_ai_rules_and_dns_pattern
@@ -1152,6 +1214,30 @@ class MacosPatcherTest < Minitest::Test
 
       assert_equal true, results.fetch(0).fetch(:active)
       refute results.fetch(0).key?(:reloaded)
+    end
+  end
+
+  def test_run_silently_skips_default_config_when_another_profile_is_selected
+    Dir.mktmpdir do |directory|
+      File.write(File.join(directory, "config.yaml"), "mode: rule\nrules: []\n")
+      selected = File.join(directory, "friend.yaml")
+      File.write(selected, YAML.dump(base_config))
+
+      results = ClashPatch.run(directories: [directory], policy_path: POLICY_PATH, selected_name: "friend", dry_run: true)
+
+      assert_equal [selected], results.map { |result| result.fetch(:path) }
+    end
+  end
+
+  def test_run_keeps_default_config_when_it_is_selected
+    Dir.mktmpdir do |directory|
+      config = File.join(directory, "config.yaml")
+      File.write(config, YAML.dump(base_config))
+      File.write(File.join(directory, "friend.yaml"), YAML.dump(base_config))
+
+      results = ClashPatch.run(directories: [directory], policy_path: POLICY_PATH, selected_name: "config", dry_run: true)
+
+      assert_includes results.map { |result| result.fetch(:path) }, config
     end
   end
 
@@ -1396,6 +1482,7 @@ class MacosPatcherTest < Minitest::Test
       { path: "/profiles/friend.yaml", status: :updated, active: false, ai_group: "AI" },
       { path: "/profiles/friend.yaml", status: :unchanged },
       { path: "/profiles/friend.yaml", status: :no_main_group },
+      { path: "/profiles/friend.yaml", status: :no_ai_nodes },
       { path: "/profiles/friend.yaml", status: :invalid },
       { path: "/profiles/friend.yaml", status: :validation_failed },
       { path: "/profiles/friend.yaml", status: :validation_timeout },

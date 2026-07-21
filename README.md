@@ -13,8 +13,9 @@ Clash Patch 是给 AI 助手使用的 Clash 配置补丁，支持 macOS 的 Clas
 - 打开配置中的 TUN、DNS 劫持、自动路由和严格路由，关闭配置中的 IPv6。
 - 使用通过原主代理组访问的 IP DoH，避免解析器域名错误或节点拒绝 Google、Cloudflare DNS。
 - 保留节点启动解析；缺失或仍是旧版危险固定值时才改用系统 DNS。
-- 已有 AI 分组时保留成员和选择，只补全 OpenAI、ChatGPT、Codex、Claude、Anthropic、Gemini 等规则；没有时才创建跟随主代理组的 AI 分组。
-- 不创建额外的安全代理分组，不替用户选择节点。家宽通常更适合 AI；有台湾家宽时优先台湾，没有时可考虑日本。
+- 已有 AI 分组时保留成员和选择，只补全 OpenAI、ChatGPT、Codex、Claude、Anthropic、Gemini 等规则。
+- 没有 AI 分组时创建独立选择器，加入订阅的全部真实节点和代理提供者。普通流量继续使用主代理组，AI 流量可以单独选择家宽节点。
+- 不创建额外的安全代理分组，也不替用户选择节点。家宽通常更适合 AI；有台湾家宽时优先台湾，没有时可考虑日本。
 - 通用 UDP 先交给原主代理组，失败后立即拒绝，减少 WebRTC 直连风险。
 - macOS 会保护已有且有效的 REALITY `short-id` 文本；Windows 脚本不处理该字段。
 

@@ -152,11 +152,18 @@ module ClashPatch
   end
 
   def managed_ai_group_fingerprint?(group)
-    return false unless group.is_a?(Hash) && group.keys.sort == %w[name proxies type]
+    return false unless group.is_a?(Hash)
+    return false unless (group.keys - %w[name proxies type use]).empty?
+    return false unless %w[name proxies type].all? { |key| group.key?(key) }
     return false unless group["type"].to_s.downcase == "select"
 
     proxies = group["proxies"]
-    proxies.is_a?(Array) && proxies.length == 1 && proxies.first.is_a?(String) && proxies.first != group["name"]
+    providers = group.key?("use") ? group["use"] : []
+    return false unless proxies.is_a?(Array) && providers.is_a?(Array)
+    return false if proxies.empty? && providers.empty?
+
+    proxies.all? { |name| name.is_a?(String) && name != group["name"] } &&
+      providers.all? { |name| name.is_a?(String) && !name.empty? }
   end
 
   def managed_safe_group_fingerprint?(group)
@@ -218,17 +225,43 @@ module ClashPatch
     end
   end
 
-  def ensure_ai_group(config, main_group, candidate, policy)
+  def ai_group_sources(config)
+    proxies = Array(config["proxies"]).each_with_object([]) do |proxy, names|
+      next unless proxy.is_a?(Hash) && proxy["name"].is_a?(String)
+      next if proxy["name"].empty? || direct_name?(proxy["name"])
+      next if DIRECT_TYPES.include?(proxy["type"].to_s.downcase)
+
+      names << proxy["name"] unless names.include?(proxy["name"])
+    end.uniq
+    providers = if config["proxy-providers"].is_a?(Hash)
+                  config["proxy-providers"].each_with_object([]) do |(name, provider), names|
+                    names << name if name.is_a?(String) && !name.empty? && provider.is_a?(Hash)
+                  end
+                else
+                  []
+                end
+    [proxies, providers]
+  end
+
+  def configure_managed_ai_group(group, config)
+    proxies, providers = ai_group_sources(config)
+    return false if proxies.empty? && providers.empty?
+
+    group.keys.each { |key| group.delete(key) unless %w[name type].include?(key) }
+    group["type"] = "select"
+    group["proxies"] = proxies
+    group["use"] = providers unless providers.empty?
+    true
+  end
+
+  def ensure_ai_group(config, policy)
     group = find_managed_select_group(config, AI_GROUP_BASE, :ai, policy)
     unless group
       group = { "name" => unique_group_name(config, AI_GROUP_BASE), "type" => "select" }
       config["proxy-groups"] << group
     end
 
-    group.keys.each { |key| group.delete(key) unless %w[name type].include?(key) }
-    group["type"] = "select"
-    group["proxies"] = [candidate || main_group].reject { |name| name == group["name"] }
-    group["name"]
+    configure_managed_ai_group(group, config) ? group["name"] : nil
   end
 
   def direct_name?(name)
@@ -540,14 +573,13 @@ module ClashPatch
     ai_group_reset = existing_ai && owned_ai_names.include?(existing_ai["name"])
     ai_group = if existing_ai
                  if ai_group_reset
-                   existing_ai.keys.each { |key| existing_ai.delete(key) unless %w[name type].include?(key) }
-                   existing_ai["type"] = "select"
-                   existing_ai["proxies"] = [main_group]
+                   return base_result(config, :no_ai_nodes) unless configure_managed_ai_group(existing_ai, patched)
                  end
                  existing_ai["name"]
                else
-                 ensure_ai_group(patched, main_group, nil, policy)
+                 ensure_ai_group(patched, policy)
                end
+    return base_result(config, :no_ai_nodes) unless ai_group
     route_group = main_group
     patched["ipv6"] = false
     patched["tun"] = {} unless patched["tun"].is_a?(Hash)
@@ -1020,7 +1052,11 @@ module ClashPatch
     active_root = active_directory || active_profile_root(roots, selected, directory)
 
     results = roots.flat_map do |root|
-      profile_paths(root).map do |path|
+      paths = profile_paths(root)
+      unless active_profile?(File.join(root, "config.yaml"), selected)
+        paths = paths.reject { |path| File.basename(path).casecmp("config.yaml").zero? }
+      end
+      paths.map do |path|
         result = patch_path(path, policy, dry_run: dry_run, backup_root: backup_root, validator: validator)
         result[:active] = active_root && File.expand_path(File.dirname(path)) == File.expand_path(active_root) && active_profile?(path, selected)
         result
@@ -1037,6 +1073,7 @@ module ClashPatch
       "#{name}：#{updated_state(result)}#{ai_state(result)}"
     when :unchanged then "#{name}：无需修改"
     when :no_main_group then "#{name}：未修改：找不到可用的主代理组"
+    when :no_ai_nodes then "#{name}：未修改：找不到可用的 AI 节点"
     when :validation_failed then "#{name}：已跳过：内核校验失败"
     when :validation_timeout then "#{name}：已跳过：订阅响应超时"
     when :non_idempotent then "#{name}：已跳过：二次转换不一致"
@@ -1050,8 +1087,8 @@ module ClashPatch
 
   def ai_state(result)
     ai_group = safe_label(result[:ai_group])
-    return "；已创建 AI 分组「#{ai_group}」并跟随主代理组，节点由你选择" if result[:ai_group_created]
-    return "；已保留 AI 分组「#{ai_group}」并改为跟随主代理组，节点由你选择" if result[:ai_group_reset]
+    return "；已创建独立 AI 分组「#{ai_group}」，包含全部可用节点和代理提供者，节点由你选择" if result[:ai_group_created]
+    return "；已升级 AI 分组「#{ai_group}」为独立节点选择器，节点由你选择" if result[:ai_group_reset]
 
     "；已复用 AI 分组「#{ai_group}」，只补全规则，节点未改"
   end

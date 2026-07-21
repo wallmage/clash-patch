@@ -6,6 +6,7 @@
 - 始终在 `main` 上工作，不使用 worktree、功能分支或 PR。
 - 实际修改项目后，除非用户明确要求不要提交，否则自动完成本地测试、commit 和 push，让 GitHub CI 自动运行。不得把“尚未 commit 或 push”作为常规收尾。
 - 文档位置固定。不得自行新增需求汇总、入口、方案或计划文档：`README.md` 面向用户，`clash-patch/SKILL.md` 规定代理流程，`clash-patch/references/patch-policy.md` 保存详细产品规则，`docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md` 保存产品需求与架构。
+- 功能需求变化时，代码、Skill 和相关产品文档必须在同一次改动中同步更新。
 
 ## 项目边界
 

@@ -50,17 +50,74 @@ test('reuses the existing AI group without creating visible groups', { skip: !av
   assert.ok(patched.dns.nameserver.every((value) => value.endsWith('#Main')));
 });
 
-test('creates an AI group following main when the subscription has none', { skip: !available }, () => {
+test('creates an AI group with all inline nodes when the subscription has none', { skip: !available }, () => {
   const config = baseConfig();
   config['proxy-groups'] = config['proxy-groups'].filter((group) => group.name !== 'AI');
 
   const patched = engine.clashPatchTransform(config, 'fixture');
 
   const ai = patched['proxy-groups'].find((group) => group.name === '🤖 AI · Clash Patch');
-  assert.deepEqual(ai.proxies, ['Main']);
+  assert.deepEqual(ai.proxies, ['台湾家宽 01', '日本家宽 01', '美国家宽 01']);
+  assert.equal(Object.hasOwn(ai, 'use'), false);
   assert.equal(patched['proxy-groups'].some((group) => /^🛡 安全代理 · Clash Patch(?: \d+)?$/.test(group.name)), false);
   assert.ok(patched.rules.includes('DOMAIN-SUFFIX,openai.com,🤖 AI · Clash Patch'));
   assert.deepEqual(patched.rules.slice(0, 2), ['NETWORK,UDP,Main', 'NETWORK,UDP,REJECT']);
+});
+
+test('new AI group includes every proxy provider', { skip: !available }, () => {
+  const config = baseConfig();
+  config['proxy-groups'] = config['proxy-groups'].filter((group) => group.name !== 'AI');
+  config['proxy-providers'] = {
+    'airport-a': { type: 'http', url: 'https://example.invalid/a' },
+    'airport-b': { type: 'file', path: './providers/b.yaml' }
+  };
+
+  const patched = engine.clashPatchTransform(config, 'fixture');
+  const ai = patched['proxy-groups'].find((group) => group.name === '🤖 AI · Clash Patch');
+
+  assert.deepEqual(ai.proxies, ['台湾家宽 01', '日本家宽 01', '美国家宽 01']);
+  assert.deepEqual(ai.use, ['airport-a', 'airport-b']);
+});
+
+test('new AI group supports provider-only subscriptions', { skip: !available }, () => {
+  const config = baseConfig();
+  config.proxies = [];
+  config['proxy-groups'] = [{ name: 'Main', type: 'select', use: ['airport-a'] }];
+  config['proxy-providers'] = {
+    'airport-a': { type: 'http', url: 'https://example.invalid/a' }
+  };
+  config.rules = ['MATCH,Main'];
+
+  const first = engine.clashPatchTransform(config, 'fixture');
+  const ai = first['proxy-groups'].find((group) => group.name === '🤖 AI · Clash Patch');
+
+  assert.deepEqual(ai.proxies, []);
+  assert.deepEqual(ai.use, ['airport-a']);
+  assert.deepEqual(engine.clashPatchTransform(first, 'fixture'), first);
+});
+
+test('does not create an AI group without nodes or providers', { skip: !available }, () => {
+  const config = baseConfig();
+  config.proxies = [];
+  delete config['proxy-providers'];
+  config['proxy-groups'] = [{ name: 'Main', type: 'select', proxies: ['Ghost'] }];
+  config.rules = ['MATCH,Main'];
+
+  assert.deepEqual(engine.clashPatchTransform(config, 'fixture'), config);
+});
+
+test('migrates owned single-main AI group to an independent node selector', { skip: !available }, () => {
+  const config = baseConfig();
+  config['proxy-groups'] = config['proxy-groups'].filter((group) => group.name !== 'AI');
+  const aiName = '🤖 AI · Clash Patch';
+  config['proxy-groups'].push({ name: aiName, type: 'select', proxies: ['Main'] });
+  config.rules = engine.clashPatchRenderAiRules(aiName).concat(config.rules);
+
+  const patched = engine.clashPatchTransform(config, 'fixture');
+  const ai = patched['proxy-groups'].find((group) => group.name === aiName);
+
+  assert.deepEqual(ai.proxies, ['台湾家宽 01', '日本家宽 01', '美国家宽 01']);
+  assert.equal(ai.proxies.includes('Main'), false);
 });
 
 test('removes groups created by an older patch', { skip: !available }, () => {
@@ -161,13 +218,14 @@ test('global transform verifies a second pass before returning a candidate', () 
   assert.match(source, /JSON\.stringify\(candidate\) !== JSON\.stringify\(secondPass\)/);
 });
 
-test('does not choose US home broadband when Taiwan and Japan are absent', { skip: !available }, () => {
+test('new AI group lists US home broadband without auto selecting it', { skip: !available }, () => {
   const config = baseConfig();
   config.proxies = config.proxies.filter((proxy) => proxy.name === '美国家宽 01');
   config['proxy-groups'] = [{ name: 'Main', type: 'select', proxies: ['美国家宽 01'] }];
   const patched = engine.clashPatchTransform(config, 'fixture');
   const ai = patched['proxy-groups'].find((group) => group.name === '🤖 AI · Clash Patch');
-  assert.deepEqual(ai.proxies, ['Main']);
+  assert.deepEqual(ai.proxies, ['美国家宽 01']);
+  assert.equal(Object.hasOwn(ai, 'now'), false);
 });
 
 test('does not select Japan home broadband automatically', { skip: !available }, () => {
@@ -498,7 +556,7 @@ test('tun arrays are replaced by a mapping', { skip: !available }, () => {
   assert.equal(patched.tun.enable, true);
 });
 
-test('owned AI group is deterministic and collision safe', { skip: !available }, () => {
+test('owned AI group is independent and collision safe', { skip: !available }, () => {
   const config = baseConfig();
   config['proxy-groups'] = config['proxy-groups'].filter((group) => group.name !== 'AI');
   config['proxy-groups'].push({ name: '🤖 AI · Clash Patch', type: 'url-test', proxies: ['台湾家宽 01'] });
@@ -507,7 +565,7 @@ test('owned AI group is deterministic and collision safe', { skip: !available },
   const names = patched['proxy-groups'].map((group) => group.name);
   assert.deepEqual(names, [...new Set(names)]);
   const managed = patched['proxy-groups'].find((group) => group.name === '🤖 AI · Clash Patch 3');
-  assert.deepEqual(managed.proxies, ['Main']);
+  assert.deepEqual(managed.proxies, ['台湾家宽 01', '日本家宽 01', '美国家宽 01']);
 });
 
 test('user-owned branded select group is preserved', { skip: !available }, () => {

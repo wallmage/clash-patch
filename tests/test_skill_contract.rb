@@ -114,9 +114,11 @@ class SkillContractTest < Minitest::Test
     assert_includes source, "不安装 LaunchAgent、`WatchPaths` 或目录监听"
     assert_includes source, "REALITY `short-id`"
     assert_includes source, "不得重新加载当前配置"
+    assert_includes source, "`config.yaml` 是 ClashX Meta 的默认基础配置"
+    assert_includes source, "不得删除"
   end
 
-  def test_skill_reuses_ai_groups_and_never_auto_selects_nodes
+  def test_skill_reuses_user_ai_groups_and_creates_independent_node_selectors
     skill = File.read(File.join(SKILL, "SKILL.md"))
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
     ruby_patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
@@ -124,12 +126,21 @@ class SkillContractTest < Minitest::Test
 
     assert_includes skill, "已有可选 AI 分组时，直接复用"
     assert_includes skill, "不得修改它的成员或当前选择"
+    assert_includes skill, "全部可用的真实节点和代理提供者"
+    assert_includes skill, "主代理组与 AI 节点互不影响"
     assert_includes skill, "不得创建第二个安全代理分组"
     assert_includes policy, "不得替用户选择台湾、日本或任何家宽节点"
     refute_includes ruby_patcher, "def ensure_safe_group"
     refute_includes ruby_patcher, "def home_candidate"
     refute_includes windows_patcher, "function clashPatchEnsureSafeGroup"
     refute_includes windows_patcher, "function clashPatchHomeCandidate"
+  end
+
+  def test_agents_requires_requirement_docs_to_change_with_behavior
+    agents = File.read(File.join(ROOT, "AGENTS.md"))
+
+    assert_includes agents, "功能需求变化时"
+    assert_includes agents, "代码、Skill 和相关产品文档必须在同一次改动中同步更新"
   end
 
   def test_public_tree_contains_no_personal_provider_or_machine_data

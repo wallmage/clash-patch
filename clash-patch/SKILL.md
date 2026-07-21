@@ -22,6 +22,7 @@ description: Use when an agent needs to inspect, repair, or safely apply DNS, We
 - macOS 不安装 LaunchAgent、`WatchPaths` 或目录监听，并清理能确认属于旧版 Clash Patch 的监听，避免补丁写入再次触发自己。
 - macOS 必须把已有且有效的 REALITY `short-id` 保持为文本；不补齐、不截断、不猜测。Windows 脚本不改该字段。
 - 任何候选都必须验证并再次转换；结果不一致、内核拒绝或超时就保留原订阅。绝不靠退出 Clash 或自动重新加载配置来生效。
+- `config.yaml` 是 ClashX Meta 的默认基础配置，不得删除；当前选择其他订阅时安静跳过它，不把它当成无效订阅报错。
 
 ## 执行
 
@@ -33,11 +34,11 @@ description: Use when an agent needs to inspect, repair, or safely apply DNS, We
 
 macOS 只单次处理当前存储位置，不安装 LaunchAgent 或 `WatchPaths`。Windows 使用全局扩展脚本；客户端运行时只更新 `profiles/Script.js`。两个平台都必须让 Clash 保持运行。
 
-订阅已有可选 AI 分组时，直接复用，只补全规则；不得修改它的成员或当前选择。没有 AI 分组时才创建跟随主代理组的 `🤖 AI · Clash Patch`。不得创建第二个安全代理分组，也不得替用户选择节点。
+订阅已有可选 AI 分组时，直接复用，只补全规则；不得修改它的成员或当前选择。没有 AI 分组时才创建独立的 `🤖 AI · Clash Patch`，加入订阅全部可用的真实节点和代理提供者，让主代理组与 AI 节点互不影响。找不到任何可用节点或代理提供者时不创建无意义的分组。不得创建第二个安全代理分组，也不得替用户选择节点。
 
 通用 UDP 会影响 WebRTC、游戏、语音、视频通话和 QUIC，执行前告诉用户。家宽通常更适合 AI；有台湾家宽时优先建议台湾，没有时可建议日本，最终由用户选择。
 
-逐份报告结果。文件已修改不等于已经生效；当前订阅写成“等待用户手动重新加载”，其他订阅写成“选择该订阅时生效”。同时说明主代理组、AI 分组、节点未改、配置中的 TUN 写入状态和是否安装自动机制。
+逐份报告结果。文件已修改不等于已经生效；当前订阅写成“等待用户手动重新加载”，其他订阅写成“选择该订阅时生效”。同时说明主代理组、AI 分组、是否新建了独立节点选择器、配置中的 TUN 写入状态和是否安装自动机制。
 
 ## 验证
 
