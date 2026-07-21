@@ -307,3 +307,5 @@ friend payload
 } finally {
     if (Test-Path -LiteralPath $sandbox) { Remove-Item -LiteralPath $sandbox -Recurse -Force }
 }
+
+exit 0
