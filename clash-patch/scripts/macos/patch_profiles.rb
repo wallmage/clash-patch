@@ -633,7 +633,7 @@ module ClashPatch
     # can also resemble a YAML number (for example 0906152e4 or 12345678).
     # Tag only that field as text before scalar resolution so unrelated YAML
     # 1.2 exponent values keep their numeric meaning.
-    stream = Psych.parse_stream(text, filename)
+    stream = Psych.parse_stream(text, filename: filename)
     documents = stream.children
     return nil if documents.empty?
     raise InvalidConfigError, "YAML 必须只包含一个文档" unless documents.length == 1

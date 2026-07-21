@@ -109,9 +109,15 @@ try {
 
     Assert-True (Test-MihomoVersionText "Mihomo Meta v1.19.27") "minimum Mihomo version was rejected"
     Assert-True (-not (Test-MihomoVersionText "Mihomo Meta v1.19.26")) "old Mihomo version was accepted"
+    $timeoutCore = $hangingCore
+    $timeoutArguments = @("-v")
+    if ($onWindows) {
+        $timeoutCore = $PowerShellPath
+        $timeoutArguments = @("-NoLogo", "-NoProfile", "-Command", "Start-Sleep -Seconds 5")
+    }
     $timeoutRaised = $false
     $timeoutWatch = [System.Diagnostics.Stopwatch]::StartNew()
-    try { Invoke-Mihomo $hangingCore @("-v") 1 | Out-Null } catch { $timeoutRaised = $_.Exception.Message.Contains("超过 1 秒") }
+    try { Invoke-Mihomo $timeoutCore $timeoutArguments 1 | Out-Null } catch { $timeoutRaised = $_.Exception.Message.Contains("超过 1 秒") }
     $timeoutWatch.Stop()
     Assert-True $timeoutRaised "hanging Mihomo process did not fail closed after one second"
     Assert-True ($timeoutWatch.Elapsed.TotalSeconds -lt 4) "hanging Mihomo process was not terminated promptly"
