@@ -147,6 +147,7 @@ class SkillContractTest < Minitest::Test
     refute_includes source, "launchctl bootstrap"
     refute_includes source, "osascript"
     assert_match(/\A#!\/bin\/sh\nset -eu\nset -f\n/, source)
+    refute_match(/\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/, source)
   end
 
   def test_installers_preflight_and_uninstallers_restore_owned_settings

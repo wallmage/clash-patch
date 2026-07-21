@@ -38,9 +38,9 @@ remove_legacy_agent() {
   if legacy_agent_owned "$candidate" "$expected_label" "$expected_patcher"; then
     /bin/launchctl bootout "gui/$USER_ID/$expected_label" >/dev/null 2>&1 || true
     /bin/rm -f "$candidate"
-    say "已移除旧版自动目录监听：$expected_label。"
+    say "已移除旧版自动目录监听：${expected_label}。"
   else
-    say "发现同名但无法确认属于 Clash 补丁的 LaunchAgent，已保留：$expected_label。"
+    say "发现同名但无法确认属于 Clash 补丁的 LaunchAgent，已保留：${expected_label}。"
   fi
 }
 
