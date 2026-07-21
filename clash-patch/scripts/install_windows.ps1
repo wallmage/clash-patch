@@ -763,7 +763,7 @@ try {
     Write-Info "已安装全局扩展脚本，之后每次加载或刷新订阅都会自动应用补丁。"
     Write-Info "已开启 TUN，并让全局脚本接管 DNS 配置。下次订阅刷新时应用补丁。"
     Write-Info "安装程序从未退出、停止或重启 Clash Verge Rev。"
-    Write-Info "AI 规则会优先选择台湾家宽，其次选择日本家宽；如果两者都没有，不会替你改成其他地区。"
+    Write-Info "已有 AI 分组只补全规则；没有时才创建并跟随主代理组。安装程序不会替你选择节点。"
     exit 0
 } catch {
     [Console]::Error.WriteLine("[Clash 补丁] 安装失败：$($_.Exception.Message)")

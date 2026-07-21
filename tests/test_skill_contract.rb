@@ -78,6 +78,22 @@ class SkillContractTest < Minitest::Test
     end
   end
 
+  def test_skill_reuses_ai_groups_and_never_auto_selects_nodes
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    ruby_patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
+    windows_patcher = File.read(File.join(SKILL, "scripts/windows/clash_verge_global.js"))
+
+    assert_includes skill, "已有可选 AI 分组时，直接复用"
+    assert_includes skill, "不得修改它的成员或当前选择"
+    assert_includes skill, "不得创建第二个安全代理分组"
+    assert_includes policy, "不得替用户选择台湾、日本或任何家宽节点"
+    refute_includes ruby_patcher, "def ensure_safe_group"
+    refute_includes ruby_patcher, "def home_candidate"
+    refute_includes windows_patcher, "function clashPatchEnsureSafeGroup"
+    refute_includes windows_patcher, "function clashPatchHomeCandidate"
+  end
+
   def test_public_tree_contains_no_personal_provider_or_machine_data
     files = Dir.glob(File.join(ROOT, "{README.md,clash-patch/**/*}"), File::FNM_EXTGLOB).select { |path| File.file?(path) }
     source = files.map { |path| File.binread(path).force_encoding("UTF-8").scrub }.join("\n")

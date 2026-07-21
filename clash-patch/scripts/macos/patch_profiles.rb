@@ -65,9 +65,10 @@ module ClashPatch
       changed: changed,
       status: status,
       ai_group: nil,
-      safe_group: nil,
+      route_group: nil,
       main_group: nil,
-      selected_home: nil
+      ai_group_created: false,
+      ai_group_reset: false
     }
   end
 
@@ -135,26 +136,9 @@ module ClashPatch
     normalized.include?("openai") || normalized.include?("人工智能") || normalized.match?(/(^|[^a-z])ai([^a-z]|$)/)
   end
 
-  def token_match?(name, token)
-    return false unless name.is_a?(String)
-    return name.downcase.include?(token.downcase) unless %w[TW JP].include?(token)
-
-    name.match?(/(?:^|[^A-Za-z])#{Regexp.escape(token)}(?:[^A-Za-z]|$)/i)
-  end
-
-  def home_candidate(config, policy)
-    candidates = Array(config["proxies"]).map do |proxy|
-      next unless proxy.is_a?(Hash) && proxy["name"].is_a?(String)
-      next if DIRECT_TYPES.include?(proxy["type"].to_s.downcase)
-
-      proxy["name"]
-    end.compact
-    candidates = candidates.uniq.select { |name| name.include?("家宽") }
-
-    taiwan = candidates.find { |name| Array(policy["taiwan_tokens"]).any? { |token| token_match?(name, token) } }
-    return taiwan if taiwan
-
-    candidates.find { |name| Array(policy["japan_tokens"]).any? { |token| token_match?(name, token) } }
+  def existing_ai_group(config, policy)
+    candidates = selectable_groups(config).select { |group| ai_name?(group["name"], policy) }
+    candidates.find { |group| !managed_group_name?(group["name"]) } || candidates.first
   end
 
   def unique_group_name(config, base)
@@ -197,11 +181,7 @@ module ClashPatch
       info = rule_info(rule)
       info[:target] == name && keys.include?(managed_rule_key(rule))
     end
-    return false unless matches >= 2
-
-    selectable_groups(config).any? do |group|
-      managed_name?(group["name"], SAFE_GROUP_BASE) && owned_safe_group?(config, group["name"])
-    end
+    matches >= 2
   end
 
   def resolver_targets(config)
@@ -255,33 +235,21 @@ module ClashPatch
     DIRECT_NAMES.any? { |candidate| candidate.casecmp(name.to_s).zero? }
   end
 
-  def safe_inline_proxies(config)
-    Array(config["proxies"]).map do |proxy|
-      next unless proxy.is_a?(Hash) && proxy["name"].is_a?(String)
-      next if DIRECT_TYPES.include?(proxy["type"].to_s.downcase)
-
-      proxy["name"]
-    end.compact.uniq
+  def owned_managed_group_names(config, policy)
+    ai_names = selectable_groups(config).map { |group| group["name"] }.select do |name|
+      managed_name?(name, AI_GROUP_BASE) && owned_ai_group?(config, name, policy)
+    end
+    safe_names = selectable_groups(config).map { |group| group["name"] }.select do |name|
+      managed_name?(name, SAFE_GROUP_BASE) && owned_safe_group?(config, name)
+    end
+    [ai_names, safe_names]
   end
 
-  def ensure_safe_group(config, candidate)
-    group = find_managed_select_group(config, SAFE_GROUP_BASE, :safe)
-    unless group
-      group = { "name" => unique_group_name(config, SAFE_GROUP_BASE), "type" => "select" }
-      config["proxy-groups"] << group
+  def remove_owned_managed_groups(config, names)
+    owned = names.each_with_object({}) { |name, memo| memo[name] = true }
+    config["proxy-groups"] = Array(config["proxy-groups"]).reject do |group|
+      group.is_a?(Hash) && owned[group["name"]]
     end
-
-    proxies = safe_inline_proxies(config)
-    if candidate && proxies.delete(candidate)
-      proxies.unshift(candidate)
-    end
-    group.keys.each { |key| group.delete(key) unless %w[name type].include?(key) }
-    group["type"] = "select"
-    group["proxies"] = proxies.reject { |name| name == group["name"] }
-    group["include-all"] = true
-    group["exclude-type"] = EXCLUDED_SAFE_TYPES
-    group["empty-fallback"] = "REJECT"
-    group["name"]
   end
 
   def tagged_resolvers(policy, group)
@@ -378,7 +346,7 @@ module ClashPatch
     safe_proxy_target?(config, target) || group_cannot_reach_direct?(config, target)
   end
 
-  def patch_dns(config, policy, safe_group)
+  def patch_dns(config, policy, route_group, owned_safe_names = [])
     dns = config["dns"].is_a?(Hash) ? config["dns"] : {}
     config["dns"] = dns
     dns["enable"] = true
@@ -387,7 +355,7 @@ module ClashPatch
     dns["use-hosts"] = true
     dns["use-system-hosts"] = true
 
-    safe_resolvers = tagged_resolvers(policy, safe_group)
+    safe_resolvers = tagged_resolvers(policy, route_group)
     fallback_bootstrap = deep_copy(policy["bootstrap_fallback_resolvers"])
     legacy_default = ["1.1.1.1", "8.8.8.8"]
     legacy_proxy = [
@@ -407,11 +375,6 @@ module ClashPatch
     existing = dns["nameserver-policy"].is_a?(Hash) ? dns["nameserver-policy"] : {}
     policies = {}
     legacy_patterns = legacy_ai_dns_patterns(policy)
-    owned_safe_names = selectable_groups(config).map { |group| group["name"] }.select do |name|
-      managed_name?(name, SAFE_GROUP_BASE) && owned_safe_group?(config, name)
-    end
-    owned_safe_names << safe_group
-    owned_safe_names.uniq!
     existing.each do |combined, endpoints|
       combined.to_s.split(",").map(&:strip).reject(&:empty?).each do |pattern|
         values = Array(endpoints).map(&:to_s)
@@ -419,7 +382,8 @@ module ClashPatch
                        values.all? { |value| owned_safe_names.include?(resolver_target(value)) }
         next if legacy_owned
 
-        policies[pattern] = !values.empty? && values.all? { |value| safe_resolver_endpoint?(config, value) } ? values : deep_copy(safe_resolvers)
+        references_old_group = values.any? { |value| owned_safe_names.include?(resolver_target(value)) }
+        policies[pattern] = !references_old_group && !values.empty? && values.all? { |value| safe_resolver_endpoint?(config, value) } ? values : deep_copy(safe_resolvers)
       end
     end
     ai_dns_patterns(policy).each { |pattern| policies[pattern] = deep_copy(safe_resolvers) }
@@ -483,27 +447,19 @@ module ClashPatch
     %w[MATCH GEOSITE GEOIP RULE-SET].include?(rule_info(rule)[:type])
   end
 
-  def patch_rules(config, policy, ai_group, safe_group)
+  def patch_rules(config, policy, ai_group, route_group, owned_ai_names = [], owned_safe_names = [])
     managed = render_ai_rules(policy, ai_group)
     managed_keys = managed.map { |rule| managed_rule_key(rule) }.compact
+    managed_identities = managed.map { |rule| managed_rule_identity(rule) }.compact
     legacy_keys = Array(policy["legacy_ai_rules"]).map { |rule| managed_rule_key(rule) }.compact
     forbidden = Array(policy["forbidden_ai_domains"])
-    owned_ai_names = selectable_groups(config).map { |group| group["name"] }.select do |name|
-      managed_name?(name, AI_GROUP_BASE) && owned_ai_group?(config, name, policy)
-    end
-    owned_ai_names << ai_group
-    owned_ai_names.uniq!
-    owned_safe_names = selectable_groups(config).map { |group| group["name"] }.select do |name|
-      managed_name?(name, SAFE_GROUP_BASE) && owned_safe_group?(config, name)
-    end
-    owned_safe_names << safe_group
-    owned_safe_names.uniq!
 
     original_rules = Array(config["rules"])
     owned_udp_indexes = []
     original_rules.each_with_index do |rule, index|
       info = rule_info(rule)
-      next unless info[:type] == "NETWORK" && info[:payload].casecmp("UDP").zero? && owned_safe_names.include?(info[:target])
+      next unless info[:type] == "NETWORK" && info[:payload].casecmp("UDP").zero? &&
+                  (owned_safe_names.include?(info[:target]) || info[:target] == route_group)
 
       owned_udp_indexes << index
       next_info = rule_info(original_rules[index + 1]) if index + 1 < original_rules.length
@@ -520,12 +476,13 @@ module ClashPatch
 
       info = rule_info(rule)
       key = managed_rule_key(rule)
-      patch_owned_ai = managed_keys.include?(key) && owned_ai_names.include?(info[:target])
+      patch_owned_ai = owned_ai_names.include?(info[:target]) && managed_keys.include?(key)
+      exact_current_ai = managed_identities.include?(managed_rule_identity(rule))
       legacy_owned_ai = legacy_keys.include?(key) && owned_ai_names.include?(info[:target])
       forbidden_ai = %w[DOMAIN DOMAIN-SUFFIX].include?(info[:type]) &&
                      forbidden.any? { |domain| domain.casecmp(info[:payload]).zero? } &&
                      owned_ai_names.include?(info[:target])
-      next if patch_owned_ai || legacy_owned_ai || forbidden_ai
+      next if patch_owned_ai || exact_current_ai || legacy_owned_ai || forbidden_ai
 
       if managed_keys.include?(key)
         user_overrides << rule
@@ -534,7 +491,7 @@ module ClashPatch
       end
     end
 
-    config["rules"] = ["NETWORK,UDP,#{safe_group}", "NETWORK,UDP,REJECT"] + user_overrides + managed + remaining
+    config["rules"] = ["NETWORK,UDP,#{route_group}", "NETWORK,UDP,REJECT"] + user_overrides + managed + remaining
   end
 
   def normalize_reality_short_ids(value)
@@ -567,14 +524,27 @@ module ClashPatch
     main_group = detect_main_group(patched, policy)
     return base_result(config, :no_main_group) unless main_group
 
-    candidate = home_candidate(patched, policy)
-    ai_group = ensure_ai_group(patched, main_group, candidate, policy)
-    safe_group = ensure_safe_group(patched, candidate)
+    owned_ai_names, owned_safe_names = owned_managed_group_names(patched, policy)
+    existing_ai = existing_ai_group(patched, policy)
+    ai_group_created = existing_ai.nil?
+    ai_group_reset = existing_ai && owned_ai_names.include?(existing_ai["name"])
+    ai_group = if existing_ai
+                 if ai_group_reset
+                   existing_ai.keys.each { |key| existing_ai.delete(key) unless %w[name type].include?(key) }
+                   existing_ai["type"] = "select"
+                   existing_ai["proxies"] = [main_group]
+                 end
+                 existing_ai["name"]
+               else
+                 ensure_ai_group(patched, main_group, nil, policy)
+               end
+    route_group = main_group
     patched["ipv6"] = false
     patched["tun"] = {} unless patched["tun"].is_a?(Hash)
     TUN_POLICY.each { |key, value| patched["tun"][key] = deep_copy(value) }
-    patch_dns(patched, policy, safe_group)
-    patch_rules(patched, policy, ai_group, safe_group)
+    patch_dns(patched, policy, route_group, owned_safe_names)
+    patch_rules(patched, policy, ai_group, route_group, owned_ai_names, owned_safe_names)
+    remove_owned_managed_groups(patched, (owned_ai_names - [ai_group]) + owned_safe_names)
     normalize_reality_short_ids(patched)
 
     {
@@ -582,9 +552,10 @@ module ClashPatch
       changed: patched != original,
       status: patched == original ? :unchanged : :updated,
       ai_group: ai_group,
-      safe_group: safe_group,
+      route_group: route_group,
       main_group: main_group,
-      selected_home: candidate
+      ai_group_created: ai_group_created,
+      ai_group_reset: !!ai_group_reset
     }
   end
 
@@ -1062,10 +1033,11 @@ module ClashPatch
   end
 
   def ai_state(result)
-    return "；没有台湾或日本家宽节点，未替你更换节点" unless result[:selected_home]
-    selected = safe_label(result[:selected_home])
-    return "；AI 将使用「#{selected}」" unless result[:active]
-    "；AI 组已写入「#{selected}」，等待运行配置生效"
+    ai_group = safe_label(result[:ai_group])
+    return "；已创建 AI 分组「#{ai_group}」并跟随主代理组，节点由你选择" if result[:ai_group_created]
+    return "；已保留 AI 分组「#{ai_group}」并改为跟随主代理组，节点由你选择" if result[:ai_group_reset]
+
+    "；已复用 AI 分组「#{ai_group}」，只补全规则，节点未改"
   end
 
   def safe_label(value)
