@@ -1131,6 +1131,19 @@ class MacosPatcherTest < Minitest::Test
     refute ClashPatch.active_profile?("/profiles/other.yaml", "config")
   end
 
+  def test_defaults_read_decodes_unicode_profile_names_from_plist
+    status = Struct.new(:success?).new(true)
+    plist = "<?xml version=\"1.0\"?><plist><dict><key>selectConfigName</key><string>Yue.to | 悦通</string></dict></plist>"
+    responses = [[plist, "", status], ["Yue.to | 悦通\n", "", status]]
+    runner = lambda do |*_args, **_kwargs|
+      responses.shift || ["", "", Struct.new(:success?).new(false)]
+    end
+
+    Open3.stub(:capture3, runner) do
+      assert_equal "Yue.to | 悦通", ClashPatch.defaults_read("selectConfigName")
+    end
+  end
+
   def test_single_custom_profile_directory_is_active
     Dir.mktmpdir do |directory|
       File.write(File.join(directory, "friend.yaml"), YAML.dump(base_config))

@@ -850,8 +850,14 @@ module ClashPatch
 
   def defaults_read(key)
     %w[com.metacubex.ClashX.meta com.MetaCubeX.ClashX.meta].each do |domain|
-      value = IO.popen(["/usr/bin/defaults", "read", domain, key], err: File::NULL, &:read).strip
-      return value unless value.empty?
+      plist, _export_error, export_status = Open3.capture3("/usr/bin/defaults", "export", domain, "-")
+      next unless export_status.success? && !plist.empty?
+
+      value, _extract_error, extract_status = Open3.capture3(
+        "/usr/bin/plutil", "-extract", key, "raw", "-o", "-", "-", stdin_data: plist
+      )
+      value = value.strip
+      return value if extract_status.success? && !value.empty?
     rescue StandardError
       next
     end
