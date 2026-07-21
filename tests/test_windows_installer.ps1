@@ -112,14 +112,18 @@ try {
     $timeoutCore = $hangingCore
     $timeoutArguments = @("-v")
     if ($onWindows) {
-        $timeoutCore = $PowerShellPath
-        $timeoutArguments = @("-NoLogo", "-NoProfile", "-Command", "Start-Sleep -Seconds 5")
+        $timeoutCore = Join-Path (Join-Path $env:SystemRoot "System32") "ping.exe"
+        $timeoutArguments = @("-n", "6", "127.0.0.1")
     }
     $timeoutRaised = $false
+    $timeoutError = ""
     $timeoutWatch = [System.Diagnostics.Stopwatch]::StartNew()
-    try { Invoke-Mihomo $timeoutCore $timeoutArguments 1 | Out-Null } catch { $timeoutRaised = $_.Exception.Message.Contains("超过 1 秒") }
+    try { Invoke-Mihomo $timeoutCore $timeoutArguments 1 | Out-Null } catch {
+        $timeoutError = $_.Exception.Message
+        $timeoutRaised = $timeoutError.Contains("超过 1 秒")
+    }
     $timeoutWatch.Stop()
-    Assert-True $timeoutRaised "hanging Mihomo process did not fail closed after one second"
+    Assert-True $timeoutRaised "hanging Mihomo process did not fail closed after one second: $timeoutError"
     Assert-True ($timeoutWatch.Elapsed.TotalSeconds -lt 4) "hanging Mihomo process was not terminated promptly"
 
     $backupSource = Join-Path $sandbox "backup-source.txt"
