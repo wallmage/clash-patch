@@ -174,6 +174,21 @@ class MacosPatcherTest < Minitest::Test
     assert_equal "0906152e4", patched.fetch("proxies").first.dig("reality-opts", "short-id")
   end
 
+  def test_dump_config_quotes_every_valid_reality_short_id
+    short_ids = %w[abcdef12 12ab34cd 0906152e4 12345678]
+    config = {
+      "proxies" => short_ids.map do |short_id|
+        { "reality-opts" => { "short-id" => short_id } }
+      end
+    }
+
+    dumped = ClashPatch.dump_config(config)
+
+    short_ids.each do |short_id|
+      assert_match(/short-id: ["']#{Regexp.escape(short_id)}["']/, dumped)
+    end
+  end
+
   def test_load_yaml_preserves_every_bare_reality_short_id_as_text
     %w[0906152e4 12345678 0].each do |short_id|
       parsed = ClashPatch.load_yaml("reality-opts:\n  short-id: #{short_id}\n")

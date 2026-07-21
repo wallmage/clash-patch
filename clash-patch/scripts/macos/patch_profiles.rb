@@ -579,7 +579,9 @@ module ClashPatch
   end
 
   def dump_config(config)
-    Psych.dump(config)
+    visitor = Psych::Visitors::YAMLTree.create({})
+    visitor << config
+    tag_reality_short_ids(visitor.tree).yaml
   end
 
   def tag_reality_short_ids(node)
@@ -592,6 +594,9 @@ module ClashPatch
           if key.is_a?(Psych::Nodes::Scalar) && key.value == "short-id" &&
              value.is_a?(Psych::Nodes::Scalar) && value.value.match?(/\A[0-9a-fA-F]{1,16}\z/)
             value.tag = "tag:yaml.org,2002:str"
+            value.plain = false
+            value.quoted = true
+            value.style = Psych::Nodes::Scalar::DOUBLE_QUOTED
           end
           stack << value
         end
