@@ -63,7 +63,7 @@ dns:
   use-system-hosts: true
 ```
 
-补丁不创建安全代理组。`DNS` 出站只把请求交给 Mihomo 内部 DNS 模块，不是远端代理。普通查询和 AI 域名查询都使用带原主代理组标签的 DoH。受管 DoH 直接连接解析器 IP，无需先解析解析器域名，避免解析器域名被错误解析后出现证书错误。策略同时配置 AdGuard 的两个地址和 TWNIC Quad 101，不再只依赖一套公共 DNS。升级旧版补丁时，删除能确认属于本工具的 `🛡 安全代理 · Clash Patch`，并把相关 DNS 和 UDP 规则迁移到原主代理组。
+补丁不创建安全代理组。`DNS` 出站只把请求交给 Mihomo 内部 DNS 模块，不是远端代理。普通查询和 AI 域名查询都使用带原主代理组标签的 DoH。受管 DoH 直接连接解析器 IP，无需先解析解析器域名，避免解析器域名被错误解析后出现证书错误。策略同时配置 AdGuard 的两个非过滤地址和 TWNIC Quad 101，不再只依赖一套公共 DNS，也不顺便加入广告拦截。升级旧版补丁时，删除能确认属于本工具的 `🛡 安全代理 · Clash Patch`，并把相关 DNS 和 UDP 规则迁移到原主代理组。
 
 `default-nameserver`、`proxy-server-nameserver` 和 `direct-nameserver` 属于网络启动边界，必须保留用户值。`proxy-server-nameserver` 缺失时使用 `system`，满足 Mihomo 的 `respect-rules` 要求；如果启动字段等于旧版补丁写入的固定 `1.1.1.1`、`8.8.8.8` 组合，也迁移为 `system`。不得把可直接访问的节点域名解析器替换为可能被阻断的境外地址。
 

@@ -5,8 +5,8 @@
 const CLASH_PATCH_POLICY = {
   "version": 1,
   "resolvers": [
-    "https://94.140.14.14/dns-query",
-    "https://94.140.15.15/dns-query",
+    "https://94.140.14.140/dns-query",
+    "https://94.140.14.141/dns-query",
     "https://101.101.101.101/dns-query"
   ],
   "bootstrapFallbackResolvers": [

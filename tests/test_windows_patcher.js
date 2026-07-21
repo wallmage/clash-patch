@@ -100,8 +100,8 @@ test('preserves bootstrap and direct resolvers', { skip: !available }, () => {
 
 test('managed DNS uses bootstrap-free IP DoH and rewrites other endpoints', { skip: !available }, () => {
   const expectedResolvers = [
-    'https://94.140.14.14/dns-query',
-    'https://94.140.15.15/dns-query',
+    'https://94.140.14.140/dns-query',
+    'https://94.140.14.141/dns-query',
     'https://101.101.101.101/dns-query'
   ];
   assert.deepEqual(engine.CLASH_PATCH_POLICY.resolvers, expectedResolvers);
@@ -111,7 +111,7 @@ test('managed DNS uses bootstrap-free IP DoH and rewrites other endpoints', { sk
   config.dns['nameserver-policy'] = {
     '+.hostname-resolver.example': ['https://dns.alidns.com/dns-query#台湾家宽 01'],
     '+.blocked-prone.example': ['https://8.8.8.8/dns-query#台湾家宽 01'],
-    '+.managed.example': ['https://94.140.14.14/dns-query#台湾家宽 01']
+    '+.managed.example': ['https://94.140.14.140/dns-query#台湾家宽 01']
   };
 
   const patched = engine.clashPatchTransform(config, 'fixture');

@@ -118,8 +118,8 @@ class SkillContractTest < Minitest::Test
   def test_managed_dns_policy_uses_bootstrap_free_ip_doh_without_site_exceptions
     policy = JSON.parse(File.read(File.join(SKILL, "references/policy.json")))
     assert_equal [
-      "https://94.140.14.14/dns-query",
-      "https://94.140.15.15/dns-query",
+      "https://94.140.14.140/dns-query",
+      "https://94.140.14.141/dns-query",
       "https://101.101.101.101/dns-query"
     ], policy.fetch("resolvers")
 

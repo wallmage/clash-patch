@@ -129,8 +129,8 @@ class MacosPatcherTest < Minitest::Test
 
   def test_managed_dns_uses_bootstrap_free_ip_doh_and_rewrites_other_endpoints
     expected_resolvers = [
-      "https://94.140.14.14/dns-query",
-      "https://94.140.15.15/dns-query",
+      "https://94.140.14.140/dns-query",
+      "https://94.140.14.141/dns-query",
       "https://101.101.101.101/dns-query"
     ]
     assert_equal expected_resolvers, @policy.fetch("resolvers")
@@ -140,7 +140,7 @@ class MacosPatcherTest < Minitest::Test
     config["dns"]["nameserver-policy"] = {
       "+.hostname-resolver.example" => ["https://dns.alidns.com/dns-query#台湾家宽 01"],
       "+.blocked-prone.example" => ["https://8.8.8.8/dns-query#台湾家宽 01"],
-      "+.managed.example" => ["https://94.140.14.14/dns-query#台湾家宽 01"]
+      "+.managed.example" => ["https://94.140.14.140/dns-query#台湾家宽 01"]
     }
 
     result = ClashPatch.patch(config, @policy)
