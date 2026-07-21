@@ -34,14 +34,26 @@ function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
 
+function Invoke-TestPowerShell([string]$ScriptPath, [string[]]$ScriptArguments) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = & $PowerShellPath -NoLogo -NoProfile -File $ScriptPath @ScriptArguments 2>&1 | Out-String
+        $exitCode = $LASTEXITCODE
+        return [pscustomobject]@{ Output = $output; ExitCode = $exitCode }
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
 function Invoke-Installer([string]$AppHome) {
-    $output = & $PowerShellPath -NoLogo -NoProfile -File $installer -AppHome $AppHome -MihomoPath $fakeCore 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "Windows installer returned $LASTEXITCODE`n$output" }
+    $result = Invoke-TestPowerShell $installer @("-AppHome", $AppHome, "-MihomoPath", $fakeCore)
+    if ($result.ExitCode -ne 0) { throw "Windows installer returned $($result.ExitCode)`n$($result.Output)" }
 }
 
 function Invoke-Uninstaller([string]$AppHome) {
-    $output = & $PowerShellPath -NoLogo -NoProfile -File $uninstaller -AppHome $AppHome 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "Windows uninstaller returned $LASTEXITCODE`n$output" }
+    $result = Invoke-TestPowerShell $uninstaller @("-AppHome", $AppHome)
+    if ($result.ExitCode -ne 0) { throw "Windows uninstaller returned $($result.ExitCode)`n$($result.Output)" }
 }
 
 function Assert-InstallerRejectsScript([string]$Name, [string]$Script, [string]$MessageFragment) {
@@ -52,9 +64,9 @@ function Assert-InstallerRejectsScript([string]$Name, [string]$Script, [string]$
     [System.IO.File]::WriteAllText((Join-Path $case "verge.yaml"), "enable_tun_mode: false`n")
     $scriptPath = Join-Path $profiles "Script.js"
     [System.IO.File]::WriteAllText($scriptPath, $Script)
-    $output = & $PowerShellPath -NoLogo -NoProfile -File $installer -AppHome $case -MihomoPath $fakeCore 2>&1 | Out-String
-    Assert-True ($LASTEXITCODE -eq 1) "$Name was accepted"
-    Assert-True ($output.Contains($MessageFragment)) "$Name rejection did not explain the problem: $output"
+    $result = Invoke-TestPowerShell $installer @("-AppHome", $case, "-MihomoPath", $fakeCore)
+    Assert-True ($result.ExitCode -eq 1) "$Name was accepted"
+    Assert-True ($result.Output.Contains($MessageFragment)) "$Name rejection did not explain the problem: $($result.Output)"
     Assert-True ((Get-Content -LiteralPath $scriptPath -Raw) -eq $Script) "$Name rejection changed Script.js"
 }
 
@@ -234,9 +246,9 @@ try {
     [System.IO.File]::WriteAllText((Join-Path $asyncCase "verge.yaml"), $asyncVerge)
     $asyncScriptPath = Join-Path $asyncProfiles "Script.js"
     [System.IO.File]::WriteAllText($asyncScriptPath, $asyncScript)
-    $asyncOutput = & $PowerShellPath -NoLogo -NoProfile -File $installer -AppHome $asyncCase -MihomoPath $fakeCore 2>&1 | Out-String
-    Assert-True ($LASTEXITCODE -eq 1) "installer accepted an async main that Clash Verge Rev cannot await"
-    Assert-True ($asyncOutput.Contains("异步 main")) "async main rejection did not explain the incompatibility"
+    $asyncResult = Invoke-TestPowerShell $installer @("-AppHome", $asyncCase, "-MihomoPath", $fakeCore)
+    Assert-True ($asyncResult.ExitCode -eq 1) "installer accepted an async main that Clash Verge Rev cannot await"
+    Assert-True ($asyncResult.Output.Contains("异步 main")) "async main rejection did not explain the incompatibility"
     Assert-True ((Get-Content -LiteralPath $asyncScriptPath -Raw) -eq $asyncScript) "async main rejection changed Script.js"
     Assert-True ((Get-Content -LiteralPath (Join-Path $asyncCase "config.yaml") -Raw) -eq $asyncConfig) "async main rejection changed config.yaml"
     Assert-True ((Get-Content -LiteralPath (Join-Path $asyncCase "verge.yaml") -Raw) -eq $asyncVerge) "async main rejection changed verge.yaml"
@@ -275,9 +287,9 @@ friend payload
     [System.IO.File]::WriteAllText((Join-Path $invalidStateCase "config.yaml"), $invalidStateConfig)
     [System.IO.File]::WriteAllText((Join-Path $invalidStateCase "verge.yaml"), $invalidStateVerge)
     [System.IO.File]::WriteAllText((Join-Path $invalidStateCase "clash-patch-install-state.json"), '{"Version":1}')
-    $invalidStateOutput = & $PowerShellPath -NoLogo -NoProfile -File $installer -AppHome $invalidStateCase -MihomoPath $fakeCore 2>&1 | Out-String
-    Assert-True ($LASTEXITCODE -eq 1) "installer accepted incomplete state"
-    Assert-True ($invalidStateOutput.Contains("安装状态文件无效")) "incomplete state rejection was unclear"
+    $invalidStateResult = Invoke-TestPowerShell $installer @("-AppHome", $invalidStateCase, "-MihomoPath", $fakeCore)
+    Assert-True ($invalidStateResult.ExitCode -eq 1) "installer accepted incomplete state"
+    Assert-True ($invalidStateResult.Output.Contains("安装状态文件无效")) "incomplete state rejection was unclear"
     Assert-True ((Get-Content -LiteralPath (Join-Path $invalidStateCase "config.yaml") -Raw) -eq $invalidStateConfig) "invalid state changed config.yaml"
     Assert-True ((Get-Content -LiteralPath (Join-Path $invalidStateCase "verge.yaml") -Raw) -eq $invalidStateVerge) "invalid state changed verge.yaml"
 
@@ -287,8 +299,8 @@ friend payload
     $badMarkerPath = Join-Path $badMarkerProfiles "Script.js"
     $badMarkerScript = "// CLASH PATCH BEGIN`nfunction main(config) { return config; }`n// CLASH PATCH END`n// CLASH PATCH END`n"
     [System.IO.File]::WriteAllText($badMarkerPath, $badMarkerScript)
-    & $PowerShellPath -NoLogo -NoProfile -File $uninstaller -AppHome $badMarkerCase *> $null
-    Assert-True ($LASTEXITCODE -eq 1) "uninstaller accepted duplicate end markers"
+    $badMarkerResult = Invoke-TestPowerShell $uninstaller @("-AppHome", $badMarkerCase)
+    Assert-True ($badMarkerResult.ExitCode -eq 1) "uninstaller accepted duplicate end markers"
     Assert-True ((Get-Content -LiteralPath $badMarkerPath -Raw) -eq $badMarkerScript) "uninstaller modified an ambiguously marked script"
 
     Write-Host "Windows installer behavioral cases passed"
