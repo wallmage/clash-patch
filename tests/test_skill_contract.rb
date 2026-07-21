@@ -19,6 +19,7 @@ class SkillContractTest < Minitest::Test
     clash-patch/scripts/uninstall_windows.ps1
     clash-patch/scripts/uninstall_windows.cmd
     clash-patch/scripts/macos/patch_profiles.rb
+    clash-patch/scripts/macos/verify_routes.rb
     clash-patch/scripts/windows/clash_verge_global.js
     .github/workflows/test.yml
     tests/fixtures/main_group_cases.json
@@ -45,8 +46,8 @@ class SkillContractTest < Minitest::Test
 
   def test_agent_instructions_execute_clear_requests_without_reconfirmation
     instructions = File.read(File.join(ROOT, "AGENTS.md"))
-    assert_includes instructions, "需求明确且在已有授权范围内时，直接执行、验证并报告结果"
-    assert_includes instructions, "不要为计划、方案或实现细节再次请求确认"
+    assert_includes instructions, "从实现、验证、安装到提交推送连续做完"
+    assert_includes instructions, "不得要求用户重复确认"
     assert_includes instructions, "不得自行新增需求汇总、入口、方案或计划文档"
     assert_includes instructions, "实际修改项目后"
     assert_includes instructions, "自动完成本地测试、commit 和 push"
@@ -67,8 +68,8 @@ class SkillContractTest < Minitest::Test
     skill = File.read(File.join(SKILL, "SKILL.md"))
 
     refute_includes policy, "TUN：已开启"
-    assert_includes policy, "配置中的 TUN：已写入；运行状态：等待用户重新加载后验证"
-    assert_includes skill, "配置中的 TUN 写入状态"
+    assert_includes policy, "配置中的 TUN：已写入；运行状态：已自动刷新并验证"
+    assert_includes skill, "检查 TUN、DNS、外网连通性和原有代理组选择"
   end
 
   def test_skill_frontmatter_contains_only_name_and_description
@@ -113,9 +114,28 @@ class SkillContractTest < Minitest::Test
     assert_includes source, "不得把节点启动解析改成 `1.1.1.1` 或 `8.8.8.8`"
     assert_includes source, "不安装 LaunchAgent、`WatchPaths` 或目录监听"
     assert_includes source, "REALITY `short-id`"
-    assert_includes source, "不得重新加载当前配置"
+    assert_includes source, "只允许通过本地控制器自动刷新"
+    assert_includes source, "失败时立即恢复原文件和原运行配置"
     assert_includes source, "`config.yaml` 是 ClashX Meta 的默认基础配置"
     assert_includes source, "不得删除"
+  end
+
+  def test_skill_automates_route_and_browser_verification_when_computer_use_exists
+    source = File.read(File.join(SKILL, "SKILL.md"))
+
+    assert_includes source, "访问 Google 时必须经过当前主代理节点"
+    assert_includes source, "访问 OpenAI、Anthropic 或 Claude 时必须经过 AI 分组当前节点"
+    assert_includes source, "macOS 或 Windows 环境只要提供 Computer Use，就由代理连续完成"
+    assert_includes source, "当前环境没有 Computer Use 时，给出中文逐步操作"
+  end
+
+
+  def test_macos_route_verifier_checks_main_and_ai_destinations
+    source = File.read(File.join(SKILL, "scripts/macos/verify_routes.rb"))
+
+    %w[Google OpenAI Anthropic Claude].each { |name| assert_includes source, name }
+    assert_includes source, 'chains.include?(expected.fetch(kind))'
+    assert_includes source, 'existing.include?(entry["id"])'
   end
 
   def test_skill_reuses_user_ai_groups_and_creates_independent_node_selectors

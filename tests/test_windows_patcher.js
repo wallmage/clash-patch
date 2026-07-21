@@ -259,6 +259,25 @@ test('preserves a user AI target ahead of the managed rule', { skip: !available 
   assert.ok(patched.rules.indexOf(userRule) < patched.rules.indexOf(managed));
 });
 
+test('main-group AI rules do not bypass the independent AI selector', { skip: !available }, () => {
+  const config = baseConfig();
+  config['proxy-groups'] = config['proxy-groups'].filter((group) => group.name !== 'AI');
+  const providerRules = [
+    'DOMAIN-SUFFIX,openai.com,Main',
+    'DOMAIN-SUFFIX,claude.ai,Main',
+    'DOMAIN-KEYWORD,openai,Main'
+  ];
+  config.rules = providerRules.concat(config.rules);
+
+  const patched = engine.clashPatchTransform(config, 'fixture');
+  const ai = patched['proxy-groups'].find((group) => group.name === '🤖 AI · Clash Patch');
+
+  for (const rule of providerRules) assert.equal(patched.rules.includes(rule), false, rule);
+  assert.ok(patched.rules.includes(`DOMAIN-SUFFIX,openai.com,${ai.name}`));
+  assert.ok(patched.rules.includes(`DOMAIN-SUFFIX,claude.ai,${ai.name}`));
+  assert.ok(patched.rules.includes(`DOMAIN-KEYWORD,openai,${ai.name}`));
+});
+
 test('UDP guard precedes leaking rules without deleting them', { skip: !available }, () => {
   const config = baseConfig();
   const userRules = [

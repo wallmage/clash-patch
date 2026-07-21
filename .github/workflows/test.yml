@@ -30,6 +30,7 @@ jobs:
       - name: Ruby 3.3 syntax checks
         run: |
           ruby -c clash-patch/scripts/macos/patch_profiles.rb
+          ruby -c clash-patch/scripts/macos/verify_routes.rb
           node --check clash-patch/scripts/windows/clash_verge_global.js
       - name: Confirm the supported system Ruby
         run: /usr/bin/ruby -e 'abort "expected Ruby 2.6" unless RUBY_VERSION.start_with?("2.6.")'
@@ -40,6 +41,7 @@ jobs:
       - name: macOS syntax checks
         run: |
           /usr/bin/ruby -c clash-patch/scripts/macos/patch_profiles.rb
+          /usr/bin/ruby -c clash-patch/scripts/macos/verify_routes.rb
           sh -n clash-patch/scripts/install_macos.sh
           sh -n clash-patch/scripts/uninstall_macos.sh
 

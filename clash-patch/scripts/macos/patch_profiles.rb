@@ -525,7 +525,8 @@ module ClashPatch
       forbidden_ai = %w[DOMAIN DOMAIN-SUFFIX].include?(info[:type]) &&
                      forbidden.any? { |domain| domain.casecmp(info[:payload]).zero? } &&
                      owned_ai_names.include?(info[:target])
-      next if patch_owned_ai || exact_current_ai || legacy_owned_ai || forbidden_ai
+      main_group_ai = managed_keys.include?(key) && info[:target] == route_group
+      next if patch_owned_ai || exact_current_ai || legacy_owned_ai || forbidden_ai || main_group_ai
 
       if managed_keys.include?(key)
         user_overrides << rule
@@ -858,7 +859,15 @@ module ClashPatch
             source.truncate(patched_bytes.bytesize)
             source.flush
             source.fsync
-            outcome = locked_source_current?(source, path, write_path) ? result.merge(path: path) : :retry
+            outcome = if locked_source_current?(source, path, write_path)
+                        result.merge(
+                          path: path,
+                          rollback_bytes: original_bytes,
+                          patched_digest: Digest::SHA256.hexdigest(patched_bytes)
+                        )
+                      else
+                        :retry
+                      end
           end
         end
       end
@@ -1041,8 +1050,120 @@ module ClashPatch
     :unknown
   end
 
+  def runtime_selections(requester)
+    status, body = requester.call("GET", "/proxies", nil)
+    return nil unless status == 200
+
+    payload = JSON.parse(body)
+    proxies = payload["proxies"]
+    return nil unless proxies.is_a?(Hash)
+
+    proxies.each_with_object({}) do |(name, proxy), selections|
+      next unless proxy.is_a?(Hash) && proxy["now"].is_a?(String)
+      next unless proxy["type"].to_s.casecmp("Selector").zero?
+
+      selections[name] = proxy["now"]
+    end
+  rescue JSON::ParserError
+    nil
+  end
+
+  def dns_runtime_healthy?(requester, name)
+    status, body = requester.call("GET", "/dns/query?name=#{name}&type=A", nil)
+    return false unless status == 200
+
+    payload = JSON.parse(body)
+    dns_status = payload["Status"] || payload["status"]
+    answers = payload["Answer"] || payload["answer"]
+    dns_status.to_i.zero? && answers.is_a?(Array) && !answers.empty?
+  rescue JSON::ParserError
+    false
+  end
+
+  def default_connectivity_healthy?
+    3.times do
+      _output, status = Open3.capture2e(
+        "/usr/bin/curl", "-sS", "--max-time", "8", "-o", "/dev/null",
+        "https://www.google.com/generate_204"
+      )
+      return true if status.success?
+    rescue StandardError
+      next
+    end
+    false
+  end
+
+  def restore_profile_bytes(result)
+    original = result[:rollback_bytes]
+    expected = result[:patched_digest]
+    return false unless original.is_a?(String) && expected.is_a?(String)
+
+    write_path = File.realpath(result.fetch(:path))
+    File.open(write_path, "r+b") do |source|
+      source.flock(File::LOCK_EX)
+      current = source.read
+      return false unless Digest::SHA256.hexdigest(current) == expected
+
+      source.rewind
+      source.write(original)
+      source.truncate(original.bytesize)
+      source.flush
+      source.fsync
+    end
+    true
+  rescue SystemCallError, IOError, KeyError
+    false
+  end
+
+  def activate_updated_profile(result, socket: nil, requester: nil, connectivity_checker: nil)
+    if requester.nil?
+      socket ||= controller_socket
+      return result.merge(status: rollback_after_reload_failure(result, nil, nil)) unless socket
+
+      requester = ->(method, endpoint, body) { controller_request(socket, method, endpoint, body) }
+    end
+    connectivity_checker ||= method(:default_connectivity_healthy?)
+
+    before = runtime_selections(requester)
+    return result.merge(status: rollback_after_reload_failure(result, requester, result[:path])) unless before
+
+    code, _body = requester.call(
+      "PUT", "/configs?force=true", JSON.generate("path" => File.expand_path(result.fetch(:path)))
+    )
+    unless code == 204
+      return result.merge(status: rollback_after_reload_failure(result, nil, nil))
+    end
+
+    healthy = tun_state(requester: requester) == :enabled
+    after = healthy ? runtime_selections(requester) : nil
+    healthy &&= after.is_a?(Hash)
+    healthy &&= before.all? { |name, selected| !after.key?(name) || after[name] == selected }
+    healthy &&= dns_runtime_healthy?(requester, "www.baidu.com")
+    healthy &&= dns_runtime_healthy?(requester, "www.google.com")
+    healthy &&= connectivity_checker.call
+
+    return result.merge(reloaded: true) if healthy
+
+    result.merge(status: rollback_after_reload_failure(result, requester, result[:path]))
+  rescue StandardError
+    result.merge(status: rollback_after_reload_failure(result, requester, result[:path]))
+  end
+
+  def rollback_after_reload_failure(result, requester, path)
+    return :reload_failed_rollback_conflict unless restore_profile_bytes(result)
+    return :reload_failed_rolled_back unless requester && path
+
+    code, _body = requester.call(
+      "PUT", "/configs?force=true", JSON.generate("path" => File.expand_path(path))
+    )
+    code == 204 ? :reload_failed_rolled_back : :reload_failed_restore_pending
+  rescue StandardError
+    :reload_failed_restore_pending
+  end
+
   def run(directory: nil, directories: nil, policy_path:, dry_run: false, backup_root: nil,
-          selected_name: nil, active_directory: nil, validator: nil)
+          selected_name: nil, active_directory: nil, validator: nil, auto_reload: false,
+          socket: nil, requester: nil, connectivity_checker: nil)
     policy = JSON.parse(File.read(policy_path, encoding: "UTF-8"))
     unless policy.is_a?(Hash) && policy["version"] == POLICY_VERSION
       raise InvalidConfigError, "不支持的策略版本"
@@ -1059,6 +1180,14 @@ module ClashPatch
       paths.map do |path|
         result = patch_path(path, policy, dry_run: dry_run, backup_root: backup_root, validator: validator)
         result[:active] = active_root && File.expand_path(File.dirname(path)) == File.expand_path(active_root) && active_profile?(path, selected)
+        if auto_reload && !dry_run && result[:active] && result[:status] == :updated
+          result = activate_updated_profile(
+            result,
+            socket: socket,
+            requester: requester,
+            connectivity_checker: connectivity_checker
+          )
+        end
         result
       end
     end
@@ -1080,6 +1209,9 @@ module ClashPatch
     when :invalid_policy then "#{name}：已跳过：策略版本无效"
     when :concurrent_change then "#{name}：已跳过：订阅正在刷新，稍后重试"
     when :io_error then "#{name}：已跳过：读取或写入失败"
+    when :reload_failed_rolled_back then "#{name}：自动刷新失败，已恢复原配置"
+    when :reload_failed_restore_pending then "#{name}：自动刷新失败；文件已恢复，运行内核恢复失败"
+    when :reload_failed_rollback_conflict then "#{name}：自动刷新失败；订阅同时发生变化，未覆盖新内容"
     when :error then "#{name}：已跳过：处理失败"
     else "#{name}：已跳过：订阅内容无效"
     end
@@ -1111,8 +1243,9 @@ module ClashPatch
   def updated_state(result)
     return "将更新（演练，未写入文件）" if result[:dry_run]
     return "已更新，选择该订阅时生效" unless result[:active]
+    return "已更新并自动生效" if result[:reloaded]
 
-    "已更新，等待用户手动重新加载"
+    "已更新，尚未自动刷新"
   end
 
   def cli(argv = ARGV)
@@ -1121,6 +1254,7 @@ module ClashPatch
       policy: File.expand_path("../../references/policy.json", __dir__),
       backup_root: File.expand_path("~/Library/Application Support/ClashPatch/backups"),
       dry_run: false,
+      auto_reload: true,
       print_tun_state: false,
       print_core_status: false
     }
@@ -1130,6 +1264,7 @@ module ClashPatch
       opts.on("--policy PATH", "指定策略文件") { |value| options[:policy] = File.expand_path(value) }
       opts.on("--backup-dir PATH", "指定备份目录") { |value| options[:backup_root] = File.expand_path(value) }
       opts.on("--dry-run", "只预览，不写入文件") { options[:dry_run] = true }
+      opts.on("--no-reload", "只更新文件，不自动刷新当前订阅") { options[:auto_reload] = false }
       opts.on("--print-tun-state", "输出当前运行内核的 TUN 状态") { options[:print_tun_state] = true }
       opts.on("--print-core-status", "检查 Mihomo 内核是否满足最低版本") { options[:print_core_status] = true }
       opts.on("-h", "--help", "显示帮助") do
@@ -1161,7 +1296,8 @@ module ClashPatch
       policy_path: options[:policy],
       dry_run: options[:dry_run],
       backup_root: options[:backup_root],
-      validator: options[:dry_run] ? nil : method(:validate_with_mihomo)
+      validator: options[:dry_run] ? nil : method(:validate_with_mihomo),
+      auto_reload: options[:auto_reload] && !options[:dry_run]
     )
     results.each { |result| puts chinese_status(result) }
     0

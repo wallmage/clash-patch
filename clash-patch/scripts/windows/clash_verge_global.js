@@ -558,7 +558,8 @@ function clashPatchRules(config, aiGroup, routeGroup, ownedAiNames, ownedSafeNam
     const forbiddenAi = (info.type === "DOMAIN" || info.type === "DOMAIN-SUFFIX") &&
       CLASH_PATCH_POLICY.forbiddenAiDomains.some(function (domain) { return domain.toLowerCase() === info.payload.toLowerCase(); }) &&
       ownedAiNames.indexOf(info.target) !== -1;
-    if (patchOwnedAi || exactCurrentAi || legacyOwnedAi || forbiddenAi) return;
+    const mainGroupAi = managedKeys.indexOf(key) !== -1 && info.target === routeGroup;
+    if (patchOwnedAi || exactCurrentAi || legacyOwnedAi || forbiddenAi || mainGroupAi) return;
     if (managedKeys.indexOf(key) !== -1) userOverrides.push(rule);
     else remaining.push(rule);
   });

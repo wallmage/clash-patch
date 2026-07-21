@@ -6,7 +6,7 @@ Clash Patch 是给 AI 助手使用的 Clash 配置补丁，支持 macOS 的 Clas
 
 **绝对不要退出、停止或重启 Clash 客户端。** 中国用户通常依靠 Clash 连接 Codex；客户端退出后，修复可能中断。
 
-补丁不会重新加载当前配置，不切换 TUN、订阅、代理组或节点，也不加入 Apple、iCloud、Speedtest 等个人规则。
+补丁不会退出或重启 Clash，也不会切换 TUN、订阅、代理组或节点。macOS 修改当前订阅后会通过本地控制器自动刷新并检查；失败时恢复修改前的文件和运行配置。补丁不加入 Apple、iCloud、Speedtest 等个人规则。
 
 ## 补丁内容
 
@@ -49,7 +49,7 @@ bash clash-patch/scripts/install_macos.sh
 
 ### macOS
 
-安装程序单次运行，只处理 ClashX Meta 当前使用的本地目录或 iCloud 容器。每份顶层 YAML 都经过 YAML 1.2 读取、二次转换和 Mihomo 校验，最长等待 30 秒。修改前创建一次性备份，写完后不重新加载配置。
+安装程序单次运行，只处理 ClashX Meta 当前使用的本地目录或 iCloud 容器。每份顶层 YAML 都经过 YAML 1.2 读取、二次转换和 Mihomo 校验，最长等待 30 秒。修改前创建一次性备份。当前订阅写入后通过 Mihomo 本地控制器自动刷新，并检查 TUN、DNS、外网连通性和原有代理组选择；任一步失败都会恢复修改前的内容。整个过程不退出或重启 ClashX Meta。
 
 macOS 不安装 LaunchAgent 或 `WatchPaths`。安装程序会删除能确认属于旧版 Clash Patch 的目录监听。订阅以后刷新时，需要再次运行 skill。
 
@@ -61,13 +61,13 @@ Clash Verge Rev 的全局扩展脚本 `profiles/Script.js` 会在订阅加载或
 
 ## 验证
 
-用户主动刷新或选择订阅后测试：
+先检查实时分流：Google 应经过主代理组当前节点；OpenAI、Anthropic 和 Claude 应经过 AI 分组当前节点。然后测试：
 
 1. [IPInfo WebRTC 检测](https://ipinfo.cv/webrtc-check)
 2. [DNS 泄漏检测](https://ip.net.coffee/dns/)：点击“深度测试”
 3. [IP Coffee WebRTC 检测](https://ip.net.coffee/webrtc/)
 
-这些第三方页面会收到浏览器公网 IP。三项都没有红色提示，且没有未代理公网 IP、私网地址或本地运营商 DNS，才能说验证通过。
+这些第三方页面会收到浏览器公网 IP。有 Computer Use 时由 AI 助手自动打开并完成测试；没有时按聊天中的中文步骤手动测试并把红色结果截图发回。三项都没有红色提示，且没有未代理公网 IP、私网地址或本地运营商 DNS，才能说验证通过。
 
 ## 卸载与隐私
 

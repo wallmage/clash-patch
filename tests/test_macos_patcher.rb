@@ -290,6 +290,26 @@ class MacosPatcherTest < Minitest::Test
     assert_operator rules.index(user_rule), :<, rules.index(managed_rule)
   end
 
+  def test_main_group_ai_rules_do_not_bypass_the_ai_selector
+    config = base_config
+    config["proxy-groups"].reject! { |group| group["name"] == "AI" }
+    provider_rules = [
+      "DOMAIN-SUFFIX,openai.com,Main",
+      "DOMAIN-SUFFIX,claude.ai,Main",
+      "DOMAIN-KEYWORD,openai,Main"
+    ]
+    config["rules"] = provider_rules + config.fetch("rules")
+
+    result = ClashPatch.patch(config, @policy)
+    rules = result.fetch(:config).fetch("rules")
+    ai_group = result.fetch(:ai_group)
+
+    provider_rules.each { |rule| refute_includes rules, rule }
+    assert_includes rules, "DOMAIN-SUFFIX,openai.com,#{ai_group}"
+    assert_includes rules, "DOMAIN-SUFFIX,claude.ai,#{ai_group}"
+    assert_includes rules, "DOMAIN-KEYWORD,openai,#{ai_group}"
+  end
+
   def test_udp_guard_precedes_leaking_rules_without_deleting_them
     config = base_config
     user_rules = [
@@ -738,23 +758,123 @@ class MacosPatcherTest < Minitest::Test
   def test_chinese_status_covers_all_update_states
     base = { path: "/profiles/friend.yaml", status: :updated, ai_group: "AI" }
 
-    assert_includes ClashPatch.chinese_status(base.merge(active: true)), "已更新，等待用户手动重新加载"
+    assert_includes ClashPatch.chinese_status(base.merge(active: true, reloaded: true)), "已更新并自动生效"
     assert_includes ClashPatch.chinese_status(base.merge(active: false)), "已更新，选择该订阅时生效"
+    assert_includes ClashPatch.chinese_status(base.merge(status: :reload_failed_rolled_back)), "自动刷新失败，已恢复原配置"
     assert_includes ClashPatch.chinese_status(base.merge(status: :unchanged)), "无需修改"
   end
 
-  def test_run_never_activates_the_updated_profile
+  def test_run_automatically_reloads_and_checks_the_active_profile
     Dir.mktmpdir do |directory|
       File.write(File.join(directory, "friend.yaml"), YAML.dump(base_config))
       File.write(File.join(directory, "other.yaml"), YAML.dump(base_config))
 
+      requests = []
+      proxy_body = JSON.generate("proxies" => {
+        "Main" => { "type" => "Selector", "now" => "台湾家宽 01" },
+        "AI" => { "type" => "Selector", "now" => "台湾家宽 01" }
+      })
+      requester = lambda do |method, endpoint, body|
+        requests << [method, endpoint, body]
+        case [method, endpoint]
+        when ["GET", "/proxies"] then [200, proxy_body]
+        when ["PUT", "/configs?force=true"] then [204, ""]
+        when ["GET", "/configs"] then [200, JSON.generate("tun" => { "enable" => true })]
+        else
+          if method == "GET" && endpoint.start_with?("/dns/query?")
+            [200, JSON.generate("Status" => 0, "Answer" => [{ "data" => "203.0.113.1" }])]
+          else
+            [404, ""]
+          end
+        end
+      end
+
       results = ClashPatch.run(directory: directory, policy_path: POLICY_PATH, backup_root: File.join(directory, "backups"),
-                               selected_name: "friend")
+                               selected_name: "friend", auto_reload: true, requester: requester,
+                               connectivity_checker: -> { true })
       active = results.find { |entry| File.basename(entry[:path]) == "friend.yaml" }
       inactive = results.find { |entry| File.basename(entry[:path]) == "other.yaml" }
-      refute active.key?(:reloaded)
-      assert_includes ClashPatch.chinese_status(active), "已更新，等待用户手动重新加载"
+      assert_equal true, active.fetch(:reloaded)
+      assert_includes ClashPatch.chinese_status(active), "已更新并自动生效"
       assert_includes ClashPatch.chinese_status(inactive), "已更新，选择该订阅时生效"
+      assert requests.any? { |method, endpoint, _body| method == "PUT" && endpoint == "/configs?force=true" }
+    end
+  end
+
+  def test_runtime_selection_guard_ignores_automatic_url_test_groups
+    requester = lambda do |_method, _endpoint, _body|
+      [200, JSON.generate("proxies" => {
+        "Main" => { "type" => "Selector", "now" => "Singapore" },
+        "Automatic" => { "type" => "URLTest", "now" => "Japan" }
+      })]
+    end
+
+    assert_equal({ "Main" => "Singapore" }, ClashPatch.runtime_selections(requester))
+  end
+
+  def test_failed_active_reload_restores_the_exact_original_profile
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config)
+      File.binwrite(profile, original)
+      requester = lambda do |method, endpoint, _body|
+        if method == "GET" && endpoint == "/proxies"
+          [200, JSON.generate("proxies" => { "Main" => { "type" => "Selector", "now" => "台湾家宽 01" } })]
+        elsif method == "PUT" && endpoint == "/configs?force=true"
+          [401, ""]
+        else
+          [404, ""]
+        end
+      end
+
+      result = ClashPatch.run(
+        directory: directory,
+        policy_path: POLICY_PATH,
+        backup_root: File.join(directory, "backups"),
+        selected_name: "friend",
+        auto_reload: true,
+        requester: requester,
+        connectivity_checker: -> { true }
+      ).first
+
+      assert_equal :reload_failed_rolled_back, result.fetch(:status)
+      assert_equal original.b, File.binread(profile)
+      assert_includes ClashPatch.chinese_status(result), "自动刷新失败，已恢复原配置"
+    end
+  end
+
+  def test_runtime_health_failure_reloads_the_restored_profile
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config)
+      File.binwrite(profile, original)
+      reload_bodies = []
+      requester = lambda do |method, endpoint, body|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          [200, JSON.generate("proxies" => { "Main" => { "type" => "Selector", "now" => "台湾家宽 01" } })]
+        when ["PUT", "/configs?force=true"]
+          reload_bodies << body
+          [204, ""]
+        when ["GET", "/configs"]
+          [200, JSON.generate("tun" => { "enable" => false })]
+        else
+          [404, ""]
+        end
+      end
+
+      result = ClashPatch.run(
+        directory: directory,
+        policy_path: POLICY_PATH,
+        selected_name: "friend",
+        auto_reload: true,
+        requester: requester,
+        connectivity_checker: -> { true }
+      ).first
+
+      assert_equal :reload_failed_rolled_back, result.fetch(:status)
+      assert_equal original.b, File.binread(profile)
+      assert_equal 2, reload_bodies.length
     end
   end
 
@@ -1343,7 +1463,7 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
-  def test_default_run_never_reloads_the_live_client
+  def test_library_run_does_not_reload_unless_explicitly_enabled
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
       File.write(profile, YAML.dump(base_config))
@@ -1358,7 +1478,7 @@ class MacosPatcherTest < Minitest::Test
 
       assert_equal :updated, active.fetch(:status)
       refute active.key?(:reloaded)
-      assert_includes ClashPatch.chinese_status(active), "等待用户手动重新加载"
+      assert_includes ClashPatch.chinese_status(active), "已更新，尚未自动刷新"
     end
   end
 
@@ -1478,8 +1598,12 @@ class MacosPatcherTest < Minitest::Test
     policy_document = File.read(File.join(ROOT, "clash-patch/references/patch-policy.md"))
     skill_document = File.read(File.join(ROOT, "clash-patch/SKILL.md"))
     examples = [
+      { path: "/profiles/friend.yaml", status: :updated, active: true, reloaded: true, ai_group: "AI" },
       { path: "/profiles/friend.yaml", status: :updated, active: true, ai_group: "AI" },
       { path: "/profiles/friend.yaml", status: :updated, active: false, ai_group: "AI" },
+      { path: "/profiles/friend.yaml", status: :reload_failed_rolled_back },
+      { path: "/profiles/friend.yaml", status: :reload_failed_restore_pending },
+      { path: "/profiles/friend.yaml", status: :reload_failed_rollback_conflict },
       { path: "/profiles/friend.yaml", status: :unchanged },
       { path: "/profiles/friend.yaml", status: :no_main_group },
       { path: "/profiles/friend.yaml", status: :no_ai_nodes },

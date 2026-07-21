@@ -2,7 +2,7 @@
 
 ## 执行
 
-- 需求明确且在已有授权范围内时，直接执行、验证并报告结果。不要为计划、方案或实现细节再次请求确认。
+- 需求明确且在已有授权范围内时，从实现、验证、安装到提交推送连续做完。不得停在方案、计划、等待用户操作或“尚未提交”的中间状态，也不得要求用户重复确认；只有缺少必要权限或操作会明显超出用户授权时才能停下。
 - 始终在 `main` 上工作，不使用 worktree、功能分支或 PR。
 - 实际修改项目后，除非用户明确要求不要提交，否则自动完成本地测试、commit 和 push，让 GitHub CI 自动运行。不得把“尚未 commit 或 push”作为常规收尾。
 - 文档位置固定。不得自行新增需求汇总、入口、方案或计划文档：`README.md` 面向用户，`clash-patch/SKILL.md` 规定代理流程，`clash-patch/references/patch-policy.md` 保存详细产品规则，`docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md` 保存产品需求与架构。
@@ -26,6 +26,7 @@ ruby tests/test_skill_contract.rb
 node --test tests/test_windows_patcher.js
 ruby tests/generate_windows_policy.rb --check
 ruby -c clash-patch/scripts/macos/patch_profiles.rb
+ruby -c clash-patch/scripts/macos/verify_routes.rb
 node --check clash-patch/scripts/windows/clash_verge_global.js
 sh -n clash-patch/scripts/install_macos.sh
 sh -n clash-patch/scripts/uninstall_macos.sh
