@@ -154,6 +154,7 @@ class SkillContractTest < Minitest::Test
     mac_uninstall = File.read(File.join(SKILL, "scripts/uninstall_macos.sh"))
     windows_install = File.binread(File.join(SKILL, "scripts/install_windows.ps1"))
     windows_uninstall = File.binread(File.join(SKILL, "scripts/uninstall_windows.ps1"))
+    windows_tests = File.binread(File.join(ROOT, "tests/test_windows_installer.ps1"))
     patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
 
     assert_operator mac_install.index('id -u'), :<, mac_install.index('/bin/mkdir -p')
@@ -176,6 +177,7 @@ class SkillContractTest < Minitest::Test
 
     assert_equal "\xEF\xBB\xBF".b, windows_install.byteslice(0, 3)
     assert_equal "\xEF\xBB\xBF".b, windows_uninstall.byteslice(0, 3)
+    assert_equal "\xEF\xBB\xBF".b, windows_tests.byteslice(0, 3)
     assert_includes windows_install.force_encoding("UTF-8"), "MihomoPath"
     assert_includes windows_install, "Test-MihomoVersion"
     assert_includes windows_install, "OriginalBytes"
