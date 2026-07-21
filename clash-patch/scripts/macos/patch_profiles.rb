@@ -346,6 +346,15 @@ module ClashPatch
     safe_proxy_target?(config, target) || group_cannot_reach_direct?(config, target)
   end
 
+  def normalized_resolver_endpoints(config, policy, values)
+    return nil unless values.all? { |value| safe_resolver_endpoint?(config, value) }
+
+    values.flat_map do |value|
+      fragment = value.to_s.split("#", 2)[1]
+      Array(policy["resolvers"]).map { |resolver| "#{resolver}##{fragment}" }
+    end.uniq
+  end
+
   def patch_dns(config, policy, route_group, owned_safe_names = [])
     dns = config["dns"].is_a?(Hash) ? config["dns"] : {}
     config["dns"] = dns
@@ -383,7 +392,8 @@ module ClashPatch
         next if legacy_owned
 
         references_old_group = values.any? { |value| owned_safe_names.include?(resolver_target(value)) }
-        policies[pattern] = !references_old_group && !values.empty? && values.all? { |value| safe_resolver_endpoint?(config, value) } ? values : deep_copy(safe_resolvers)
+        normalized = !references_old_group && !values.empty? ? normalized_resolver_endpoints(config, policy, values) : nil
+        policies[pattern] = normalized || deep_copy(safe_resolvers)
       end
     end
     ai_dns_patterns(policy).each { |pattern| policies[pattern] = deep_copy(safe_resolvers) }

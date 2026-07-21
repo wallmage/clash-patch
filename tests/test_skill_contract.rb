@@ -115,6 +115,24 @@ class SkillContractTest < Minitest::Test
     refute policy.key?("default_bootstrap_resolvers")
   end
 
+  def test_managed_dns_policy_uses_bootstrap_free_ip_doh_without_site_exceptions
+    policy = JSON.parse(File.read(File.join(SKILL, "references/policy.json")))
+    assert_equal [
+      "https://94.140.14.14/dns-query",
+      "https://94.140.15.15/dns-query",
+      "https://101.101.101.101/dns-query"
+    ], policy.fetch("resolvers")
+
+    public_source = Dir.glob(File.join(ROOT, "{README.md,clash-patch/**/*}"), File::FNM_EXTGLOB)
+                       .select { |path| File.file?(path) }
+                       .map { |path| File.binread(path).force_encoding("UTF-8").scrub }
+                       .join("\n")
+    refute_includes public_source.downcase, "aiping.cn"
+
+    policy_doc = File.read(File.join(SKILL, "references/patch-policy.md"))
+    assert_includes policy_doc, "无需先解析解析器域名"
+  end
+
   def test_windows_policy_is_generated_from_canonical_json
     generator = File.join(ROOT, "tests/generate_windows_policy.rb")
     assert system(RbConfig.ruby, generator, "--check"), "Windows policy block is stale"

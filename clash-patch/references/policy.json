@@ -1,9 +1,9 @@
 {
   "version": 1,
   "resolvers": [
-    "https://1.1.1.1/dns-query",
-    "https://1.0.0.1/dns-query",
-    "https://8.8.8.8/dns-query"
+    "https://94.140.14.14/dns-query",
+    "https://94.140.15.15/dns-query",
+    "https://101.101.101.101/dns-query"
   ],
   "bootstrap_fallback_resolvers": [
     "system"

@@ -5,9 +5,9 @@
 const CLASH_PATCH_POLICY = {
   "version": 1,
   "resolvers": [
-    "https://1.1.1.1/dns-query",
-    "https://1.0.0.1/dns-query",
-    "https://8.8.8.8/dns-query"
+    "https://94.140.14.14/dns-query",
+    "https://94.140.15.15/dns-query",
+    "https://101.101.101.101/dns-query"
   ],
   "bootstrapFallbackResolvers": [
     "system"
@@ -385,6 +385,19 @@ function clashPatchSafeResolverEndpoint(config, endpoint) {
   return clashPatchSafeProxyTarget(config, target) || clashPatchGroupCannotReachDirect(config, target, []);
 }
 
+function clashPatchNormalizedResolverEndpoints(config, values) {
+  if (!values.every(function (value) { return clashPatchSafeResolverEndpoint(config, value); })) return null;
+  const normalized = [];
+  values.forEach(function (value) {
+    const fragment = String(value).split("#", 2)[1];
+    CLASH_PATCH_POLICY.resolvers.forEach(function (resolver) {
+      const endpoint = resolver + "#" + fragment;
+      if (normalized.indexOf(endpoint) === -1) normalized.push(endpoint);
+    });
+  });
+  return normalized;
+}
+
 function clashPatchDns(config, routeGroup, ownedSafeNames) {
   const dns = config.dns && typeof config.dns === "object" && !Array.isArray(config.dns) ? config.dns : {};
   config.dns = dns;
@@ -424,10 +437,8 @@ function clashPatchDns(config, routeGroup, ownedSafeNames) {
       const referencesOldGroup = values.some(function (value) {
         return ownedSafeNames.indexOf(clashPatchResolverTarget(value)) !== -1;
       });
-      const safe = !referencesOldGroup && values.length > 0 && values.every(function (value) {
-        return clashPatchSafeResolverEndpoint(config, value);
-      });
-      policies[pattern] = safe ? values : safeResolvers.slice();
+      const normalized = !referencesOldGroup && values.length > 0 ? clashPatchNormalizedResolverEndpoints(config, values) : null;
+      policies[pattern] = normalized || safeResolvers.slice();
     });
   });
   clashPatchDnsPatterns().forEach(function (pattern) { policies[pattern] = safeResolvers.slice(); });

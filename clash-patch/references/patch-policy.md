@@ -63,15 +63,15 @@ dns:
   use-system-hosts: true
 ```
 
-补丁不创建安全代理组。`DNS` 出站只把请求交给 Mihomo 内部 DNS 模块，不是远端代理。普通查询和 AI 域名查询都使用带原主代理组标签的 DoH。升级旧版补丁时，删除能确认属于本工具的 `🛡 安全代理 · Clash Patch`，并把相关 DNS 和 UDP 规则迁移到原主代理组。
+补丁不创建安全代理组。`DNS` 出站只把请求交给 Mihomo 内部 DNS 模块，不是远端代理。普通查询和 AI 域名查询都使用带原主代理组标签的 DoH。受管 DoH 直接连接解析器 IP，无需先解析解析器域名，避免解析器域名被错误解析后出现证书错误。策略同时配置 AdGuard 的两个地址和 TWNIC Quad 101，不再只依赖一套公共 DNS。升级旧版补丁时，删除能确认属于本工具的 `🛡 安全代理 · Clash Patch`，并把相关 DNS 和 UDP 规则迁移到原主代理组。
 
-`default-nameserver`、`proxy-server-nameserver` 和 `direct-nameserver` 属于网络启动边界，必须保留用户值。`proxy-server-nameserver` 缺失时使用 `system`，满足 Mihomo 的 `respect-rules` 要求；如果启动字段等于旧版补丁写入的固定 `1.1.1.1`、`8.8.8.8` 组合，也迁移为 `system`。不得把可直接访问的节点域名解析器替换为可能被阻断的境外地址。加密 DoH 可以使用这些地址，但必须带原主代理组标签，经代理访问。
+`default-nameserver`、`proxy-server-nameserver` 和 `direct-nameserver` 属于网络启动边界，必须保留用户值。`proxy-server-nameserver` 缺失时使用 `system`，满足 Mihomo 的 `respect-rules` 要求；如果启动字段等于旧版补丁写入的固定 `1.1.1.1`、`8.8.8.8` 组合，也迁移为 `system`。不得把可直接访问的节点域名解析器替换为可能被阻断的境外地址。
 
-如 `nameserver-policy` 把多个域名写在同一个逗号分隔键中，拆成独立键。只有当解析器片段指向已知的非直连节点，或指向依赖关系中无法到达 `DIRECT` 的静态代理组时才保留。判断代理组时必须应用 `exclude-filter`；筛选后为空时，只接受明确指向安全内联代理的 `empty-fallback`，默认的 `COMPATIBLE` 不合格。带 `use`、`include-all` 或其他动态成员的组无法静态证明，改为受管 DoH。Mihomo 的 `exclude-type` 只作用于自动纳入的节点，这些动态组本来就不保留。
+如 `nameserver-policy` 把多个域名写在同一个逗号分隔键中，拆成独立键。只有当解析器片段指向已知的非直连节点，或指向依赖关系中无法到达 `DIRECT` 的静态代理组时，才保留这个分流目标；解析器地址统一换成策略文件中的三个 IP DoH。这样不会因为 `dns.google`、`cloudflare-dns.com` 等解析器域名被错误解析而让所有新域名一起失败，也不会继续依赖某些节点会拒绝的 `8.8.8.8`、`1.1.1.1`。判断代理组时必须应用 `exclude-filter`；筛选后为空时，只接受明确指向安全内联代理的 `empty-fallback`，默认的 `COMPATIBLE` 不合格。带 `use`、`include-all` 或其他动态成员的组无法静态证明，改为受管 DoH。Mihomo 的 `exclude-type` 只作用于自动纳入的节点，这些动态组本来就不保留。
 
 `#h3=true` 可以保留。`#en0`、`#RULES`、未知名称、明文 DNS、`DIRECT`、`DNS` 出站和没有代理组标签的查询都改为受管 DoH。带 `skip-cert-verify=true` 的解析器跳过证书校验；带 `ecs` 或 `ecs-override` 的解析器会发送客户端子网信息。这三类参数也改为受管 DoH。
 
-不要为测速成绩额外添加国内 DNS 例外。以真实泄漏测试结果为准。
+不要为某个打不开的网站添加专用 DNS 例外，也不要为测速成绩添加国内 DNS 例外。同类网站一起出现 `SERVFAIL` 时，应检查整组解析器和当前节点；某个配置在另一节点上恢复，通常是节点故障，不要误改 DNS。最后以真实泄漏测试结果为准。
 
 ## 主代理组
 

@@ -127,6 +127,32 @@ class MacosPatcherTest < Minitest::Test
     assert_equal ["system"], patched.fetch("direct-nameserver")
   end
 
+  def test_managed_dns_uses_bootstrap_free_ip_doh_and_rewrites_other_endpoints
+    expected_resolvers = [
+      "https://94.140.14.14/dns-query",
+      "https://94.140.15.15/dns-query",
+      "https://101.101.101.101/dns-query"
+    ]
+    assert_equal expected_resolvers, @policy.fetch("resolvers")
+
+    config = base_config
+    config["dns"]["proxy-server-nameserver"] = ["223.5.5.5", "120.53.53.53"]
+    config["dns"]["nameserver-policy"] = {
+      "+.hostname-resolver.example" => ["https://dns.alidns.com/dns-query#台湾家宽 01"],
+      "+.blocked-prone.example" => ["https://8.8.8.8/dns-query#台湾家宽 01"],
+      "+.managed.example" => ["https://94.140.14.14/dns-query#台湾家宽 01"]
+    }
+
+    result = ClashPatch.patch(config, @policy)
+    policies = result.fetch(:config).dig("dns", "nameserver-policy")
+    managed = expected_resolvers.map { |resolver| "#{resolver}#台湾家宽 01" }
+
+    assert_equal managed, policies.fetch("+.hostname-resolver.example")
+    assert_equal managed, policies.fetch("+.blocked-prone.example")
+    assert_equal managed, policies.fetch("+.managed.example")
+    assert_equal ["223.5.5.5", "120.53.53.53"], result.fetch(:config).dig("dns", "proxy-server-nameserver")
+  end
+
   def test_uses_system_only_when_proxy_bootstrap_is_missing
     patched = ClashPatch.patch(base_config, @policy).fetch(:config).fetch("dns")
 
@@ -792,8 +818,8 @@ class MacosPatcherTest < Minitest::Test
     result = ClashPatch.patch(config, @policy)
     policies = result.fetch(:config).dig("dns", "nameserver-policy")
 
-    assert_equal ["https://1.1.1.1/dns-query#台湾家宽 01"], policies.fetch("+.proxy.example")
-    assert_equal ["https://1.1.1.1/dns-query#SafeExisting"], policies.fetch("+.group.example")
+    assert_equal @policy.fetch("resolvers").map { |resolver| "#{resolver}#台湾家宽 01" }, policies.fetch("+.proxy.example")
+    assert_equal @policy.fetch("resolvers").map { |resolver| "#{resolver}#SafeExisting" }, policies.fetch("+.group.example")
     %w[+.direct.example +.option.example +.interface.example].each do |pattern|
       assert policies.fetch(pattern).all? { |value| value.end_with?("##{result.fetch(:route_group)}") }, pattern
     end
@@ -818,7 +844,7 @@ class MacosPatcherTest < Minitest::Test
     policies = result.fetch(:config).dig("dns", "nameserver-policy")
     safe_suffix = "##{result.fetch(:route_group)}"
 
-    assert_equal ["https://1.1.1.1/dns-query#台湾家宽 01"], policies.fetch("+.encrypted.example")
+    assert_equal @policy.fetch("resolvers").map { |resolver| "#{resolver}#台湾家宽 01" }, policies.fetch("+.encrypted.example")
     %w[+.plaintext.example +.provider.example +.include-all.example].each do |pattern|
       assert policies.fetch(pattern).all? { |endpoint| endpoint.end_with?(safe_suffix) }, pattern
     end
@@ -851,7 +877,7 @@ class MacosPatcherTest < Minitest::Test
     main_group = result.fetch(:config).fetch("proxy-groups").find { |group| group["name"] == result.fetch(:route_group) }
 
     assert policies.fetch("+.compatible.example").all? { |endpoint| endpoint.end_with?(safe_suffix) }
-    assert_equal ["https://1.1.1.1/dns-query#FilteredToSafeProxy"], policies.fetch("+.fallback.example")
+    assert_equal @policy.fetch("resolvers").map { |resolver| "#{resolver}#FilteredToSafeProxy" }, policies.fetch("+.fallback.example")
     assert policies.fetch("+.dns-out.example").all? { |endpoint| endpoint.end_with?(safe_suffix) }
     assert_equal original_main, main_group
   end
@@ -869,7 +895,7 @@ class MacosPatcherTest < Minitest::Test
     policies = result.fetch(:config).dig("dns", "nameserver-policy")
     safe_suffix = "##{result.fetch(:route_group)}"
 
-    assert_equal ["https://1.1.1.1/dns-query##{target}&h3=true"], policies.fetch("+.h3.example")
+    assert_equal @policy.fetch("resolvers").map { |resolver| "#{resolver}##{target}&h3=true" }, policies.fetch("+.h3.example")
     %w[+.skip-cert.example +.ecs.example].each do |pattern|
       assert policies.fetch(pattern).all? { |endpoint| endpoint.end_with?(safe_suffix) }, pattern
     end
@@ -1025,7 +1051,7 @@ class MacosPatcherTest < Minitest::Test
 
     assert_includes result.fetch(:config).fetch("rules"), "DOMAIN-SUFFIX,ai.com,Friend"
     assert_includes result.fetch(:config).fetch("rules"), "IP-CIDR,160.79.104.0/21,Friend,no-resolve"
-    assert_equal ["https://1.1.1.1/dns-query#Friend"], result.fetch(:config).dig("dns", "nameserver-policy", "+.ai.com")
+    assert_equal @policy.fetch("resolvers").map { |resolver| "#{resolver}#Friend" }, result.fetch(:config).dig("dns", "nameserver-policy", "+.ai.com")
   end
 
   def test_patches_config_without_rules_array

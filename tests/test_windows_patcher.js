@@ -98,6 +98,32 @@ test('preserves bootstrap and direct resolvers', { skip: !available }, () => {
   assert.deepEqual(dns['direct-nameserver'], ['system']);
 });
 
+test('managed DNS uses bootstrap-free IP DoH and rewrites other endpoints', { skip: !available }, () => {
+  const expectedResolvers = [
+    'https://94.140.14.14/dns-query',
+    'https://94.140.15.15/dns-query',
+    'https://101.101.101.101/dns-query'
+  ];
+  assert.deepEqual(engine.CLASH_PATCH_POLICY.resolvers, expectedResolvers);
+
+  const config = baseConfig();
+  config.dns['proxy-server-nameserver'] = ['223.5.5.5', '120.53.53.53'];
+  config.dns['nameserver-policy'] = {
+    '+.hostname-resolver.example': ['https://dns.alidns.com/dns-query#台湾家宽 01'],
+    '+.blocked-prone.example': ['https://8.8.8.8/dns-query#台湾家宽 01'],
+    '+.managed.example': ['https://94.140.14.14/dns-query#台湾家宽 01']
+  };
+
+  const patched = engine.clashPatchTransform(config, 'fixture');
+  const policies = patched.dns['nameserver-policy'];
+  const managed = expectedResolvers.map((resolver) => `${resolver}#台湾家宽 01`);
+
+  assert.deepEqual(policies['+.hostname-resolver.example'], managed);
+  assert.deepEqual(policies['+.blocked-prone.example'], managed);
+  assert.deepEqual(policies['+.managed.example'], managed);
+  assert.deepEqual(patched.dns['proxy-server-nameserver'], ['223.5.5.5', '120.53.53.53']);
+});
+
 test('uses system only when proxy bootstrap is missing', { skip: !available }, () => {
   const dns = engine.clashPatchTransform(baseConfig(), 'fixture').dns;
 
@@ -361,8 +387,8 @@ test('DNS fragments must resolve to a non-direct proxy or group', { skip: !avail
   };
   const patched = engine.clashPatchTransform(config, 'fixture');
   const policy = patched.dns['nameserver-policy'];
-  assert.deepEqual(policy['+.proxy.example'], ['https://1.1.1.1/dns-query#台湾家宽 01']);
-  assert.deepEqual(policy['+.group.example'], ['https://1.1.1.1/dns-query#SafeExisting']);
+  assert.deepEqual(policy['+.proxy.example'], engine.CLASH_PATCH_POLICY.resolvers.map((resolver) => `${resolver}#台湾家宽 01`));
+  assert.deepEqual(policy['+.group.example'], engine.CLASH_PATCH_POLICY.resolvers.map((resolver) => `${resolver}#SafeExisting`));
   for (const pattern of ['+.direct.example', '+.option.example', '+.interface.example']) {
     assert.ok(policy[pattern].every((value) => value.endsWith(`#${engine.clashPatchRouteGroupName(patched)}`)), pattern);
   }
@@ -382,7 +408,7 @@ test('DNS policy rejects plaintext and dynamic group targets', { skip: !availabl
   const patched = engine.clashPatchTransform(config, 'fixture');
   const policies = patched.dns['nameserver-policy'];
   const safeSuffix = `#${engine.clashPatchRouteGroupName(patched)}`;
-  assert.deepEqual(policies['+.encrypted.example'], ['https://1.1.1.1/dns-query#台湾家宽 01']);
+  assert.deepEqual(policies['+.encrypted.example'], engine.CLASH_PATCH_POLICY.resolvers.map((resolver) => `${resolver}#台湾家宽 01`));
   for (const pattern of ['+.plaintext.example', '+.provider.example', '+.include-all.example']) {
     assert.ok(policies[pattern].every((endpoint) => endpoint.endsWith(safeSuffix)), pattern);
   }
@@ -412,7 +438,7 @@ test('DNS policy accounts for exclusion, empty fallback, and DNS outbounds', { s
   const safeSuffix = `#${safeName}`;
   const mainGroup = patched['proxy-groups'].find((group) => group.name === safeName);
   assert.ok(policies['+.compatible.example'].every((endpoint) => endpoint.endsWith(safeSuffix)));
-  assert.deepEqual(policies['+.fallback.example'], ['https://1.1.1.1/dns-query#FilteredToSafeProxy']);
+  assert.deepEqual(policies['+.fallback.example'], engine.CLASH_PATCH_POLICY.resolvers.map((resolver) => `${resolver}#FilteredToSafeProxy`));
   assert.ok(policies['+.dns-out.example'].every((endpoint) => endpoint.endsWith(safeSuffix)));
   assert.deepEqual(mainGroup, originalMain);
 });
@@ -429,7 +455,7 @@ test('DNS policy rejects privacy-weakening resolver options', { skip: !available
   const patched = engine.clashPatchTransform(config, 'fixture');
   const policies = patched.dns['nameserver-policy'];
   const safeSuffix = `#${engine.clashPatchRouteGroupName(patched)}`;
-  assert.deepEqual(policies['+.h3.example'], [`https://1.1.1.1/dns-query#${target}&h3=true`]);
+  assert.deepEqual(policies['+.h3.example'], engine.CLASH_PATCH_POLICY.resolvers.map((resolver) => `${resolver}#${target}&h3=true`));
   for (const pattern of ['+.skip-cert.example', '+.ecs.example']) {
     assert.ok(policies[pattern].every((endpoint) => endpoint.endsWith(safeSuffix)), pattern);
   }
@@ -567,7 +593,7 @@ test('preserves user legacy AI rules and DNS pattern', { skip: !available }, () 
   const patched = engine.clashPatchTransform(config, 'fixture');
   assert.ok(patched.rules.includes('DOMAIN-SUFFIX,ai.com,Friend'));
   assert.ok(patched.rules.includes('IP-CIDR,160.79.104.0/21,Friend,no-resolve'));
-  assert.deepEqual(patched.dns['nameserver-policy']['+.ai.com'], ['https://1.1.1.1/dns-query#Friend']);
+  assert.deepEqual(patched.dns['nameserver-policy']['+.ai.com'], engine.CLASH_PATCH_POLICY.resolvers.map((resolver) => `${resolver}#Friend`));
 });
 
 test('patches config without a rules array', { skip: !available }, () => {
