@@ -5,13 +5,8 @@
     "https://1.0.0.1/dns-query",
     "https://8.8.8.8/dns-query"
   ],
-  "proxy_bootstrap_resolvers": [
-    "https://1.1.1.1/dns-query",
-    "https://8.8.8.8/dns-query"
-  ],
-  "default_bootstrap_resolvers": [
-    "1.1.1.1",
-    "8.8.8.8"
+  "bootstrap_fallback_resolvers": [
+    "system"
   ],
   "main_group_names": [
     "Proxy",

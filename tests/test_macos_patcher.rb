@@ -61,6 +61,38 @@ class MacosPatcherTest < Minitest::Test
     assert_includes patched.fetch("rules"), "DOMAIN,storage.googleapis.com,AI"
   end
 
+  def test_preserves_bootstrap_and_direct_resolvers
+    config = base_config
+    config["dns"]["default-nameserver"] = ["223.5.5.5", "119.29.29.29"]
+    config["dns"]["proxy-server-nameserver"] = ["223.5.5.5", "120.53.53.53"]
+    config["dns"]["direct-nameserver"] = ["system"]
+
+    patched = ClashPatch.patch(config, @policy).fetch(:config).fetch("dns")
+
+    assert_equal ["223.5.5.5", "119.29.29.29"], patched.fetch("default-nameserver")
+    assert_equal ["223.5.5.5", "120.53.53.53"], patched.fetch("proxy-server-nameserver")
+    assert_equal ["system"], patched.fetch("direct-nameserver")
+  end
+
+  def test_uses_system_only_when_proxy_bootstrap_is_missing
+    patched = ClashPatch.patch(base_config, @policy).fetch(:config).fetch("dns")
+
+    refute patched.key?("default-nameserver")
+    assert_equal ["system"], patched.fetch("proxy-server-nameserver")
+    refute patched.key?("direct-nameserver")
+  end
+
+  def test_migrates_the_old_unsafe_bootstrap_signature_to_system
+    config = base_config
+    config["dns"]["default-nameserver"] = ["1.1.1.1", "8.8.8.8"]
+    config["dns"]["proxy-server-nameserver"] = ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
+
+    patched = ClashPatch.patch(config, @policy).fetch(:config).fetch("dns")
+
+    assert_equal ["system"], patched.fetch("default-nameserver")
+    assert_equal ["system"], patched.fetch("proxy-server-nameserver")
+  end
+
   def test_prefers_japan_when_taiwan_home_is_absent
     config = base_config
     config["proxies"].reject! { |proxy| proxy["name"].include?("台湾") }
@@ -413,7 +445,7 @@ class MacosPatcherTest < Minitest::Test
       File.write(good_path, YAML.dump(base_config))
 
       results = ClashPatch.run(directories: [directory], policy_path: POLICY_PATH,
-                               selected_name: "good", reloader: ->(_path) { true })
+                               selected_name: "good")
       by_name = results.each_with_object({}) { |result, memo| memo[File.basename(result.fetch(:path))] = result }
 
       assert_includes %i[invalid error], by_name.fetch("deep.yaml").fetch(:status)
@@ -522,9 +554,7 @@ class MacosPatcherTest < Minitest::Test
       File.write(profile, original)
 
       results = ClashPatch.run(directory: directory, policy_path: POLICY_PATH, dry_run: true,
-                               backup_root: File.join(directory, "backups"),
-                               reloader: ->(_path) { raise "reload must not run during a dry run" },
-                               selected_name: "friend")
+                               backup_root: File.join(directory, "backups"), selected_name: "friend")
       active = results.find { |entry| File.basename(entry[:path]) == "friend.yaml" }
       status = ClashPatch.chinese_status(active)
 
@@ -566,37 +596,23 @@ class MacosPatcherTest < Minitest::Test
   def test_chinese_status_covers_all_update_states
     base = { path: "/profiles/friend.yaml", status: :updated, selected_home: nil }
 
-    assert_includes ClashPatch.chinese_status(base.merge(active: true, reloaded: true)), "已更新并生效"
-    assert_includes ClashPatch.chinese_status(base.merge(active: true, reloaded: false)), "已更新，等待重新加载"
+    assert_includes ClashPatch.chinese_status(base.merge(active: true)), "已更新，等待用户手动重新加载"
     assert_includes ClashPatch.chinese_status(base.merge(active: false)), "已更新，选择该订阅时生效"
     assert_includes ClashPatch.chinese_status(base.merge(status: :unchanged)), "无需修改"
   end
 
-  def test_run_reports_reload_success_and_failure
+  def test_run_never_activates_the_updated_profile
     Dir.mktmpdir do |directory|
       File.write(File.join(directory, "friend.yaml"), YAML.dump(base_config))
       File.write(File.join(directory, "other.yaml"), YAML.dump(base_config))
 
       results = ClashPatch.run(directory: directory, policy_path: POLICY_PATH, backup_root: File.join(directory, "backups"),
-                               reloader: ->(_path) { true }, selected_name: "friend")
+                               selected_name: "friend")
       active = results.find { |entry| File.basename(entry[:path]) == "friend.yaml" }
       inactive = results.find { |entry| File.basename(entry[:path]) == "other.yaml" }
-      assert_equal true, active[:reloaded]
-      assert_includes ClashPatch.chinese_status(active), "已更新并生效"
-      assert_nil inactive[:reloaded]
+      refute active.key?(:reloaded)
+      assert_includes ClashPatch.chinese_status(active), "已更新，等待用户手动重新加载"
       assert_includes ClashPatch.chinese_status(inactive), "已更新，选择该订阅时生效"
-    end
-
-    Dir.mktmpdir do |directory|
-      File.write(File.join(directory, "friend.yaml"), YAML.dump(base_config))
-
-      results = ClashPatch.run(directory: directory, policy_path: POLICY_PATH, backup_root: File.join(directory, "backups"),
-                               reloader: ->(_path) { false }, selected_name: "friend")
-      active = results.find { |entry| File.basename(entry[:path]) == "friend.yaml" }
-      assert_equal false, active[:reloaded]
-      status = ClashPatch.chinese_status(active)
-      assert_includes status, "已更新，等待重新加载"
-      refute_includes status, "已更新并生效"
     end
   end
 
@@ -611,7 +627,7 @@ class MacosPatcherTest < Minitest::Test
       File.write(File.join(directory, "friend.yaml"), YAML.dump(config))
 
       results = ClashPatch.run(directory: directory, policy_path: POLICY_PATH, backup_root: File.join(directory, "backups"),
-                               reloader: ->(_path) { true }, selected_name: "friend")
+                               selected_name: "friend")
       output = results.map { |entry| ClashPatch.chinese_status(entry) }.join("\n")
       ["secret-server.internal.example", "secret-password-123", "11111111-2222-3333-4444-555555555555"].each do |secret|
         refute_includes output, secret
@@ -1023,15 +1039,12 @@ class MacosPatcherTest < Minitest::Test
 
   def test_single_custom_profile_directory_is_active
     Dir.mktmpdir do |directory|
-      profile = File.join(directory, "friend.yaml")
-      File.write(profile, YAML.dump(base_config))
-      reloads = []
+      File.write(File.join(directory, "friend.yaml"), YAML.dump(base_config))
 
-      results = ClashPatch.run(directories: [directory], policy_path: POLICY_PATH, selected_name: "friend",
-                               reloader: ->(path) { reloads << path; true })
+      results = ClashPatch.run(directories: [directory], policy_path: POLICY_PATH, selected_name: "friend")
 
       assert_equal true, results.fetch(0).fetch(:active)
-      assert_equal [profile], reloads
+      refute results.fetch(0).key?(:reloaded)
     end
   end
 
@@ -1044,40 +1057,15 @@ class MacosPatcherTest < Minitest::Test
       File.write(File.join(current, "other.yaml"), YAML.dump(base_config))
       selected = File.join(legacy, "friend.yaml")
       File.write(selected, YAML.dump(base_config))
-      reloads = []
 
       results = ClashPatch.stub(:icloud_enabled?, true) do
-        ClashPatch.run(directories: [current, legacy], policy_path: POLICY_PATH, selected_name: "friend",
-                       reloader: ->(path) { reloads << path; true })
+        ClashPatch.run(directories: [current, legacy], policy_path: POLICY_PATH, selected_name: "friend")
       end
       active = results.find { |result| result[:active] }
 
       assert_equal selected, active.fetch(:path)
-      assert_equal [selected], reloads
+      refute active.key?(:reloaded)
     end
-  end
-
-  def test_reload_requires_http_204
-    requester_401 = ->(*_args) { [401, ""] }
-    requester_204 = ->(*_args) { [204, ""] }
-    assert_equal false, ClashPatch.reload("/profiles/config.yaml", socket: "/tmp/fake.sock", requester: requester_401)
-    assert_equal true, ClashPatch.reload("/profiles/config.yaml", socket: "/tmp/fake.sock", requester: requester_204)
-  end
-
-  def test_ai_runtime_selection_is_verified
-    calls = []
-    requester = lambda do |method, path, body|
-      calls << [method, path, body]
-      method == "PUT" ? [204, ""] : [200, JSON.generate("now" => "台湾家宽 01")]
-    end
-    assert ClashPatch.select_proxy("🤖 AI · Clash Patch", "台湾家宽 01", socket: "/tmp/fake.sock", requester: requester)
-    assert_equal %w[PUT GET], calls.map(&:first)
-    expected_path = "/proxies/%F0%9F%A4%96%20AI%20%C2%B7%20Clash%20Patch"
-    assert_equal [expected_path, expected_path], calls.map { |call| call[1] }
-    refute calls.any? { |call| call[1].include?("+") }
-
-    wrong_shape = ->(method, *_args) { method == "PUT" ? [204, ""] : [200, "[]"] }
-    assert_equal false, ClashPatch.select_proxy("group", "node", socket: "/tmp/fake.sock", requester: wrong_shape)
   end
 
   def test_controller_socket_ignores_disappearing_cache_files
@@ -1109,20 +1097,75 @@ class MacosPatcherTest < Minitest::Test
     assert_equal :unknown, ClashPatch.tun_state(socket: "/tmp/fake.sock", requester: wrong_shape)
   end
 
-  def test_icloud_profile_discovery_includes_current_and_legacy_containers
+  def test_profile_discovery_uses_only_the_active_storage_root
     Dir.mktmpdir do |home|
       local = File.join(home, ".config", "clash.meta")
       current = File.join(home, "Library", "Mobile Documents", "iCloud~com~metacubex~ClashX", "Documents")
       legacy = File.join(home, "Library", "Mobile Documents", "iCloud~com~west2online~ClashX", "Documents")
       [local, current, legacy].each { |path| FileUtils.mkdir_p(path) }
 
-      directories = ClashPatch.default_profile_directories(home: home, app_paths: [])
-      assert_equal [local, current, legacy], directories
-      watch_paths = ClashPatch.default_watch_paths(home: home, app_paths: [])
-      assert_includes watch_paths, File.dirname(current)
-      assert_includes watch_paths, current
-      assert_includes watch_paths, File.dirname(legacy)
-      assert_includes watch_paths, legacy
+      File.write(File.join(current, "active.yaml"), YAML.dump(base_config))
+      File.write(File.join(legacy, "abandoned.yaml"), YAML.dump(base_config))
+
+      local_directories = ClashPatch.default_profile_directories(
+        home: home, app_paths: [], cloud_enabled: false, selected: "active"
+      )
+      cloud_directories = ClashPatch.default_profile_directories(
+        home: home, app_paths: [], cloud_enabled: true, selected: "active"
+      )
+
+      assert_equal [local], local_directories
+      assert_equal [current], cloud_directories
+      refute_includes cloud_directories, legacy
+    end
+  end
+
+  def test_profile_discovery_refuses_ambiguous_icloud_roots
+    Dir.mktmpdir do |home|
+      current = File.join(home, "Library", "Mobile Documents", "iCloud~com~metacubex~ClashX", "Documents")
+      legacy = File.join(home, "Library", "Mobile Documents", "iCloud~com~west2online~ClashX", "Documents")
+      [current, legacy].each { |path| FileUtils.mkdir_p(path) }
+      File.write(File.join(current, "one.yaml"), YAML.dump(base_config))
+      File.write(File.join(legacy, "two.yaml"), YAML.dump(base_config))
+
+      directories = ClashPatch.default_profile_directories(
+        home: home, app_paths: [], cloud_enabled: true, selected: "missing"
+      )
+
+      assert_empty directories
+    end
+  end
+
+  def test_profile_discovery_refuses_unknown_storage_mode
+    Dir.mktmpdir do |home|
+      local = File.join(home, ".config", "clash.meta")
+      FileUtils.mkdir_p(local)
+      File.write(File.join(local, "old.yaml"), YAML.dump(base_config))
+
+      directories = ClashPatch.stub(:defaults_read, "") do
+        ClashPatch.default_profile_directories(home: home, app_paths: [])
+      end
+
+      assert_empty directories
+    end
+  end
+
+  def test_default_run_never_reloads_the_live_client
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
+
+      results = ClashPatch.run(
+        directory: directory,
+        policy_path: POLICY_PATH,
+        backup_root: File.join(directory, "backups"),
+        selected_name: "friend"
+      )
+      active = results.find { |entry| entry.fetch(:path) == profile }
+
+      assert_equal :updated, active.fetch(:status)
+      refute active.key?(:reloaded)
+      assert_includes ClashPatch.chinese_status(active), "等待用户手动重新加载"
     end
   end
 
@@ -1148,6 +1191,30 @@ class MacosPatcherTest < Minitest::Test
     refute ClashPatch.mihomo_version_supported?("Mihomo Meta v1.19.26")
     refute ClashPatch.mihomo_version_supported?("unknown")
     refute ClashPatch.validate_with_mihomo("/tmp/missing.yaml", core_path: nil)
+  end
+
+  def test_mihomo_validation_times_out_and_terminates_the_child
+    Dir.mktmpdir do |directory|
+      core = File.join(directory, "mihomo-test")
+      profile = File.join(directory, "friend.yaml")
+      File.write(core, <<~SH)
+        #!/bin/sh
+        if [ "$1" = "-v" ]; then
+          echo 'Mihomo Meta v1.19.27 test'
+          exit 0
+        fi
+        sleep 5
+      SH
+      File.chmod(0o700, core)
+      File.write(profile, "rules: []\n")
+
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      result = ClashPatch.validate_with_mihomo(profile, core_path: core, timeout_seconds: 0.1)
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      assert_equal :timeout, result
+      assert_operator elapsed, :<, 2
+    end
   end
 
   def test_cli_default_policy_path_works_from_the_repository
@@ -1218,13 +1285,14 @@ class MacosPatcherTest < Minitest::Test
     policy_document = File.read(File.join(ROOT, "clash-patch/references/patch-policy.md"))
     skill_document = File.read(File.join(ROOT, "clash-patch/SKILL.md"))
     examples = [
-      { path: "/profiles/friend.yaml", status: :updated, active: true, reloaded: true, selected_home: nil },
-      { path: "/profiles/friend.yaml", status: :updated, active: true, reloaded: false, selected_home: nil },
+      { path: "/profiles/friend.yaml", status: :updated, active: true, selected_home: nil },
       { path: "/profiles/friend.yaml", status: :updated, active: false, selected_home: nil },
       { path: "/profiles/friend.yaml", status: :unchanged },
       { path: "/profiles/friend.yaml", status: :no_main_group },
       { path: "/profiles/friend.yaml", status: :invalid },
       { path: "/profiles/friend.yaml", status: :validation_failed },
+      { path: "/profiles/friend.yaml", status: :validation_timeout },
+      { path: "/profiles/friend.yaml", status: :non_idempotent },
       { path: "/profiles/friend.yaml", status: :invalid_policy },
       { path: "/profiles/friend.yaml", status: :concurrent_change },
       { path: "/profiles/friend.yaml", status: :io_error },

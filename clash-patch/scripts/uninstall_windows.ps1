@@ -244,7 +244,7 @@ $statePath = Join-Path $AppHome "clash-patch-install-state.json"
 $state = $null
 
 try {
-    if (Test-ClashVergeRunning) { throw "Clash Verge Rev 仍在运行。请先从托盘菜单完全退出客户端，再重新卸载。" }
+    $clientRunning = Test-ClashVergeRunning
     if (Test-Path -LiteralPath $statePath -PathType Leaf) {
         $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
         Assert-InstallState $state
@@ -284,7 +284,7 @@ try {
     }
 
     $settingsRestored = $true
-    if ($null -ne $state) {
+    if ($null -ne $state -and -not $clientRunning) {
         $settingTargets = @(
             [pscustomobject]@{ Entry = $state.ConfigYaml; Path = $configPath; Label = "config.yaml" },
             [pscustomobject]@{ Entry = $state.VergeYaml; Path = $vergePath; Label = "verge.yaml" }
@@ -300,15 +300,22 @@ try {
             }
         }
         if ($settingsRestored) { Remove-Item -LiteralPath $statePath -Force }
+    } elseif ($null -ne $state) {
+        $settingsRestored = $false
+        Write-Info "Clash Verge Rev 保持运行；config.yaml 与 verge.yaml 未改动，安装状态文件继续保留。"
     }
 
     if (-not $scriptChanged -and $null -eq $state) {
         Write-Info "没有发现已安装的自动补丁，无需移除。"
         exit 0
     }
-    if (-not $settingsRestored) { throw "部分设置在安装后有新改动，未自动覆盖；请根据保留的安装状态文件手动处理。" }
+    if (-not $settingsRestored -and -not $clientRunning) { throw "部分设置在安装后有新改动，未自动覆盖；请根据保留的安装状态文件手动处理。" }
 
-    Write-Info "全局自动补丁已移除，config.yaml 与 verge.yaml 已恢复到安装前状态。现有备份没有删除。"
+    if ($clientRunning) {
+        Write-Info "全局自动补丁已移除；客户端保持运行，应用设置和现有备份均未改动。"
+    } else {
+        Write-Info "全局自动补丁已移除，config.yaml 与 verge.yaml 已恢复到安装前状态。现有备份没有删除。"
+    }
     exit 0
 } catch {
     [Console]::Error.WriteLine("[Clash 补丁] 卸载失败：$($_.Exception.Message)")

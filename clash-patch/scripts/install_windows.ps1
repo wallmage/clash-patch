@@ -9,6 +9,70 @@ function Write-Info([string]$Message) {
     Write-Host "[Clash 补丁] $Message"
 }
 
+function ConvertTo-NativeArgument([string]$Value) {
+    if ($Value -notmatch '[\s"]') { return $Value }
+
+    $builder = New-Object System.Text.StringBuilder
+    [void]$builder.Append('"')
+    $slashes = 0
+    foreach ($character in $Value.ToCharArray()) {
+        if ($character -eq '\') {
+            $slashes++
+            continue
+        }
+        if ($character -eq '"') {
+            [void]$builder.Append(('\' * (($slashes * 2) + 1)))
+            [void]$builder.Append('"')
+        } else {
+            if ($slashes -gt 0) { [void]$builder.Append(('\' * $slashes)) }
+            [void]$builder.Append($character)
+        }
+        $slashes = 0
+    }
+    if ($slashes -gt 0) { [void]$builder.Append(('\' * ($slashes * 2))) }
+    [void]$builder.Append('"')
+    return $builder.ToString()
+}
+
+function Invoke-Mihomo(
+    [string]$CorePath,
+    [string[]]$Arguments,
+    [int]$TimeoutSeconds = 30
+) {
+    $nativeArguments = (($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and $CorePath -match '(?i)\.(?:cmd|bat)$') {
+        $start.FileName = $env:ComSpec
+        $start.Arguments = '/d /s /c ""' + $CorePath + '" ' + $nativeArguments + '"'
+    } else {
+        $start.FileName = $CorePath
+        $start.Arguments = $nativeArguments
+    }
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { throw "无法启动 Mihomo 校验进程。" }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $process.Kill()
+            $process.WaitForExit()
+            throw "Mihomo 校验超过 $TimeoutSeconds 秒；候选配置无效，原文件保持不变。"
+        }
+        $process.WaitForExit()
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            Output = (($stdout.Result, $stderr.Result) -join "`n")
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
 function Protect-BackupAcl([string]$Path) {
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return }
 
@@ -327,10 +391,8 @@ function Test-MihomoVersion([string]$CorePath) {
     if ([string]::IsNullOrWhiteSpace($CorePath) -or -not (Test-Path -LiteralPath $CorePath -PathType Leaf)) {
         throw "没有找到可用的 Mihomo 内核。请更新 Clash Verge Rev，或用 -MihomoPath 指定可信的内核路径。"
     }
-    $output = @(& $CorePath -v 2>&1)
-    $exitCode = $LASTEXITCODE
-    $versionText = $output -join "`n"
-    if ($exitCode -ne 0 -or -not (Test-MihomoVersionText $versionText)) {
+    $result = Invoke-Mihomo $CorePath @("-v")
+    if ($result.ExitCode -ne 0 -or -not (Test-MihomoVersionText $result.Output)) {
         throw "需要 Mihomo 1.19.27 或更高版本，当前内核版本无法确认或过旧。"
     }
     return $true
@@ -371,8 +433,8 @@ function Test-MihomoCandidate([string]$CorePath, [string]$Text, [string]$Directo
     $temporary = Join-Path $Directory (".clash-patch-validate-" + [System.IO.Path]::GetRandomFileName() + ".yaml")
     try {
         [System.IO.File]::WriteAllText($temporary, $Text, (New-Object System.Text.UTF8Encoding($false)))
-        & $CorePath -d $Directory -t -f $temporary *> $null
-        if ($LASTEXITCODE -ne 0) { throw "Mihomo 拒绝了生成的 config.yaml。原文件没有被修改。" }
+        $result = Invoke-Mihomo $CorePath @("-d", $Directory, "-t", "-f", $temporary)
+        if ($result.ExitCode -ne 0) { throw "Mihomo 拒绝了生成的 config.yaml。原文件没有被修改。" }
     } finally {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
     }
@@ -630,11 +692,20 @@ if (-not (Test-Path -LiteralPath $enginePath -PathType Leaf)) {
 }
 
 try {
-    if (Test-ClashVergeRunning) {
-        throw "Clash Verge Rev 仍在运行。请先从托盘菜单完全退出客户端，再重新安装。"
-    }
+    $clientRunning = Test-ClashVergeRunning
     $corePath = Find-MihomoCore $MihomoPath
     Test-MihomoVersion $corePath | Out-Null
+
+    if ($clientRunning) {
+        New-Item -ItemType Directory -Path $profilesDirectory -Force | Out-Null
+        $scriptOutput = Build-GlobalScript $enginePath $targetScript
+        $scriptBytes = ConvertTo-Utf8Bytes $scriptOutput
+        Backup-Once $targetScript
+        Write-BytesAtomic $targetScript $scriptBytes
+        Write-Info "Clash Verge Rev 保持运行；已更新全局扩展脚本。"
+        Write-Info "config.yaml、verge.yaml 和当前运行配置均未修改。下次订阅刷新时应用补丁。"
+        exit 0
+    }
 
     $installState = $null
     if (Test-Path -LiteralPath $statePath -PathType Leaf) {
@@ -678,7 +749,7 @@ try {
     foreach ($target in $targets) { Backup-Once $target.Path }
 
     try {
-        if (Test-ClashVergeRunning) { throw "Clash Verge Rev 在安装期间启动，文件没有被修改。" }
+        if (Test-ClashVergeRunning) { throw "检测到 Clash Verge Rev 在安装期间启动；已撤销本次文件修改。" }
         foreach ($target in $targets) {
             Write-BytesAtomic $target.Path $target.Bytes
         }
@@ -690,7 +761,8 @@ try {
     }
 
     Write-Info "已安装全局扩展脚本，之后每次加载或刷新订阅都会自动应用补丁。"
-    Write-Info "已开启 TUN，并让全局脚本接管 DNS 配置。请在 Clash Verge Rev 中重新加载当前订阅或重启内核。"
+    Write-Info "已开启 TUN，并让全局脚本接管 DNS 配置。下次订阅刷新时应用补丁。"
+    Write-Info "安装程序从未退出、停止或重启 Clash Verge Rev。"
     Write-Info "AI 规则会优先选择台湾家宽，其次选择日本家宽；如果两者都没有，不会替你改成其他地区。"
     exit 0
 } catch {

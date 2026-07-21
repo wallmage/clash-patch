@@ -5,9 +5,12 @@ set -f
 INSTALL_DIR="$HOME/Library/Application Support/ClashPatch"
 BACKUP_DIR="$INSTALL_DIR/backups"
 STATE_PATH="$INSTALL_DIR/install-state.plist"
-PLIST_PATH="$HOME/Library/LaunchAgents/com.clashpatch.profiles.plist"
-PATCHER_TARGET="$INSTALL_DIR/patch_profiles.rb"
-LABEL="com.clashpatch.profiles"
+CURRENT_LABEL="com.clashpatch.profiles"
+CURRENT_PLIST="$HOME/Library/LaunchAgents/$CURRENT_LABEL.plist"
+CURRENT_PATCHER="$INSTALL_DIR/patch_profiles.rb"
+LEGACY_LABEL="com.wallny.clash-profile-patcher"
+LEGACY_PLIST="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
+LEGACY_PATCHER="$HOME/Library/Application Support/ClashProfilePatcher/patch_profiles.rb"
 DEFAULTS_DOMAIN="com.metacubex.ClashX.meta"
 
 say() {
@@ -16,11 +19,30 @@ say() {
 
 launch_agent_owned() {
   candidate=$1
+  expected_label=$2
+  expected_patcher=$3
   [ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
   agent_label=$(/usr/bin/plutil -extract Label raw "$candidate" 2>/dev/null || true)
   agent_arg0=$(/usr/bin/plutil -extract ProgramArguments.0 raw "$candidate" 2>/dev/null || true)
   agent_arg1=$(/usr/bin/plutil -extract ProgramArguments.1 raw "$candidate" 2>/dev/null || true)
-  [ "$agent_label" = "$LABEL" ] && [ "$agent_arg0" = "/usr/bin/ruby" ] && [ "$agent_arg1" = "$PATCHER_TARGET" ]
+  [ "$agent_label" = "$expected_label" ] && [ "$agent_arg0" = "/usr/bin/ruby" ] && [ "$agent_arg1" = "$expected_patcher" ]
+}
+
+remove_owned_agent() {
+  candidate=$1
+  expected_label=$2
+  expected_patcher=$3
+  if [ -f "$candidate" ]; then
+    if launch_agent_owned "$candidate" "$expected_label" "$expected_patcher"; then
+      /bin/launchctl bootout "gui/$USER_ID/$expected_label" >/dev/null 2>&1 || true
+      /bin/rm -f "$candidate"
+      say "已移除旧版自动目录监听：$expected_label。"
+    else
+      say "发现同名但无法确认属于 Clash 补丁的 LaunchAgent，已保留：$expected_label。"
+    fi
+  elif /bin/launchctl print "gui/$USER_ID/$expected_label" >/dev/null 2>&1; then
+    say "发现同名 LaunchAgent，但缺少可核对的 plist；未停止该服务：$expected_label。"
+  fi
 }
 
 if [ "$(uname -s)" != "Darwin" ]; then
@@ -34,19 +56,8 @@ if [ "$USER_ID" -eq 0 ]; then
   exit 2
 fi
 
-if [ -f "$PLIST_PATH" ]; then
-  if ! launch_agent_owned "$PLIST_PATH"; then
-    say "LaunchAgent 文件不是 Clash 补丁创建的，已停止，未删除任何文件。"
-    exit 1
-  fi
-  /bin/launchctl bootout "gui/$USER_ID/$LABEL" >/dev/null 2>&1 || true
-  /bin/rm -f "$PLIST_PATH"
-else
-  # 没有受管 plist 时无法证明同名服务属于本工具，不碰它。
-  if /bin/launchctl print "gui/$USER_ID/$LABEL" >/dev/null 2>&1; then
-    say "发现同名 LaunchAgent，但缺少可核对的受管 plist；未停止该服务。"
-  fi
-fi
+remove_owned_agent "$CURRENT_PLIST" "$CURRENT_LABEL" "$CURRENT_PATCHER"
+remove_owned_agent "$LEGACY_PLIST" "$LEGACY_LABEL" "$LEGACY_PATCHER"
 
 # 只有状态明确记录了安装前值时才恢复。无状态旧版的更早值无法推断。
 TUN_RESTORED=0

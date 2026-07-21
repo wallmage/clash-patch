@@ -59,15 +59,18 @@ class SkillContractTest < Minitest::Test
     skip unless File.file?(File.join(SKILL, "agents/openai.yaml"))
 
     metadata = YAML.safe_load(File.read(File.join(SKILL, "agents/openai.yaml")))
-    assert_includes metadata.dig("interface", "default_prompt"), "$clash-patch"
-    assert_match(/[\p{Han}]/, metadata.dig("interface", "default_prompt"))
+    prompt = metadata.dig("interface", "default_prompt")
+    assert_includes prompt, "$clash-patch"
+    assert_includes prompt, "当前存储位置"
+    assert_includes prompt, "绝对不要退出、停止或重启 Clash 客户端"
+    assert_match(/[\p{Han}]/, prompt)
   end
 
   def test_skill_contains_required_chinese_user_contract
     skip unless File.file?(File.join(SKILL, "SKILL.md"))
 
     source = File.read(File.join(SKILL, "SKILL.md"))
-    %w[简体中文 所有订阅 ClashX\ Meta Clash\ Verge\ Rev 深度测试 截图 未验证].each do |text|
+    %w[简体中文 当前存储位置 ClashX\ Meta Clash\ Verge\ Rev 深度测试 截图 未验证].each do |text|
       assert_includes source, text.gsub("\\ ", " ")
     end
     %w[ipinfo.cv/webrtc-check ip.net.coffee/dns ip.net.coffee/webrtc].each do |url|
@@ -92,8 +95,8 @@ class SkillContractTest < Minitest::Test
     ai_rules = policy.fetch("ai_rules").join("\n")
     refute_includes ai_rules, "raw.githubusercontent.com"
     refute_includes ai_rules, "storage.googleapis.com"
-    refute_includes policy.fetch("proxy_bootstrap_resolvers").join("\n"), "223.5.5.5"
-    refute_includes policy.fetch("default_bootstrap_resolvers").join("\n"), "223.5.5.5"
+    refute policy.key?("proxy_bootstrap_resolvers")
+    refute policy.key?("default_bootstrap_resolvers")
   end
 
   def test_windows_policy_is_generated_from_canonical_json
@@ -108,45 +111,41 @@ class SkillContractTest < Minitest::Test
     refute_match(/File\.write\(engine_path/, source)
   end
 
-  def test_readme_is_chinese_and_explains_both_persistence_mechanisms
+  def test_readme_is_chinese_and_explains_safe_refresh_behavior
     path = File.join(ROOT, "README.md")
     skip unless File.file?(path)
 
     source = File.read(path)
     assert_operator source.scan(/[\p{Han}]/).length, :>, 200
-    %w[LaunchAgent WatchPaths 全局扩展脚本 DNS WebRTC 家宽 台湾 日本].each do |term|
+    %w[单次运行 当前存储位置 全局扩展脚本 DNS WebRTC 家宽 台湾 日本].each do |term|
       assert_includes source, term
     end
     %w[游戏 语音 视频 QUIC 第三方].each { |term| assert_includes source, term }
   end
 
-  def test_policy_documents_dns_filters_migration_and_legacy_tun_state
+  def test_policy_documents_dns_filters_and_safety_migrations
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
-    %w[exclude-filter empty-fallback skip-cert-verify ecs 160.79.104.0/21 ai.com RestoreTunKnown].each do |term|
+    %w[exclude-filter empty-fallback skip-cert-verify ecs 160.79.104.0/21 ai.com proxy-server-nameserver system 二次转换].each do |term|
       assert_includes policy, term
     end
   end
 
-  def test_macos_installer_is_event_driven_and_not_resident
+  def test_macos_installer_is_one_shot_and_removes_legacy_persistence
     path = File.join(SKILL, "scripts/install_macos.sh")
     skip unless File.file?(path)
 
     source = File.read(path)
-    assert_includes source, "RunAtLoad"
-    assert_includes source, "WatchPaths"
+    refute_includes source, "RunAtLoad"
+    refute_includes source, "WatchPaths"
     refute_includes source, "KeepAlive"
     patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
     assert_includes patcher, 'File.join(home, ".config", "clash.meta")'
-    assert_includes source, "launchctl"
+    assert_includes source, "launchctl bootout"
     assert_match(/[\p{Han}]/, source)
     assert_includes source, "plutil"
     refute_includes source, "<plist version="
-    assert_includes source, "--print-watch-paths"
-    assert_includes source, "restoreTunProxy"
-    refute_includes source, "tunOverridden"
-    assert_includes source, "osascript"
-    assert_includes source, "--print-tun-state"
-    refute_includes source, "read_tun_enabled"
+    refute_includes source, "launchctl bootstrap"
+    refute_includes source, "osascript"
     assert_match(/\A#!\/bin\/sh\nset -eu\nset -f\n/, source)
   end
 
@@ -159,17 +158,15 @@ class SkillContractTest < Minitest::Test
 
     assert_operator mac_install.index('id -u'), :<, mac_install.index('/bin/mkdir -p')
     assert_operator mac_install.index('--print-core-status'), :<, mac_install.index('/bin/mkdir -p')
-    assert_operator mac_install.index('plutil -extract Label'), :<, mac_install.index('plutil -create')
-    assert_operator mac_install.index('ProgramArguments.0'), :<, mac_install.index('plutil -create')
-    assert_operator mac_install.index('ProgramArguments.1'), :<, mac_install.index('plutil -create')
-    assert_includes mac_install, "install-state.plist"
-    assert_includes mac_install, "RestoreTunKnown"
-    assert_includes mac_install, "rollback_install"
-    assert_includes mac_install, "COMMIT_STARTED"
-    assert_includes mac_install, "COMMIT_COMPLETE"
-    assert_includes mac_install, "AGENT_WAS_LOADED"
-    assert_operator mac_install.index('COMMIT_STARTED=1'), :<, mac_install.rindex('launchctl bootstrap')
-    assert_operator mac_install.rindex('launchctl bootstrap'), :<, mac_install.index('COMMIT_COMPLETE=1')
+    assert_operator mac_install.index('plutil -extract Label'), :<, mac_install.index('launchctl bootout')
+    assert_operator mac_install.index('ProgramArguments.0'), :<, mac_install.index('launchctl bootout')
+    assert_operator mac_install.index('ProgramArguments.1'), :<, mac_install.index('launchctl bootout')
+    assert_includes mac_install, "com.clashpatch.profiles"
+    assert_includes mac_install, "com.wallny.clash-profile-patcher"
+    assert_includes mac_uninstall, "com.clashpatch.profiles"
+    assert_includes mac_uninstall, "com.wallny.clash-profile-patcher"
+    refute_includes mac_install, "launchctl bootstrap"
+    refute_includes mac_install, "WatchPaths"
     assert_includes mac_uninstall, "restoreTunProxy"
     assert_includes mac_uninstall, "RestoreTunPresent"
     assert_includes mac_uninstall, "RestoreTunKnown"
@@ -187,6 +184,45 @@ class SkillContractTest < Minitest::Test
     assert_includes windows_install, "S-1-5-18"
     assert_includes windows_install, "S-1-5-32-544"
     assert_includes windows_uninstall, "InstalledSha256"
+  end
+
+
+  def test_skill_and_scripts_never_stop_or_restart_clash
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    readme = File.read(File.join(ROOT, "README.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    mac_install = File.read(File.join(SKILL, "scripts/install_macos.sh"))
+    windows_install = File.binread(File.join(SKILL, "scripts/install_windows.ps1")).force_encoding("UTF-8")
+    windows_uninstall = File.binread(File.join(SKILL, "scripts/uninstall_windows.ps1")).force_encoding("UTF-8")
+
+    [skill, readme, policy].each do |source|
+      assert_includes source, "绝对不要退出、停止或重启 Clash 客户端"
+      refute_includes source, "请先从托盘菜单完全退出"
+      refute_includes source, "退出客户端，再"
+    end
+    [mac_install, windows_install, windows_uninstall].each do |source|
+      refute_match(/osascript[^\n]*(?:quit|terminate)/i, source)
+      refute_match(/Stop-Process|taskkill|killall/i, source)
+      refute_includes source, "请先从托盘菜单完全退出"
+      refute_includes source, "退出客户端，再"
+    end
+  end
+
+  def test_validation_timeout_and_idempotence_guards_are_documented
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    mac = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
+    windows = File.binread(File.join(SKILL, "scripts/install_windows.ps1")).force_encoding("UTF-8")
+
+    [skill, policy].each do |source|
+      assert_includes source, "30 秒"
+      assert_includes source, "二次转换"
+    end
+    assert_includes mac, "VALIDATION_TIMEOUT_SECONDS = 30"
+    assert_includes mac, ":non_idempotent"
+    refute_match(/^\s*def (?:reload|select_proxy)\b/, mac)
+    assert_includes windows, "WaitForExit($TimeoutSeconds * 1000)"
+    assert_includes windows, '$process.Kill()'
   end
 
   def test_reality_short_id_scope_is_documented

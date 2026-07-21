@@ -1,4 +1,4 @@
 interface:
   display_name: "Clash 补丁"
-  short_description: "自动修复 Clash 的 DNS、WebRTC 与 AI 分流"
-  default_prompt: "使用 $clash-patch 检查并增强这台电脑上的所有 Clash 订阅。"
+  short_description: "安全修复当前 Clash 订阅的 DNS、WebRTC 与 AI 分流"
+  default_prompt: "使用 $clash-patch 检查并增强 Clash 当前存储位置中的订阅；绝对不要退出、停止或重启 Clash 客户端。"

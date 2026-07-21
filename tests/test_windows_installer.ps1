@@ -10,6 +10,7 @@ $uninstaller = Join-Path (Join-Path $root "clash-patch/scripts") "uninstall_wind
 $sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("clash-patch-windows-test-" + [System.Guid]::NewGuid().ToString("N"))
 $onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 $fakeCore = Join-Path $sandbox $(if ($onWindows) { "mihomo-test.cmd" } else { "mihomo-test.sh" })
+$hangingCore = Join-Path $sandbox $(if ($onWindows) { "mihomo-hang.cmd" } else { "mihomo-hang.sh" })
 
 $tokens = $null
 $parseErrors = $null
@@ -66,6 +67,13 @@ try {
     }
     [System.IO.File]::WriteAllText($fakeCore, $fakeCoreText, [System.Text.Encoding]::ASCII)
     if (-not $onWindows) { & /bin/chmod 700 $fakeCore }
+    if ($onWindows) {
+        $hangingCoreText = "@echo off`r`nping 127.0.0.1 -n 6 >nul`r`nexit /b 0`r`n"
+    } else {
+        $hangingCoreText = "#!/bin/sh`nsleep 5`nexit 0`n"
+    }
+    [System.IO.File]::WriteAllText($hangingCore, $hangingCoreText, [System.Text.Encoding]::ASCII)
+    if (-not $onWindows) { & /bin/chmod 700 $hangingCore }
 
     $unitStage = Set-YamlTopLevelScalar "ipv6 : true`ntun: null`n" "ipv6" "false"
     Assert-True ($unitStage -match '(?m)^tun:') "scalar transform lost tun node: $($unitStage | ConvertTo-Json -Compress)"
@@ -101,6 +109,12 @@ try {
 
     Assert-True (Test-MihomoVersionText "Mihomo Meta v1.19.27") "minimum Mihomo version was rejected"
     Assert-True (-not (Test-MihomoVersionText "Mihomo Meta v1.19.26")) "old Mihomo version was accepted"
+    $timeoutRaised = $false
+    $timeoutWatch = [System.Diagnostics.Stopwatch]::StartNew()
+    try { Invoke-Mihomo $hangingCore @("-v") 1 | Out-Null } catch { $timeoutRaised = $_.Exception.Message.Contains("超过 1 秒") }
+    $timeoutWatch.Stop()
+    Assert-True $timeoutRaised "hanging Mihomo process did not fail closed after one second"
+    Assert-True ($timeoutWatch.Elapsed.TotalSeconds -lt 4) "hanging Mihomo process was not terminated promptly"
 
     $backupSource = Join-Path $sandbox "backup-source.txt"
     $backupBytes = [byte[]](0xEF, 0xBB, 0xBF, 0x66, 0x69, 0x72, 0x73, 0x74)

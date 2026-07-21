@@ -7,7 +7,6 @@ require "open3"
 require "optparse"
 require "psych"
 require "tempfile"
-require "uri"
 
 module ClashPatch
   module_function
@@ -15,6 +14,7 @@ module ClashPatch
   AI_GROUP_BASE = "🤖 AI · Clash Patch".freeze
   SAFE_GROUP_BASE = "🛡 安全代理 · Clash Patch".freeze
   MIN_MIHOMO_VERSION = [1, 19, 27].freeze
+  VALIDATION_TIMEOUT_SECONDS = 30
   MAX_PATCH_ATTEMPTS = 3
   POLICY_VERSION = 1
   AUTO_CORE = Object.new.freeze
@@ -388,11 +388,21 @@ module ClashPatch
     dns["use-system-hosts"] = true
 
     safe_resolvers = tagged_resolvers(policy, safe_group)
-    dns["default-nameserver"] = deep_copy(policy["default_bootstrap_resolvers"])
-    dns["proxy-server-nameserver"] = deep_copy(policy["proxy_bootstrap_resolvers"])
+    fallback_bootstrap = deep_copy(policy["bootstrap_fallback_resolvers"])
+    legacy_default = ["1.1.1.1", "8.8.8.8"]
+    legacy_proxy = [
+      ["1.1.1.1", "8.8.8.8"],
+      ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
+    ]
+    current_proxy = Array(dns["proxy-server-nameserver"])
+    if current_proxy.empty? || legacy_proxy.include?(current_proxy)
+      dns["proxy-server-nameserver"] = fallback_bootstrap
+    end
+    if Array(dns["default-nameserver"]) == legacy_default
+      dns["default-nameserver"] = deep_copy(fallback_bootstrap)
+    end
     dns["nameserver"] = deep_copy(safe_resolvers)
     dns["fallback"] = deep_copy(safe_resolvers) if dns.key?("fallback")
-    dns["direct-nameserver"] = deep_copy(safe_resolvers) if dns.key?("direct-nameserver")
 
     existing = dns["nameserver-policy"].is_a?(Hash) ? dns["nameserver-policy"] : {}
     policies = {}
@@ -687,11 +697,54 @@ module ClashPatch
     version && (version <=> MIN_MIHOMO_VERSION) >= 0
   end
 
-  def mihomo_core_status(core_path = AUTO_CORE)
+  def terminate_process_group(pid)
+    Process.kill("TERM", -pid)
+    sleep 0.05
+    Process.kill("KILL", -pid)
+  rescue Errno::ESRCH, Errno::EPERM
+    begin
+      Process.kill("KILL", pid)
+    rescue Errno::ESRCH, Errno::EPERM
+      nil
+    end
+  ensure
+    begin
+      Process.waitpid(pid)
+    rescue Errno::ECHILD
+      nil
+    end
+  end
+
+  def run_process_with_timeout(command, *arguments, timeout_seconds: VALIDATION_TIMEOUT_SECONDS)
+    output = Tempfile.new("clash-patch-command")
+    pid = Process.spawn(command, *arguments, out: output, err: output, pgroup: true)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_seconds
+
+    loop do
+      waited = Process.waitpid2(pid, Process::WNOHANG)
+      if waited
+        output.flush
+        output.rewind
+        return [output.read, waited[1], false]
+      end
+      if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        terminate_process_group(pid)
+        output.flush
+        output.rewind
+        return [output.read, nil, true]
+      end
+      sleep 0.05
+    end
+  ensure
+    output.close! if output
+  end
+
+  def mihomo_core_status(core_path = AUTO_CORE, timeout_seconds: VALIDATION_TIMEOUT_SECONDS)
     core = core_path.equal?(AUTO_CORE) ? mihomo_core_path : core_path
     return :missing unless core && File.file?(core) && File.executable?(core)
 
-    output, status = Open3.capture2e(core, "-v")
+    output, status, timed_out = run_process_with_timeout(core, "-v", timeout_seconds: timeout_seconds)
+    return :timeout if timed_out
     return :unreadable unless status.success?
 
     mihomo_version_supported?(output) ? :supported : :too_old
@@ -699,11 +752,19 @@ module ClashPatch
     :unreadable
   end
 
-  def validate_with_mihomo(path, core_path: AUTO_CORE)
+  def validate_with_mihomo(path, core_path: AUTO_CORE, timeout_seconds: VALIDATION_TIMEOUT_SECONDS)
     core = core_path.equal?(AUTO_CORE) ? mihomo_core_path : core_path
-    return false unless mihomo_core_status(core) == :supported
+    core_status = mihomo_core_status(core, timeout_seconds: timeout_seconds)
+    return :timeout if core_status == :timeout
+    return false unless core_status == :supported
 
-    system(core, "-d", mihomo_validation_directory(path), "-t", "-f", path, out: File::NULL, err: File::NULL)
+    _output, status, timed_out = run_process_with_timeout(
+      core, "-d", mihomo_validation_directory(path), "-t", "-f", path,
+      timeout_seconds: timeout_seconds
+    )
+    return :timeout if timed_out
+
+    status.success?
   end
 
   def mihomo_validation_directory(path)
@@ -743,6 +804,11 @@ module ClashPatch
       return result.merge(path: path) unless result[:changed]
 
       patched_text = dump_config(result[:config])
+      candidate_config = load_yaml(patched_text, path)
+      second_pass = patch(candidate_config, policy)
+      if second_pass[:changed] || second_pass[:config] != candidate_config
+        return base_result(config, :non_idempotent).merge(path: path)
+      end
       return result.merge(path: path, dry_run: true) if dry_run
 
       Tempfile.create([File.basename(write_path), ".tmp"], File.dirname(write_path), encoding: "UTF-8") do |temporary|
@@ -750,8 +816,14 @@ module ClashPatch
         temporary.flush
         temporary.fsync
         load_yaml(File.read(temporary.path, encoding: "UTF-8"), temporary.path)
-        unless validator.nil? || validator.call(temporary.path)
-          return base_result(config, :validation_failed).merge(path: path)
+        unless validator.nil?
+          validation = validator.call(temporary.path)
+          if validation == :timeout
+            return base_result(config, :validation_timeout).merge(path: path)
+          end
+          unless validation == true
+            return base_result(config, :validation_failed).merge(path: path)
+          end
         end
 
         source.rewind
@@ -810,7 +882,15 @@ module ClashPatch
   end
 
   def icloud_enabled?
-    %w[1 true yes].include?(defaults_read("kUserEnableiCloud").downcase)
+    storage_mode == :icloud
+  end
+
+  def storage_mode(value = defaults_read("kUserEnableiCloud"))
+    normalized = value.to_s.strip.downcase
+    return :icloud if %w[1 true yes].include?(normalized)
+    return :local if %w[0 false no].include?(normalized)
+
+    :unknown
   end
 
   def clashx_app_paths
@@ -841,17 +921,26 @@ module ClashPatch
     end.uniq
   end
 
-  def default_profile_directories(home: Dir.home, app_paths: clashx_app_paths)
+  def default_profile_directories(home: Dir.home, app_paths: clashx_app_paths, cloud_enabled: nil, selected: nil)
     local = File.join(home, ".config", "clash.meta")
     clouds = icloud_container_roots(home: home, app_paths: app_paths).map { |root| File.join(root, "Documents") }
-    ([local] + clouds).select { |path| Dir.exist?(path) }.uniq
-  end
+    mode = cloud_enabled.nil? ? storage_mode : (cloud_enabled ? :icloud : :local)
+    return [] if mode == :unknown
+    return Dir.exist?(local) ? [local] : [] if mode == :local
 
-  def default_watch_paths(home: Dir.home, app_paths: clashx_app_paths)
-    local = File.join(home, ".config", "clash.meta")
-    roots = icloud_container_roots(home: home, app_paths: app_paths).select { |path| Dir.exist?(path) }
-    cloud_paths = roots.flat_map { |root| [root, File.join(root, "Documents")] }
-    ([local] + cloud_paths).select { |path| Dir.exist?(path) }.uniq
+    selected = selected_profile_name if selected.nil?
+    existing_clouds = clouds.select { |path| Dir.exist?(path) }.uniq
+    matching = existing_clouds.select do |root|
+      profile_paths(root).any? { |path| active_profile?(path, selected) }
+    end
+    return [] if matching.empty? && existing_clouds.length > 1
+
+    candidates = matching.empty? ? existing_clouds : matching
+    chosen = candidates.max_by do |root|
+      selected_paths = profile_paths(root).select { |path| active_profile?(path, selected) }
+      selected_paths.map { |path| File.mtime(path).to_f }.max || 0
+    end
+    chosen ? [chosen] : []
   end
 
   def active_profile?(path, selected)
@@ -913,15 +1002,6 @@ module ClashPatch
     [0, ""]
   end
 
-  def reload(path, socket: nil, requester: nil)
-    socket ||= controller_socket
-    return false unless socket
-
-    request = requester || ->(method, endpoint, body) { controller_request(socket, method, endpoint, body) }
-    status, = request.call("PUT", "/configs?force=true", JSON.generate("path" => path))
-    status == 204
-  end
-
   def tun_state(socket: nil, requester: nil)
     socket ||= controller_socket
     return :unknown unless socket
@@ -942,30 +1022,12 @@ module ClashPatch
     :unknown
   end
 
-  def select_proxy(group, candidate, socket: nil, requester: nil)
-    socket ||= controller_socket
-    return false unless socket
-
-    encoded = URI.encode_www_form_component(group).gsub("+", "%20")
-    request = requester || ->(method, endpoint, body) { controller_request(socket, method, endpoint, body) }
-    put_status, = request.call("PUT", "/proxies/#{encoded}", JSON.generate("name" => candidate))
-    return false unless put_status == 204
-
-    get_status, body = request.call("GET", "/proxies/#{encoded}", nil)
-    parsed = JSON.parse(body) if get_status == 200
-    get_status == 200 && parsed.is_a?(Hash) && parsed["now"] == candidate
-  rescue JSON::ParserError, TypeError
-    false
-  end
-
-  def run(directory: nil, directories: nil, policy_path:, dry_run: false, backup_root: nil, reloader: nil,
-          selector: nil, selected_name: nil, active_directory: nil, validator: nil)
+  def run(directory: nil, directories: nil, policy_path:, dry_run: false, backup_root: nil,
+          selected_name: nil, active_directory: nil, validator: nil)
     policy = JSON.parse(File.read(policy_path, encoding: "UTF-8"))
     unless policy.is_a?(Hash) && policy["version"] == POLICY_VERSION
       raise InvalidConfigError, "不支持的策略版本"
     end
-    reloader ||= method(:reload)
-    selector ||= method(:select_proxy)
     selected = selected_name.nil? ? selected_profile_name : selected_name
     roots = directories || (directory ? [directory] : default_profile_directories)
     active_root = active_directory || active_profile_root(roots, selected, directory)
@@ -978,14 +1040,6 @@ module ClashPatch
       end
     end
 
-    active = results.find { |result| result[:active] && %i[updated unchanged].include?(result[:status]) }
-    if active && !dry_run
-      active[:reloaded] = reloader.call(active[:path]) if active[:changed]
-      runtime_ready = !active[:changed] || active[:reloaded]
-      if runtime_ready && active[:selected_home]
-        active[:selection_verified] = selector.call(active[:ai_group], active[:selected_home])
-      end
-    end
     results
   end
 
@@ -994,11 +1048,11 @@ module ClashPatch
     case result[:status]
     when :updated
       "#{name}：#{updated_state(result)}#{ai_state(result)}"
-    when :unchanged
-      suffix = result[:selection_verified] ? "；AI 节点已确认" : ""
-      "#{name}：无需修改#{suffix}"
+    when :unchanged then "#{name}：无需修改"
     when :no_main_group then "#{name}：未修改：找不到可用的主代理组"
     when :validation_failed then "#{name}：已跳过：内核校验失败"
+    when :validation_timeout then "#{name}：已跳过：订阅响应超时"
+    when :non_idempotent then "#{name}：已跳过：二次转换不一致"
     when :invalid_policy then "#{name}：已跳过：策略版本无效"
     when :concurrent_change then "#{name}：已跳过：订阅正在刷新，稍后重试"
     when :io_error then "#{name}：已跳过：读取或写入失败"
@@ -1011,8 +1065,6 @@ module ClashPatch
     return "；没有台湾或日本家宽节点，未替你更换节点" unless result[:selected_home]
     selected = safe_label(result[:selected_home])
     return "；AI 将使用「#{selected}」" unless result[:active]
-    return "；AI 已切换到「#{selected}」" if result[:selection_verified]
-
     "；AI 组已写入「#{selected}」，等待运行配置生效"
   end
 
@@ -1035,7 +1087,7 @@ module ClashPatch
     return "将更新（演练，未写入文件）" if result[:dry_run]
     return "已更新，选择该订阅时生效" unless result[:active]
 
-    result[:reloaded] ? "已更新并生效" : "已更新，等待重新加载"
+    "已更新，等待用户手动重新加载"
   end
 
   def cli(argv = ARGV)
@@ -1044,7 +1096,6 @@ module ClashPatch
       policy: File.expand_path("../../references/policy.json", __dir__),
       backup_root: File.expand_path("~/Library/Application Support/ClashPatch/backups"),
       dry_run: false,
-      print_watch_paths: false,
       print_tun_state: false,
       print_core_status: false
     }
@@ -1054,7 +1105,6 @@ module ClashPatch
       opts.on("--policy PATH", "指定策略文件") { |value| options[:policy] = File.expand_path(value) }
       opts.on("--backup-dir PATH", "指定备份目录") { |value| options[:backup_root] = File.expand_path(value) }
       opts.on("--dry-run", "只预览，不写入文件") { options[:dry_run] = true }
-      opts.on("--print-watch-paths", "输出 LaunchAgent 应监视的目录") { options[:print_watch_paths] = true }
       opts.on("--print-tun-state", "输出当前运行内核的 TUN 状态") { options[:print_tun_state] = true }
       opts.on("--print-core-status", "检查 Mihomo 内核是否满足最低版本") { options[:print_core_status] = true }
       opts.on("-h", "--help", "显示帮助") do
@@ -1072,11 +1122,6 @@ module ClashPatch
 
     if options[:print_tun_state]
       puts tun_state
-      return 0
-    end
-
-    if options[:print_watch_paths]
-      default_watch_paths.each { |path| puts path }
       return 0
     end
 

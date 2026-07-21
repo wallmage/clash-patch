@@ -9,13 +9,8 @@ const CLASH_PATCH_POLICY = {
     "https://1.0.0.1/dns-query",
     "https://8.8.8.8/dns-query"
   ],
-  "proxyBootstrapResolvers": [
-    "https://1.1.1.1/dns-query",
-    "https://8.8.8.8/dns-query"
-  ],
-  "defaultBootstrapResolvers": [
-    "1.1.1.1",
-    "8.8.8.8"
+  "bootstrapFallbackResolvers": [
+    "system"
   ],
   "mainGroupNames": [
     "Proxy",
@@ -433,11 +428,21 @@ function clashPatchDns(config, safeGroup) {
   dns["use-hosts"] = true;
   dns["use-system-hosts"] = true;
   const safeResolvers = clashPatchTaggedResolvers(safeGroup);
-  dns["default-nameserver"] = CLASH_PATCH_POLICY.defaultBootstrapResolvers.slice();
-  dns["proxy-server-nameserver"] = CLASH_PATCH_POLICY.proxyBootstrapResolvers.slice();
+  const fallbackBootstrap = CLASH_PATCH_POLICY.bootstrapFallbackResolvers.slice();
+  const currentProxyBootstrap = Array.isArray(dns["proxy-server-nameserver"]) ? dns["proxy-server-nameserver"] : [];
+  const serializedProxyBootstrap = JSON.stringify(currentProxyBootstrap);
+  const legacyProxyBootstraps = [
+    JSON.stringify(["1.1.1.1", "8.8.8.8"]),
+    JSON.stringify(["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"])
+  ];
+  if (currentProxyBootstrap.length === 0 || legacyProxyBootstraps.indexOf(serializedProxyBootstrap) !== -1) {
+    dns["proxy-server-nameserver"] = fallbackBootstrap.slice();
+  }
+  if (JSON.stringify(dns["default-nameserver"]) === JSON.stringify(["1.1.1.1", "8.8.8.8"])) {
+    dns["default-nameserver"] = fallbackBootstrap.slice();
+  }
   dns.nameserver = safeResolvers.slice();
   if (Object.prototype.hasOwnProperty.call(dns, "fallback")) dns.fallback = safeResolvers.slice();
-  if (Object.prototype.hasOwnProperty.call(dns, "direct-nameserver")) dns["direct-nameserver"] = safeResolvers.slice();
 
   const existing = dns["nameserver-policy"] && typeof dns["nameserver-policy"] === "object" ? dns["nameserver-policy"] : {};
   const policies = {};
@@ -559,7 +564,7 @@ function clashPatchRules(config, aiGroup, safeGroup) {
   config.rules = ["NETWORK,UDP," + safeGroup, "NETWORK,UDP,REJECT"].concat(userOverrides, managed, remaining);
 }
 
-function clashPatchTransform(config, profileName) {
+function clashPatchApply(config, profileName) {
   if (CLASH_PATCH_POLICY.version !== 1) return config;
   if (!clashPatchUsable(config)) return config;
   const patched = clashPatchClone(config);
@@ -580,6 +585,14 @@ function clashPatchTransform(config, profileName) {
   clashPatchDns(patched, safeGroup);
   clashPatchRules(patched, aiGroup, safeGroup);
   return patched;
+}
+
+function clashPatchTransform(config, profileName) {
+  const candidate = clashPatchApply(config, profileName);
+  if (candidate === config) return config;
+  const secondPass = clashPatchApply(clashPatchClone(candidate), profileName);
+  if (JSON.stringify(candidate) !== JSON.stringify(secondPass)) return config;
+  return candidate;
 }
 
 function clashPatchCompose(previousMain, config, profileName) {

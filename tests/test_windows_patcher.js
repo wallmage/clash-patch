@@ -36,6 +36,38 @@ test('global transform applies common policy', { skip: !available }, () => {
   assert.ok(patched.rules.includes('DOMAIN,storage.googleapis.com,AI'));
 });
 
+test('preserves bootstrap and direct resolvers', { skip: !available }, () => {
+  const config = baseConfig();
+  config.dns['default-nameserver'] = ['223.5.5.5', '119.29.29.29'];
+  config.dns['proxy-server-nameserver'] = ['223.5.5.5', '120.53.53.53'];
+  config.dns['direct-nameserver'] = ['system'];
+
+  const dns = engine.clashPatchTransform(config, 'fixture').dns;
+
+  assert.deepEqual(dns['default-nameserver'], ['223.5.5.5', '119.29.29.29']);
+  assert.deepEqual(dns['proxy-server-nameserver'], ['223.5.5.5', '120.53.53.53']);
+  assert.deepEqual(dns['direct-nameserver'], ['system']);
+});
+
+test('uses system only when proxy bootstrap is missing', { skip: !available }, () => {
+  const dns = engine.clashPatchTransform(baseConfig(), 'fixture').dns;
+
+  assert.equal(Object.hasOwn(dns, 'default-nameserver'), false);
+  assert.deepEqual(dns['proxy-server-nameserver'], ['system']);
+  assert.equal(Object.hasOwn(dns, 'direct-nameserver'), false);
+});
+
+test('migrates the old unsafe bootstrap signature to system', { skip: !available }, () => {
+  const config = baseConfig();
+  config.dns['default-nameserver'] = ['1.1.1.1', '8.8.8.8'];
+  config.dns['proxy-server-nameserver'] = ['https://1.1.1.1/dns-query', 'https://8.8.8.8/dns-query'];
+
+  const dns = engine.clashPatchTransform(config, 'fixture').dns;
+
+  assert.deepEqual(dns['default-nameserver'], ['system']);
+  assert.deepEqual(dns['proxy-server-nameserver'], ['system']);
+});
+
 test('main delegates to the same transform', { skip: !available }, () => {
   assert.deepEqual(engine.main(baseConfig(), 'fixture'), engine.clashPatchTransform(baseConfig(), 'fixture'));
 });
@@ -44,6 +76,14 @@ test('transform is idempotent', { skip: !available }, () => {
   const once = engine.clashPatchTransform(baseConfig(), 'fixture');
   const twice = engine.clashPatchTransform(once, 'fixture');
   assert.deepEqual(twice, once);
+});
+
+test('global transform verifies a second pass before returning a candidate', () => {
+  const source = fs.readFileSync(enginePath, 'utf8');
+
+  assert.match(source, /function clashPatchApply/);
+  assert.match(source, /const secondPass = clashPatchApply\(clashPatchClone\(candidate\)/);
+  assert.match(source, /JSON\.stringify\(candidate\) !== JSON\.stringify\(secondPass\)/);
 });
 
 test('does not choose US home broadband when Taiwan and Japan are absent', { skip: !available }, () => {
@@ -119,8 +159,7 @@ test('exports the canonical policy without divergence', { skip: !available }, ()
   const mapping = {
     version: 'version',
     resolvers: 'resolvers',
-    proxy_bootstrap_resolvers: 'proxyBootstrapResolvers',
-    default_bootstrap_resolvers: 'defaultBootstrapResolvers',
+    bootstrap_fallback_resolvers: 'bootstrapFallbackResolvers',
     main_group_names: 'mainGroupNames',
     ai_group_names: 'aiGroupNames',
     taiwan_tokens: 'taiwanTokens',
@@ -530,6 +569,9 @@ test('Windows installation fails closed and preserves exact restore state', () =
   assert.match(installer, /Mihomo 1\.19\.27/);
   assert.match(installer, /Join-Path \(Join-Path \$env:LOCALAPPDATA "Clash Verge"\) "verge-mihomo\.exe"/);
   assert.match(installer, /function Test-ClashVergeRunning/);
+  assert.match(installer, /if \(\$clientRunning\)[\s\S]*Write-BytesAtomic \$targetScript \$scriptBytes[\s\S]*exit 0/);
+  assert.match(installer, /WaitForExit\(\$TimeoutSeconds \* 1000\)/);
+  assert.match(installer, /\$process\.Kill\(\)/);
   assert.doesNotMatch(installer, /Get-Process -Name "verge-mihomo"/);
   assert.match(installer, /function Write-BytesAtomic/);
   assert.match(installer, /OriginalBytes/);
