@@ -1396,8 +1396,8 @@ class MacosPatcherTest < Minitest::Test
       message = ClashPatch.chinese_status(example).split("：", 2).last
       status = message.split("；", 2).first
       assert_includes policy_document, status
-      assert_includes skill_document, "`#{status}`"
     end
+    assert_includes skill_document, "全部状态以"
   end
 
   private

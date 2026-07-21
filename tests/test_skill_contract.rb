@@ -43,6 +43,34 @@ class SkillContractTest < Minitest::Test
     assert_includes ignore.lines.map(&:strip), "dist/"
   end
 
+  def test_agent_instructions_execute_clear_requests_without_reconfirmation
+    instructions = File.read(File.join(ROOT, "AGENTS.md"))
+    assert_includes instructions, "需求明确且在已有授权范围内时，直接执行、验证并报告结果"
+    assert_includes instructions, "不要为计划、方案或实现细节再次请求确认"
+    assert_includes instructions, "不得自行新增需求汇总、入口、方案或计划文档"
+    assert_includes instructions, "实际修改项目后"
+    assert_includes instructions, "自动完成本地测试、commit 和 push"
+    assert_includes instructions, "不得把“尚未 commit 或 push”作为常规收尾"
+  end
+
+  def test_public_guides_stay_concise_and_separate_detailed_policy
+    readme = File.read(File.join(ROOT, "README.md"))
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+
+    assert_operator readme.lines.length, :<=, 110
+    assert_operator skill.lines.length, :<=, 80
+    assert_includes skill, "详细产品规则和全部状态以"
+  end
+
+  def test_documentation_distinguishes_written_tun_settings_from_runtime_state
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+
+    refute_includes policy, "TUN：已开启"
+    assert_includes policy, "配置中的 TUN：已写入；运行状态：等待用户重新加载后验证"
+    assert_includes skill, "配置中的 TUN 写入状态"
+  end
+
   def test_skill_frontmatter_contains_only_name_and_description
     skip unless File.file?(File.join(SKILL, "SKILL.md"))
 
@@ -76,6 +104,16 @@ class SkillContractTest < Minitest::Test
     %w[ipinfo.cv/webrtc-check ip.net.coffee/dns ip.net.coffee/webrtc].each do |url|
       assert_includes source, url
     end
+  end
+
+  def test_skill_names_every_guard_from_the_network_outage
+    source = File.read(File.join(SKILL, "SKILL.md"))
+
+    assert_includes source, "保留 `default-nameserver`、`proxy-server-nameserver` 和 `direct-nameserver`"
+    assert_includes source, "不得把节点启动解析改成 `1.1.1.1` 或 `8.8.8.8`"
+    assert_includes source, "不安装 LaunchAgent、`WatchPaths` 或目录监听"
+    assert_includes source, "REALITY `short-id`"
+    assert_includes source, "不得重新加载当前配置"
   end
 
   def test_skill_reuses_ai_groups_and_never_auto_selects_nodes
