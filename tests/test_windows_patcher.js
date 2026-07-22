@@ -1003,6 +1003,14 @@ test('Windows public commands share the JSON v1 result contract', () => {
   assert.match(fs.readFileSync(routeVerifierPath, 'utf8'), /-Command "verify_routes"/);
 });
 
+test('Windows route verifier accepts an explicit non-AI Google proxy group', () => {
+  const source = fs.readFileSync(routeVerifierPath, 'utf8');
+
+  assert.match(source, /function Test-RouteChains/);
+  assert.match(source, /Observe-Route "Google"[^\r\n]+\$true/);
+  assert.match(source, /Observe-Route "OpenAI"[^\r\n]+\$false/);
+});
+
 function baseConfig() {
   return {
     proxies: [

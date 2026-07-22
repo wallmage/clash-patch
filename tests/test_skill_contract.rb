@@ -323,8 +323,9 @@ class SkillContractTest < Minitest::Test
       assert_includes source, "DIRECT"
     end
     assert_includes policy, "verify_routes.ps1"
-    assert_includes mac_verifier, '!chains.include?("DIRECT")'
-    assert_includes windows_verifier, '$chains -notcontains "DIRECT"'
+    assert_includes mac_verifier, 'return false if chains.include?("DIRECT")'
+    assert_includes windows_verifier, '$Chains -contains "DIRECT"'
+    assert_includes windows_verifier, "function Test-RouteChains"
     assert_includes windows_verifier, 'type -eq "Selector"'
   end
 
@@ -636,7 +637,8 @@ class SkillContractTest < Minitest::Test
   def test_skill_automates_route_and_browser_verification_when_computer_use_exists
     source = File.read(File.join(SKILL, "SKILL.md"))
 
-    assert_includes source, "访问 Google 时必须经过当前主代理节点"
+    assert_includes source, "访问 Google 时必须经过主代理组"
+    assert_includes source, "不能经过 `DIRECT` 或 AI 分组"
     assert_includes source, "访问 OpenAI、Anthropic 或 Claude 时必须经过 AI 分组当前节点"
     assert_includes source, "macOS 或 Windows 环境只要提供 Computer Use，就由代理连续完成"
     assert_includes source, "当前环境没有 Computer Use 时，给出中文逐步操作"
@@ -647,7 +649,8 @@ class SkillContractTest < Minitest::Test
     source = File.read(File.join(SKILL, "scripts/macos/verify_routes.rb"))
 
     %w[Google OpenAI Anthropic Claude].each { |name| assert_includes source, name }
-    assert_includes source, 'chains.include?(expected.fetch(kind))'
+    assert_includes source, "def route_passes?"
+    assert_includes source, "return false if chains.include?(ai_group)"
     assert_includes source, 'existing.include?(entry["id"])'
   end
 

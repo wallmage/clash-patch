@@ -223,7 +223,7 @@ bash clash-patch/scripts/install_macos.sh --profile N
 
 ## 第三档验证
 
-先检查实时分流：macOS 使用 `scripts/macos/verify_routes.rb`，Windows 使用 `scripts/windows/verify_routes.ps1`。两者都通过 Mihomo 的 `/proxies` 与 `/connections` 实时记录验证：国内网站应获得大陆 CDN 并经过 `DIRECT`；Google 应经过主代理组当前节点；OpenAI、Anthropic 和 Claude 应经过 AI 分组当前节点；任何分组当前选择为 `DIRECT` 都判失败。只看配置文件或网页出口 IP 不足以证明分流正确。然后测试：
+先检查实时分流：macOS 使用 `scripts/macos/verify_routes.rb`，Windows 使用 `scripts/windows/verify_routes.ps1`。两者都通过 Mihomo 的 `/proxies` 与 `/connections` 实时记录验证：国内网站应获得大陆 CDN 并经过 `DIRECT`；Google 应经过主代理组，或订阅明确提供且当前选择有效代理节点的非 AI 专用组，不能经过 `DIRECT` 或 AI 分组；OpenAI、Anthropic 和 Claude 应经过 AI 分组当前节点。只看配置文件或网页出口 IP 不足以证明分流正确。然后测试：
 
 1. [IPInfo WebRTC 检测](https://ipinfo.cv/webrtc-check)
 2. [DNS 泄漏检测](https://ip.net.coffee/dns/)：点击“深度测试”

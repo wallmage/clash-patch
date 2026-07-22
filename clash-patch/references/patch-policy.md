@@ -433,7 +433,7 @@ Windows 全局脚本也必须做二次转换一致性检查；结果不一致时
 
 档位 1 只验收系统代理与 Google、Twitter、用户常用站点；档位 2 只验收 TUN、Clash 自己的系统代理开关、Google、Twitter、ChatGPT、Gemini 和一个命令行或 Agent 连接。不能因为未运行泄漏测试而把档位 1、2判为失败。以下完整验收只属于档位 3。
 
-先生成 Google、OpenAI 和 Claude/Anthropic 的真实连接，同时读取 Mihomo `/connections` 与 `/proxies`。macOS 运行 `ruby scripts/macos/verify_routes.rb`；Windows 运行 `powershell.exe -NoProfile -File scripts/windows/verify_routes.ps1`。Google 的连接链必须包含当前主代理组及其所选节点；AI 网站的连接链必须包含 AI 分组及其所选节点，任何分组当前选择为 `DIRECT` 都失败。只看配置文件或网页出口 IP 不足以证明分流正确。
+先生成 Google、OpenAI 和 Claude/Anthropic 的真实连接，同时读取 Mihomo `/connections` 与 `/proxies`。macOS 运行 `ruby scripts/macos/verify_routes.rb`；Windows 运行 `powershell.exe -NoProfile -File scripts/windows/verify_routes.ps1`。Google 的连接链必须包含当前主代理组及其所选节点；若订阅有明确的 Google 专用组，也可包含该非 AI 组及其有效代理选择，但连接链出现 `DIRECT` 或 AI 分组仍失败。AI 网站的连接链必须包含 AI 分组及其所选节点。只看配置文件或网页出口 IP 不足以证明分流正确。
 
 然后必须测试：
 

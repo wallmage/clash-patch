@@ -53,7 +53,8 @@ $routeAst = [System.Management.Automation.Language.Parser]::ParseFile($routeVeri
 if ($routeParseErrors.Count -gt 0) { throw ($routeParseErrors | Out-String) }
 $routeAst.FindAll({
     param($node)
-    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Find-Group"
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -in @("Find-Group", "Test-RouteChains")
 }, $true) | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
 $uninstallTokens = $null
 $uninstallParseErrors = $null
@@ -229,7 +230,7 @@ try {
     $lightVerge = "enable_tun_mode: false`n"
     [System.IO.File]::WriteAllText((Join-Path $lightCase "config.yaml"), $lightConfig)
     [System.IO.File]::WriteAllText((Join-Path $lightCase "verge.yaml"), $lightVerge)
-    $profileOne = Invoke-TestPowerShell $installer @("-AppHome", $lightCase, "-UsageProfile", "1")
+    $profileOne = Invoke-TestPowerShell $installer @("-AppHome", $lightCase, "-UsageProfile", "1", "-MihomoPath", $fakeCore)
     Assert-True ($profileOne.ExitCode -eq 0) "profile 1 installer failed: $($profileOne.Output)"
     Assert-True ((Get-Content -LiteralPath (Join-Path $lightCase "config.yaml") -Raw) -eq $lightConfig) "profile 1 modified config.yaml"
     Assert-True ((Get-Content -LiteralPath (Join-Path $lightCase "verge.yaml") -Raw) -eq $lightVerge) "profile 1 modified verge.yaml"
@@ -240,7 +241,7 @@ try {
     Assert-True ($profileOneScript.Contains("cnDomainProvider")) "profile 1 script omitted the China-domain provider"
     $savedProfileOne = Get-Content -LiteralPath (Join-Path $lightCase "clash-patch-usage-profile.json") -Raw | ConvertFrom-Json
     Assert-True ([int]$savedProfileOne.Profile -eq 1) "profile 1 was not saved"
-    $profileTwo = Invoke-TestPowerShell $installer @("-AppHome", $lightCase, "-UsageProfile", "2")
+    $profileTwo = Invoke-TestPowerShell $installer @("-AppHome", $lightCase, "-UsageProfile", "2", "-MihomoPath", $fakeCore)
     Assert-True ($profileTwo.ExitCode -eq 0) "profile 2 installer failed: $($profileTwo.Output)"
     Assert-True ((Get-Content -LiteralPath (Join-Path $lightCase "config.yaml") -Raw) -eq $lightConfig) "profile 2 modified config.yaml"
     Assert-True (Test-Path -LiteralPath $lightScript -PathType Leaf) "profile 2 removed the shared subscription patch"
@@ -387,6 +388,14 @@ items:
         "🤖 AI · Clash Patch" = [pscustomobject]@{ type = "Selector"; now = "Taiwan" }
     }
     Assert-True ((Find-Group $routeGroups @("AI") "" "AI 分组") -eq "🤖 AI · Clash Patch") "Windows route verifier did not recognize its managed AI group"
+    $routeChains = [pscustomobject]@{
+        Main = [pscustomobject]@{ type = "Selector"; now = "Taiwan" }
+        AI = [pscustomobject]@{ type = "Selector"; now = "Japan" }
+        Google = [pscustomobject]@{ type = "Selector"; now = "Singapore" }
+    }
+    Assert-True (Test-RouteChains $routeChains @("Singapore", "Google") "Main" "Taiwan" "AI" $true) "Windows route verifier rejected a user Google proxy group"
+    Assert-True (-not (Test-RouteChains $routeChains @("Japan", "AI", "Google") "Main" "Taiwan" "AI" $true)) "Windows route verifier accepted the AI group for ordinary Google traffic"
+    Assert-True (Test-RouteChains $routeChains @("Japan", "AI") "AI" "Japan" "AI" $false) "Windows route verifier rejected the required AI group"
 
     Assert-True (Test-MihomoVersionText "Mihomo Meta v1.19.27") "minimum Mihomo version was rejected"
     Assert-True (-not (Test-MihomoVersionText "Mihomo Meta v1.19.26")) "old Mihomo version was accepted"

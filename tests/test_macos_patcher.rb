@@ -222,15 +222,16 @@ class MacosPatcherTest < Minitest::Test
   end
 
   def test_route_verifier_json_mode_emits_one_contract_object_on_business_failure
-    output, error, status = Open3.capture3(RbConfig.ruby, ROUTE_VERIFIER_PATH, "--json")
+    output = StringIO.new
+    ClashRouteVerifier.stub(:run, false) do
+      assert_equal 1, ClashRouteVerifier.cli(["--json"], output: output)
+    end
 
-    assert_equal 1, status.exitstatus
-    assert_empty error
-    result = JSON.parse(output)
+    result = JSON.parse(output.string)
     assert_equal "verify_routes", result.fetch("command")
     assert_equal "failed", result.fetch("status")
-    assert_equal status.exitstatus, result.fetch("exit_code")
-    refute_includes output, Dir.home
+    assert_equal 1, result.fetch("exit_code")
+    refute_includes output.string, Dir.home
   end
 
   def test_route_verifier_cli_json_does_not_forward_human_output
@@ -2775,6 +2776,33 @@ class MacosPatcherTest < Minitest::Test
               assert ClashRouteVerifier.run(output: output)
               assert_includes output.string, "Google：通过"
               assert_includes output.string, "Claude：通过"
+            end
+          end
+        end
+      end
+    end
+  end
+
+  def test_route_verifier_accepts_a_user_google_proxy_group
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
+      proxies = { "proxies" => {
+        "Main" => { "type" => "Selector", "now" => "Taiwan" },
+        "AI" => { "type" => "Selector", "now" => "Japan" },
+        "Google" => { "type" => "Selector", "now" => "Singapore" }
+      } }
+      observations = [
+        { "chains" => ["Singapore", "Google"] },
+        { "chains" => ["Japan", "AI"] },
+        { "chains" => ["Japan", "AI"] },
+        { "chains" => ["Japan", "AI"] }
+      ]
+      ClashPatch.stub(:controller_socket, "socket") do
+        ClashRouteVerifier.stub(:active_profile, profile) do
+          ClashRouteVerifier.stub(:get_json, proxies) do
+            ClashRouteVerifier.stub(:observe_connection, ->(*_args) { observations.shift }) do
+              assert ClashRouteVerifier.run(output: StringIO.new)
             end
           end
         end

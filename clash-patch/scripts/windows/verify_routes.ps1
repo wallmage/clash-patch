@@ -82,7 +82,41 @@ function Start-TestTraffic([string]$Url) {
     return $process
 }
 
-function Observe-Route([string]$Label, [string]$Url, [string]$HostPattern, [string]$ExpectedGroup, [string]$ExpectedSelection) {
+function Test-RouteChains(
+    [object]$Proxies,
+    [string[]]$Chains,
+    [string]$ExpectedGroup,
+    [string]$ExpectedSelection,
+    [string]$AiGroup,
+    [bool]$AllowExplicitProxyGroup
+) {
+    if ($Chains -contains "DIRECT" -or $ExpectedSelection -eq "DIRECT") { return $false }
+    if (-not $AllowExplicitProxyGroup) {
+        return ($Chains -contains $ExpectedGroup) -and ($Chains -contains $ExpectedSelection)
+    }
+    if ($Chains -contains $AiGroup) { return $false }
+    if (($Chains -contains $ExpectedGroup) -and ($Chains -contains $ExpectedSelection)) { return $true }
+    foreach ($name in $Chains) {
+        $property = $Proxies.PSObject.Properties[$name]
+        if ($null -eq $property) { continue }
+        $selection = [string]$property.Value.now
+        if (-not [string]::IsNullOrWhiteSpace($selection) -and $selection -ne "DIRECT" -and $Chains -contains $selection) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Observe-Route(
+    [string]$Label,
+    [string]$Url,
+    [string]$HostPattern,
+    [string]$ExpectedGroup,
+    [string]$ExpectedSelection,
+    [object]$Proxies,
+    [string]$AiGroup,
+    [bool]$AllowExplicitProxyGroup
+) {
     $known = Get-ConnectionIds
     $process = Start-TestTraffic $Url
     try {
@@ -95,10 +129,7 @@ function Observe-Route([string]$Label, [string]$Url, [string]$HostPattern, [stri
                 $host = [string]$connection.metadata.host
                 if ($host -notmatch $HostPattern) { continue }
                 $chains = @($connection.chains | ForEach-Object { [string]$_ })
-                $passed = ($chains -notcontains "DIRECT") -and
-                    ($chains -contains $ExpectedGroup) -and
-                    ($chains -contains $ExpectedSelection) -and
-                    ($ExpectedSelection -ne "DIRECT")
+                $passed = Test-RouteChains $Proxies $chains $ExpectedGroup $ExpectedSelection $AiGroup $AllowExplicitProxyGroup
                 [void]$script:ClashPatchChecks.Add([ordered]@{ name = $Label.ToLowerInvariant(); ok = $passed; status = $(if ($passed) { "passed" } else { "failed" }) })
                 if (-not $Json) { Write-Host ("{0}：{1}" -f $Label, $(if ($passed) { "通过" } else { "失败" })) }
                 return $passed
@@ -134,10 +165,10 @@ try {
         Write-Output "AI 分组：已识别；当前选择已隐藏"
     }
     $checks = @(
-        (Observe-Route "Google" "https://www.google.com/search?q=clash-route-verification" "google" $main $mainSelection),
-        (Observe-Route "OpenAI" "https://openai.com/" "openai" $ai $aiSelection),
-        (Observe-Route "Anthropic" "https://www.anthropic.com/" "anthropic" $ai $aiSelection),
-        (Observe-Route "Claude" "https://claude.ai/" "claude" $ai $aiSelection)
+        (Observe-Route "Google" "https://www.google.com/search?q=clash-route-verification" "google" $main $mainSelection $proxies $ai $true),
+        (Observe-Route "OpenAI" "https://openai.com/" "openai" $ai $aiSelection $proxies $ai $false),
+        (Observe-Route "Anthropic" "https://www.anthropic.com/" "anthropic" $ai $aiSelection $proxies $ai $false),
+        (Observe-Route "Claude" "https://claude.ai/" "claude" $ai $aiSelection $proxies $ai $false)
     )
     if (@($checks | Where-Object { -not $_ }).Count -gt 0) {
         if ($Json) { Write-ClashPatchResult (New-ClashPatchResult -Command "verify_routes" -Operation "verify_routes" -Ok $false -Status "failed" -Code "route_check_failed" -ExitCode 1 -SummaryZh "Windows 分流验证未通过。" -Checks @($script:ClashPatchChecks)) }

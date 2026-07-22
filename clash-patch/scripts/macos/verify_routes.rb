@@ -86,6 +86,18 @@ module ClashRouteVerifier
     end
   end
 
+  def route_passes?(chains, proxies:, kind:, expected_group:, expected_selection:, ai_group:)
+    return false if chains.include?("DIRECT") || expected_selection == "DIRECT"
+    return chains.include?(expected_group) && chains.include?(expected_selection) if kind == :ai
+    return false if chains.include?(ai_group)
+    return true if chains.include?(expected_group) && chains.include?(expected_selection)
+
+    chains.any? do |name|
+      selection = proxies.dig(name, "now").to_s
+      !selection.empty? && selection != "DIRECT" && chains.include?(selection)
+    end
+  end
+
   def run(output: $stdout, details: nil)
     socket = ClashPatch.controller_socket
     path = active_profile
@@ -114,7 +126,10 @@ module ClashRouteVerifier
     checks = TARGETS.map do |label, url, kind, host_pattern|
       connection = observe_connection(socket, url, host_pattern)
       chains = Array(connection && connection["chains"])
-      ok = !chains.include?("DIRECT") && chains.include?(expected.fetch(kind)) && chains.include?(selections.fetch(kind))
+      ok = route_passes?(
+        chains, proxies: proxies, kind: kind, expected_group: expected.fetch(kind),
+        expected_selection: selections.fetch(kind), ai_group: ai_group
+      )
       selected = chains.first
       output.puts "#{label}：#{ok ? '通过' : '失败'}（#{ClashPatch.safe_label(selected)}）"
       details[:checks] << { "name" => label.downcase, "ok" => ok } if details
