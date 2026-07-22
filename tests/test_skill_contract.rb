@@ -91,12 +91,13 @@ class SkillContractTest < Minitest::Test
     assert_includes instructions, "不得把“尚未 commit 或 push”作为常规收尾"
   end
 
-  def test_public_guides_stay_concise_and_separate_detailed_policy
+  def test_public_guides_keep_readable_size_and_point_to_detailed_policy
     readme = File.read(File.join(ROOT, "README.md"))
     skill = File.read(File.join(SKILL, "SKILL.md"))
 
-    assert_operator readme.lines.length, :<=, 125
+    assert_operator readme.lines.length, :<=, 320
     assert_operator skill.lines.length, :<=, 110
+    assert_includes readme, "patch-policy.md"
     assert_includes skill, "详细产品规则和全部状态以"
   end
 
@@ -163,8 +164,8 @@ class SkillContractTest < Minitest::Test
     end
 
     assert_includes policy, "档位 1 不修改 TUN"
-    assert_includes policy, "不修改订阅"
-    assert_includes policy, "档位 2 不应用 DNS、WebRTC 或 AI 分组补丁"
+    assert_includes policy, "共同国内域名直连基线"
+    assert_includes policy, "档位 2 不增加 WebRTC 或 AI 分组补丁"
     assert_includes policy, "只关闭 Clash 客户端自己的系统代理开关"
     assert_includes policy, "不得清除或覆盖 AdGuard"
     assert_includes policy, "不是为了隐藏代理"
@@ -187,10 +188,49 @@ class SkillContractTest < Minitest::Test
     assert_includes skill, "uninstall_windows.cmd"
     assert_includes policy, "旧订阅增强仍可能保留"
     assert_includes policy, "只有档位 3"
-    assert_includes mac_installer, 'if [ "$SAFE_UPDATE" -eq 0 ] && [ "$USAGE_PROFILE" -ne 3 ]'
-    assert_includes mac_installer, "检测到从档位 3 改为轻量档位"
+    assert_includes mac_installer, '--usage-profile "$USAGE_PROFILE"'
     assert_includes windows_installer, 'if ($resolvedUsageProfile -ne 3)'
     assert_includes windows_installer, "检测到从档位 3 改为轻量档位"
+  end
+
+  def test_all_profiles_share_one_managed_china_domain_baseline
+    readme = File.read(File.join(ROOT, "README.md"))
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy_doc = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+    policy = JSON.parse(File.read(File.join(SKILL, "references/policy.json")))
+    mac_patcher = mac_patcher_source
+    windows_patcher = File.read(File.join(SKILL, "scripts/windows/clash_verge_global.js"))
+
+    [readme, skill, policy_doc, design].each do |document|
+      assert_includes document, "共同国内域名直连基线"
+      assert_includes document, "全部订阅"
+    end
+    provider = policy.fetch("cn_domain_provider")
+    assert_equal "http", provider.fetch("type")
+    assert_equal "domain", provider.fetch("behavior")
+    assert_equal "mrs", provider.fetch("format")
+    assert_equal 86_400, provider.fetch("interval")
+    assert_includes provider.fetch("url"), "/geosite/cn.mrs"
+    assert_includes mac_patcher, "patch_common_cn"
+    assert_includes mac_patcher, '"rule-set:#{provider_name}"'
+    assert_includes windows_patcher, "clashPatchCommonCn"
+    assert_includes windows_patcher, "CLASH_PATCH_USAGE_PROFILE"
+  end
+
+  def test_known_diagnostics_cover_domestic_misrouting_and_adguard_certificate_failures
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+
+    [skill, policy].each do |document|
+      assert_includes document, "第一档已知故障：国内请求误走海外"
+      assert_includes document, "Kimi"
+      assert_includes document, "欧陆词典"
+      assert_includes document, "不得点击"
+      assert_includes document, "CERTIFICATE_VERIFY_FAILED"
+      assert_includes document, "不添加 Apple"
+      assert_includes document, "暂未复现"
+    end
   end
 
   def test_saved_profile_bounds_diagnostics_repairs_and_regression_checks
@@ -209,9 +249,9 @@ class SkillContractTest < Minitest::Test
     assert_includes skill, "Diagnostics 每次开始都先读取本机保存的档位"
     assert_includes skill, "故障本身不能自动升档"
     assert_includes policy, "用途档位是 Diagnostics 的需求边界"
-    assert_includes policy, "档位 1 不检查或修改 TUN"
-    assert_includes policy, "档位 1 不运行 DNS 泄漏、WebRTC 或 AI 检查"
-    assert_includes policy, "目标域名的普通 DNS 解析"
+    assert_includes policy, "但不检查或修改 TUN"
+    assert_includes policy, "不运行 DNS 泄漏、WebRTC 或 AI 检查"
+    assert_includes policy, "共同国内域名直连基线"
     assert_includes policy, "档位 2 不运行 DNS 泄漏、WebRTC 或 AI 分组检查"
     assert_includes policy, "档位 3 的既有能力"
     assert_includes policy, "只重测可能受本次改动影响的第三档能力"
@@ -785,7 +825,7 @@ class SkillContractTest < Minitest::Test
     patcher = mac_patcher_source
 
     assert_operator mac_install.index('id -u'), :<, mac_install.index("\n  save_profile\n")
-    assert_operator mac_install.index('if [ "$SAFE_UPDATE" -eq 0 ] && [ "$USAGE_PROFILE" -ne 3 ]'), :<, mac_install.index('core_status=')
+    assert_operator mac_install.index('core_status='), :<, mac_install.index("\n  save_profile\n")
     assert_operator mac_install.index('core_status='), :<, mac_install.index('--disable-subscription-auto-update')
     assert_operator mac_install.index('plutil -extract Label'), :<, mac_install.index('launchctl bootout')
     assert_operator mac_install.index('ProgramArguments.0'), :<, mac_install.index('launchctl bootout')

@@ -24,6 +24,8 @@ module ClashPatch
   end
 
   def ai_state(result)
+    return "" if result[:ai_group].nil?
+
     ai_group = safe_label(result[:ai_group])
     return "；已创建独立 AI 分组「#{ai_group}」，包含全部可用节点和代理提供者，节点由你选择" if result[:ai_group_created]
     return "；已升级 AI 分组「#{ai_group}」为独立节点选择器，节点由你选择" if result[:ai_group_reset]
@@ -126,7 +128,7 @@ module ClashPatch
       opts.on("--restore-backup ID", "恢复指定备份") { |value| options[:restore_backup] = value }
       opts.on("--expected-current-sha256 SHA256", "恢复前要求当前配置哈希匹配") { |value| options[:expected_current_sha256] = value }
       opts.on("--safe-update-all", "安全更新当前存储位置中的全部远程订阅") { options[:safe_update_all] = true }
-      opts.on("--usage-profile N", Integer, "安全更新采用的用途档位") { |value| options[:usage_profile] = value }
+      opts.on("--usage-profile N", Integer, "补丁与安全更新采用的用途档位") { |value| options[:usage_profile] = value }
       opts.on("--json", "输出 JSON v1 结果") { options[:json] = true }
       opts.on("-h", "--help", "显示帮助") do
         options[:help] = true
@@ -305,19 +307,21 @@ module ClashPatch
       dry_run: options[:dry_run],
       backup_root: options[:backup_root],
       validator: options[:dry_run] ? nil : method(:validate_with_mihomo),
-      auto_reload: options[:auto_reload] && !options[:dry_run]
+      auto_reload: options[:auto_reload] && !options[:dry_run],
+      usage_profile: options[:usage_profile] || 3
     )
     if options[:json]
       status, code, summary = batch_json_status(results)
+      exit_code = %w[ok no_change].include?(status) ? 0 : 1
       return emit_cli_result(
-        operation: options[:dry_run] ? "preview_profiles" : "patch_profiles", exit_code: 0,
+        operation: options[:dry_run] ? "preview_profiles" : "patch_profiles", exit_code: exit_code,
         status: status, code: code, summary_zh: summary,
         changes: results.any? { |result| result[:status] == :updated } ? ["profiles"] : [],
         items: results.map { |result| result_item(result) }
       )
     end
     results.each { |result| puts chinese_status(result) }
-    0
+    results.all? { |result| %i[updated unchanged].include?(result[:status]) } ? 0 : 1
   rescue OptionParser::ParseError => error
     return emit_cli_result(
       operation: "parse_arguments", exit_code: 64, status: "invalid_request", code: "invalid_arguments",

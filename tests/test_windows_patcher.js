@@ -54,6 +54,57 @@ test('global transform applies common policy', { skip: !available }, () => {
   assert.ok(patched.rules.includes('DOMAIN,storage.googleapis.com,AI'));
 });
 
+test('lightweight profiles receive the common China-domain baseline only', { skip: !available }, () => {
+  for (const usageProfile of [1, 2]) {
+    const input = baseConfig();
+    input.ipv6 = true;
+    input.tun = { enable: false };
+    const patched = engine.clashPatchTransform(input, 'fixture', usageProfile);
+    const providerName = engine.CLASH_PATCH_POLICY.cnDomainProvider.name;
+    const provider = patched['rule-providers'][providerName];
+
+    assert.equal(provider.type, 'http');
+    assert.equal(provider.behavior, 'domain');
+    assert.equal(provider.format, 'mrs');
+    assert.equal(provider.url, engine.CLASH_PATCH_POLICY.cnDomainProvider.url);
+    assert.equal(provider.proxy, 'Main');
+    assert.deepEqual(patched.dns['nameserver-policy'][`rule-set:${providerName}`], engine.CLASH_PATCH_POLICY.directResolvers);
+    assert.ok(patched.rules.indexOf(`RULE-SET,${providerName},DIRECT`) < patched.rules.indexOf('GEOSITE,CN,DIRECT'));
+    assert.equal(patched.ipv6, true);
+    assert.deepEqual(patched.tun, { enable: false });
+    assert.equal(patched.rules.some((rule) => rule.startsWith('NETWORK,UDP,')), false);
+    assert.deepEqual(engine.clashPatchTransform(patched, 'fixture', usageProfile), patched);
+  }
+});
+
+test('common China-domain baseline preserves a colliding user provider', { skip: !available }, () => {
+  const input = baseConfig();
+  const providerName = engine.CLASH_PATCH_POLICY.cnDomainProvider.name;
+  input['rule-providers'] = {
+    [providerName]: { type: 'file', behavior: 'domain', path: './user-owned.yaml' }
+  };
+
+  const patched = engine.clashPatchTransform(input, 'fixture', 1);
+
+  assert.equal(patched['rule-providers'][providerName].path, './user-owned.yaml');
+  assert.ok(patched['rule-providers'][`${providerName}-2`]);
+  assert.ok(patched.rules.includes(`RULE-SET,${providerName}-2,DIRECT`));
+});
+
+test('common China-domain baseline preserves a colliding user provider path', { skip: !available }, () => {
+  const input = baseConfig();
+  const provider = engine.CLASH_PATCH_POLICY.cnDomainProvider;
+  input['rule-providers'] = {
+    'user-cn': { type: 'file', behavior: 'domain', path: provider.path }
+  };
+
+  const patched = engine.clashPatchTransform(input, 'fixture', 1);
+
+  assert.equal(patched['rule-providers']['user-cn'].path, provider.path);
+  assert.equal(patched['rule-providers'][`${provider.name}-2`].path, `./ruleset/${provider.name}-2.mrs`);
+  assert.ok(patched.rules.includes(`RULE-SET,${provider.name}-2,DIRECT`));
+});
+
 test('reuses the existing AI group without creating visible groups', { skip: !available }, () => {
   const config = baseConfig();
   const originalAi = structuredClone(config['proxy-groups'].find((group) => group.name === 'AI'));
@@ -497,6 +548,13 @@ test('PowerShell installer uses the documented global script and app settings', 
   const preflight = source.indexOf('$scriptOutput = Build-GlobalScript');
   const firstBackup = source.indexOf('Backup-Versioned $target.Path $backupRoot "prewrite"');
   assert.ok(preflight !== -1 && firstBackup !== -1 && preflight < firstBackup, 'all transformations must be prepared before files change');
+});
+
+test('PowerShell 5.1 keeps a single remote subscription path as an array', () => {
+  const profilesModule = fs.readFileSync(path.join(installerModuleDir, 'profiles.ps1'), 'utf8');
+
+  assert.match(profilesModule, /\$matches\s*=\s*@\(\$candidates\s*\|\s*Where-Object/);
+  assert.match(profilesModule, /Resolve-Path\s+-LiteralPath\s+\$matches\[0\]/);
 });
 
 // Static contract only: pwsh is unavailable on macOS, so exit codes cannot be

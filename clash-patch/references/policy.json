@@ -12,6 +12,16 @@
   "bootstrap_fallback_resolvers": [
     "system"
   ],
+  "cn_domain_provider": {
+    "name": "clash-patch-cn-domain",
+    "type": "http",
+    "behavior": "domain",
+    "format": "mrs",
+    "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/cn.mrs",
+    "path": "./ruleset/clash-patch-cn-domain.mrs",
+    "interval": 86400,
+    "size_limit": 2097152
+  },
   "main_group_names": [
     "Proxy",
     "PROXY",

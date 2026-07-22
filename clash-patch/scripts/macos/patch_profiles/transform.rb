@@ -11,6 +11,7 @@ module ClashPatch
   DIRECT_NAMES = %w[DIRECT REJECT REJECT-DROP PASS PASS-RULE COMPATIBLE REMATCH].freeze
   EXCLUDED_SAFE_TYPES = "Direct|Dns|Reject|Pass|Compatible|Rematch".freeze
   LEGACY_QUIC_REJECT_RULE = "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT".freeze
+  CN_PROVIDER_SUFFIX = /(?:-[2-9]|-[1-9][0-9]+)?/.freeze
 
   class InvalidConfigError < StandardError; end
 
@@ -57,9 +58,95 @@ module ClashPatch
       ai_group: nil,
       route_group: nil,
       main_group: nil,
+      cn_provider: nil,
       ai_group_created: false,
       ai_group_reset: false
     }
+  end
+
+  def managed_cn_provider_name?(name, policy)
+    base = policy.dig("cn_domain_provider", "name")
+    base.is_a?(String) && name.is_a?(String) && name.match?(/\A#{Regexp.escape(base)}#{CN_PROVIDER_SUFFIX}\z/)
+  end
+
+  def cn_provider_path(provider_policy, name)
+    base_name = provider_policy.fetch("name")
+    base_path = provider_policy.fetch("path")
+    suffix = name.delete_prefix(base_name)
+    return base_path if suffix.empty?
+
+    extension = File.extname(base_path)
+    base_path.delete_suffix(extension) + suffix + extension
+  end
+
+  def owned_cn_provider?(name, provider, policy)
+    provider_policy = policy["cn_domain_provider"]
+    return false unless provider_policy.is_a?(Hash) && provider.is_a?(Hash)
+    return false unless managed_cn_provider_name?(name, policy)
+
+    provider["url"] == provider_policy["url"] && provider["path"] == cn_provider_path(provider_policy, name)
+  end
+
+  def ensure_cn_provider(config, policy, route_group)
+    provider_policy = policy["cn_domain_provider"]
+    raise InvalidConfigError, "国内域名规则配置无效" unless provider_policy.is_a?(Hash)
+
+    providers = config["rule-providers"].is_a?(Hash) ? config["rule-providers"] : {}
+    config["rule-providers"] = providers
+    name = providers.find { |candidate, provider| owned_cn_provider?(candidate, provider, policy) }&.first
+    unless name
+      base = provider_policy.fetch("name")
+      name = base
+      sequence = 2
+      while providers.key?(name) || providers.any? { |_candidate, provider|
+              provider.is_a?(Hash) && provider["path"] == cn_provider_path(provider_policy, name)
+            }
+        name = "#{base}-#{sequence}"
+        sequence += 1
+      end
+    end
+    providers[name] = {
+      "type" => provider_policy.fetch("type"),
+      "behavior" => provider_policy.fetch("behavior"),
+      "format" => provider_policy.fetch("format"),
+      "url" => provider_policy.fetch("url"),
+      "path" => cn_provider_path(provider_policy, name),
+      "interval" => provider_policy.fetch("interval"),
+      "proxy" => route_group,
+      "size-limit" => provider_policy.fetch("size_limit")
+    }
+    name
+  end
+
+  def patch_common_cn(config, policy, route_group)
+    owned_names = if config["rule-providers"].is_a?(Hash)
+                    config["rule-providers"].select { |name, provider| owned_cn_provider?(name, provider, policy) }.keys
+                  else
+                    []
+                  end
+    provider_name = ensure_cn_provider(config, policy, route_group)
+    owned_names << provider_name
+
+    dns = config["dns"].is_a?(Hash) ? config["dns"] : {}
+    config["dns"] = dns
+    dns["enable"] = true
+    dns["respect-rules"] = true
+    dns["proxy-server-nameserver"] = deep_copy(policy["bootstrap_fallback_resolvers"]) if Array(dns["proxy-server-nameserver"]).empty?
+    dns["nameserver"] = tagged_resolvers(policy, route_group) if Array(dns["nameserver"]).empty?
+    dns["direct-nameserver"] = deep_copy(policy["direct_resolvers"])
+    dns["direct-nameserver-follow-policy"] = false
+    policies = dns["nameserver-policy"].is_a?(Hash) ? deep_copy(dns["nameserver-policy"]) : {}
+    policies["rule-set:#{provider_name}"] = deep_copy(policy["direct_resolvers"])
+    dns["nameserver-policy"] = policies
+
+    rules = Array(config["rules"]).reject do |rule|
+      info = rule_info(rule)
+      info[:type] == "RULE-SET" && owned_names.include?(info[:payload])
+    end
+    insertion = rules.index { |rule| broad_rule?(rule) } || rules.length
+    rules.insert(insertion, "RULE-SET,#{provider_name},DIRECT")
+    config["rules"] = rules
+    provider_name
   end
 
   def usable_config?(config)
@@ -378,7 +465,7 @@ module ClashPatch
     end.uniq
   end
 
-  def patch_dns(config, policy, route_group, ai_group, owned_safe_names = [])
+  def patch_dns(config, policy, route_group, ai_group, owned_safe_names = [], cn_provider_name = nil)
     dns = config["dns"].is_a?(Hash) ? config["dns"] : {}
     config["dns"] = dns
     dns["enable"] = true
@@ -423,6 +510,7 @@ module ClashPatch
       end
     end
     policies["geosite:cn"] = deep_copy(policy["direct_resolvers"])
+    policies["rule-set:#{cn_provider_name}"] = deep_copy(policy["direct_resolvers"]) if cn_provider_name
     ai_dns_patterns(policy).each { |pattern| policies[pattern] = deep_copy(ai_resolvers) }
     dns["nameserver-policy"] = policies
   end
@@ -557,8 +645,9 @@ module ClashPatch
     value
   end
 
-  def patch(config, policy)
+  def patch(config, policy, usage_profile: 3)
     return base_result(config, :invalid_policy) unless policy.is_a?(Hash) && policy["version"] == POLICY_VERSION
+    return base_result(config, :invalid_profile) unless [1, 2, 3].include?(usage_profile)
     return base_result(config, :invalid) unless usable_config?(config)
 
     original = deep_copy(config)
@@ -566,6 +655,22 @@ module ClashPatch
     patched["rules"] ||= []
     main_group = detect_main_group(patched, policy)
     return base_result(config, :no_main_group) unless main_group
+
+    cn_provider = patch_common_cn(patched, policy, main_group)
+    if usage_profile < 3
+      normalize_reality_short_ids(patched)
+      return {
+        config: patched,
+        changed: patched != original,
+        status: patched == original ? :unchanged : :updated,
+        ai_group: nil,
+        route_group: main_group,
+        main_group: main_group,
+        cn_provider: cn_provider,
+        ai_group_created: false,
+        ai_group_reset: false
+      }
+    end
 
     owned_ai_names, owned_safe_names = owned_managed_group_names(patched, policy)
     existing_ai = existing_ai_group(patched, policy)
@@ -584,7 +689,7 @@ module ClashPatch
     patched["ipv6"] = false
     patched["tun"] = {} unless patched["tun"].is_a?(Hash)
     TUN_POLICY.each { |key, value| patched["tun"][key] = deep_copy(value) }
-    patch_dns(patched, policy, route_group, ai_group, owned_safe_names)
+    patch_dns(patched, policy, route_group, ai_group, owned_safe_names, cn_provider)
     patch_rules(patched, policy, ai_group, route_group, owned_ai_names, owned_safe_names)
     remove_owned_managed_groups(patched, (owned_ai_names - [ai_group]) + owned_safe_names)
     normalize_reality_short_ids(patched)
@@ -596,6 +701,7 @@ module ClashPatch
       ai_group: ai_group,
       route_group: route_group,
       main_group: main_group,
+      cn_provider: cn_provider,
       ai_group_created: ai_group_created,
       ai_group_reset: !!ai_group_reset
     }

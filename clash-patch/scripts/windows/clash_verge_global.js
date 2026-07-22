@@ -16,6 +16,16 @@ const CLASH_PATCH_POLICY = {
   "bootstrapFallbackResolvers": [
     "system"
   ],
+  "cnDomainProvider": {
+    "name": "clash-patch-cn-domain",
+    "type": "http",
+    "behavior": "domain",
+    "format": "mrs",
+    "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/meta/geo/geosite/cn.mrs",
+    "path": "./ruleset/clash-patch-cn-domain.mrs",
+    "interval": 86400,
+    "size_limit": 2097152
+  },
   "mainGroupNames": [
     "Proxy",
     "PROXY",
@@ -99,6 +109,7 @@ const CLASH_PATCH_SAFE_GROUP = "🛡 安全代理 · Clash Patch";
 const CLASH_PATCH_DIRECT_NAMES = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "PASS-RULE", "COMPATIBLE", "REMATCH"];
 const CLASH_PATCH_DIRECT_TYPES = ["direct", "dns", "reject", "pass", "compatible", "rematch"];
 const CLASH_PATCH_LEGACY_QUIC_REJECT_RULE = "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT";
+const CLASH_PATCH_USAGE_PROFILE = 3;
 
 function clashPatchClone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -432,7 +443,7 @@ function clashPatchNormalizedResolverEndpoints(config, values) {
   return normalized;
 }
 
-function clashPatchDns(config, routeGroup, aiGroup, ownedSafeNames) {
+function clashPatchDns(config, routeGroup, aiGroup, ownedSafeNames, cnProviderName) {
   const dns = config.dns && typeof config.dns === "object" && !Array.isArray(config.dns) ? config.dns : {};
   config.dns = dns;
   dns.enable = true;
@@ -479,6 +490,7 @@ function clashPatchDns(config, routeGroup, aiGroup, ownedSafeNames) {
     });
   });
   policies["geosite:cn"] = CLASH_PATCH_POLICY.directResolvers.slice();
+  if (cnProviderName) policies["rule-set:" + cnProviderName] = CLASH_PATCH_POLICY.directResolvers.slice();
   clashPatchDnsPatterns().forEach(function (pattern) { policies[pattern] = aiResolvers.slice(); });
   dns["nameserver-policy"] = policies;
 }
@@ -531,6 +543,98 @@ function clashPatchManagedRuleIdentity(rule) {
 
 function clashPatchBroadRule(rule) {
   return ["MATCH", "GEOSITE", "GEOIP", "RULE-SET"].indexOf(clashPatchRuleInfo(rule).type) !== -1;
+}
+
+function clashPatchManagedCnProviderName(name) {
+  const base = CLASH_PATCH_POLICY.cnDomainProvider.name;
+  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp("^" + escaped + "(?:-[2-9]|-[1-9][0-9]+)?$").test(String(name));
+}
+
+function clashPatchCnProviderPath(name) {
+  const provider = CLASH_PATCH_POLICY.cnDomainProvider;
+  const suffix = String(name).slice(provider.name.length);
+  if (!suffix) return provider.path;
+  const dot = provider.path.lastIndexOf(".");
+  if (dot === -1) return provider.path + suffix;
+  return provider.path.slice(0, dot) + suffix + provider.path.slice(dot);
+}
+
+function clashPatchOwnedCnProvider(name, provider) {
+  const expected = CLASH_PATCH_POLICY.cnDomainProvider;
+  return provider && typeof provider === "object" && clashPatchManagedCnProviderName(name) &&
+    provider.url === expected.url && provider.path === clashPatchCnProviderPath(name);
+}
+
+function clashPatchEnsureCnProvider(config, routeGroup) {
+  const expected = CLASH_PATCH_POLICY.cnDomainProvider;
+  const providers = config["rule-providers"] && typeof config["rule-providers"] === "object" &&
+    !Array.isArray(config["rule-providers"]) ? config["rule-providers"] : {};
+  config["rule-providers"] = providers;
+  let name = Object.keys(providers).find(function (candidate) {
+    return clashPatchOwnedCnProvider(candidate, providers[candidate]);
+  });
+  if (!name) {
+    name = expected.name;
+    let sequence = 2;
+    while (Object.prototype.hasOwnProperty.call(providers, name) || Object.keys(providers).some(function (candidate) {
+      const provider = providers[candidate];
+      return provider && typeof provider === "object" && provider.path === clashPatchCnProviderPath(name);
+    })) {
+      name = expected.name + "-" + sequence;
+      sequence += 1;
+    }
+  }
+  providers[name] = {
+    type: expected.type,
+    behavior: expected.behavior,
+    format: expected.format,
+    url: expected.url,
+    path: clashPatchCnProviderPath(name),
+    interval: expected.interval,
+    proxy: routeGroup,
+    "size-limit": expected.size_limit
+  };
+  return name;
+}
+
+function clashPatchCommonCn(config, routeGroup) {
+  const oldOwnedNames = [];
+  const existingProviders = config["rule-providers"];
+  if (existingProviders && typeof existingProviders === "object" && !Array.isArray(existingProviders)) {
+    Object.keys(existingProviders).forEach(function (name) {
+      if (clashPatchOwnedCnProvider(name, existingProviders[name])) oldOwnedNames.push(name);
+    });
+  }
+  const providerName = clashPatchEnsureCnProvider(config, routeGroup);
+  oldOwnedNames.push(providerName);
+
+  const dns = config.dns && typeof config.dns === "object" && !Array.isArray(config.dns) ? config.dns : {};
+  config.dns = dns;
+  dns.enable = true;
+  dns["respect-rules"] = true;
+  if (!Array.isArray(dns["proxy-server-nameserver"]) || dns["proxy-server-nameserver"].length === 0) {
+    dns["proxy-server-nameserver"] = CLASH_PATCH_POLICY.bootstrapFallbackResolvers.slice();
+  }
+  if (!Array.isArray(dns.nameserver) || dns.nameserver.length === 0) {
+    dns.nameserver = clashPatchTaggedResolvers(routeGroup);
+  }
+  dns["direct-nameserver"] = CLASH_PATCH_POLICY.directResolvers.slice();
+  dns["direct-nameserver-follow-policy"] = false;
+  const policies = dns["nameserver-policy"] && typeof dns["nameserver-policy"] === "object" &&
+    !Array.isArray(dns["nameserver-policy"]) ? clashPatchClone(dns["nameserver-policy"]) : {};
+  policies["rule-set:" + providerName] = CLASH_PATCH_POLICY.directResolvers.slice();
+  dns["nameserver-policy"] = policies;
+
+  const rules = (Array.isArray(config.rules) ? config.rules : []).filter(function (rule) {
+    const info = clashPatchRuleInfo(rule);
+    return !(info.type === "RULE-SET" && oldOwnedNames.indexOf(info.payload) !== -1);
+  });
+  let insertion = rules.findIndex(clashPatchBroadRule);
+  if (insertion === -1) insertion = rules.length;
+  rules.splice(insertion, 0, "RULE-SET," + providerName + ",DIRECT");
+  config.rules = rules;
+  return providerName;
 }
 
 function clashPatchRenderAiRules(aiGroup) {
@@ -588,13 +692,16 @@ function clashPatchRules(config, aiGroup, routeGroup, ownedAiNames, ownedSafeNam
   config.rules = ["NETWORK,UDP," + aiGroup, "NETWORK,UDP,REJECT"].concat(userOverrides, managed, remaining);
 }
 
-function clashPatchApply(config, profileName) {
+function clashPatchApply(config, profileName, usageProfile) {
   if (CLASH_PATCH_POLICY.version !== 1) return config;
   if (!clashPatchUsable(config)) return config;
   const patched = clashPatchClone(config);
   if (!Array.isArray(patched.rules)) patched.rules = [];
   const mainGroup = clashPatchDetectMain(patched);
   if (!mainGroup) return config;
+  const profile = [1, 2, 3].indexOf(usageProfile) !== -1 ? usageProfile : 3;
+  const cnProviderName = clashPatchCommonCn(patched, mainGroup);
+  if (profile < 3) return patched;
   const ownedNames = clashPatchOwnedManagedNames(patched);
   const existingAi = clashPatchExistingAiGroup(patched);
   let aiGroup;
@@ -616,16 +723,16 @@ function clashPatchApply(config, profileName) {
   patched.tun["auto-route"] = true;
   patched.tun["auto-detect-interface"] = true;
   patched.tun["strict-route"] = true;
-  clashPatchDns(patched, routeGroup, aiGroup, ownedNames.safe);
+  clashPatchDns(patched, routeGroup, aiGroup, ownedNames.safe, cnProviderName);
   clashPatchRules(patched, aiGroup, routeGroup, ownedNames.ai, ownedNames.safe);
   clashPatchRemoveOwnedManagedGroups(patched, ownedNames.ai.filter(function (name) { return name !== aiGroup; }).concat(ownedNames.safe));
   return patched;
 }
 
-function clashPatchTransform(config, profileName) {
-  const candidate = clashPatchApply(config, profileName);
+function clashPatchTransform(config, profileName, usageProfile) {
+  const candidate = clashPatchApply(config, profileName, usageProfile);
   if (candidate === config) return config;
-  const secondPass = clashPatchApply(clashPatchClone(candidate), profileName);
+  const secondPass = clashPatchApply(clashPatchClone(candidate), profileName, usageProfile);
   if (JSON.stringify(candidate) !== JSON.stringify(secondPass)) return config;
   return candidate;
 }
@@ -638,7 +745,8 @@ function clashPatchCompose(previousMain, config, profileName) {
 
 function main(config, profileName) {
   const previous = typeof clashPatchPreviousMain === "function" ? clashPatchPreviousMain : null;
-  return clashPatchCompose(previous, config, profileName);
+  const previousResult = previous ? previous(config, profileName) || config : config;
+  return clashPatchTransform(previousResult, profileName, CLASH_PATCH_USAGE_PROFILE);
 }
 
 if (typeof module !== "undefined" && module.exports) {

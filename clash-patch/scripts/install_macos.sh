@@ -210,11 +210,6 @@ if [ ! -d "/Applications/ClashX Meta.app" ] && [ ! -d "$HOME/Applications/ClashX
   finish 4 unsupported client_missing "没有找到受支持的 ClashX Meta。" install
 fi
 
-if [ "$PROFILE_SOURCE" != "saved" ] && [ "$USAGE_PROFILE" -ne 3 ]; then
-  save_profile
-  say "已保存用途档位 ${USAGE_PROFILE}。"
-fi
-
 if [ -n "$CUSTOM_PROFILE_DIR" ] && [ ! -d "$CUSTOM_PROFILE_DIR" ]; then
   say "没有找到指定的 ClashX Meta 配置目录。"
   finish 5 failed profile_directory_missing "没有找到指定的 ClashX Meta 配置目录。" install
@@ -229,19 +224,6 @@ fi
 remove_legacy_agent "$CURRENT_PLIST" "$CURRENT_LABEL" "$CURRENT_PATCHER"
 remove_legacy_agent "$LEGACY_PLIST" "$LEGACY_LABEL" "$LEGACY_PATCHER"
 
-if [ "$SAFE_UPDATE" -eq 0 ] && [ "$USAGE_PROFILE" -ne 3 ]; then
-  if [ "$PREVIOUS_PROFILE" = "3" ] && [ "$PROFILE_SOURCE" != "saved" ]; then
-    say "检测到从档位 3 改为轻量档位。安装程序不会覆盖后来产生的用户改动；请由本 skill 先运行安全卸载流程，并说明无法自动恢复的旧订阅增强。"
-  fi
-  if [ "$USAGE_PROFILE" -eq 1 ]; then
-    say "档位 1 只需要确认 ClashX Meta 的“设置为系统代理”已开启；未修改 TUN 或订阅。"
-  else
-    say "档位 2 只需要开启 TUN 并关闭 ClashX Meta 自己的系统代理开关；未修改订阅、DNS、WebRTC 或 AI 分组。"
-  fi
-  say "请由本 skill 使用 Computer Use 完成客户端开关和对应网站复测。"
-  finish 0 ok lightweight_profile_saved "用途档位已保存；未修改订阅。" install
-fi
-
 core_status=$(/usr/bin/ruby "$PATCHER_SOURCE" --print-core-status 2>/dev/null || true)
 if [ "$core_status" != "supported" ]; then
   case "$core_status" in
@@ -252,7 +234,7 @@ if [ "$core_status" != "supported" ]; then
   finish 8 unsupported mihomo_unavailable "Mihomo 内核不可用或版本不受支持。" core_status
 fi
 
-if [ "$PROFILE_SOURCE" != "saved" ] && [ "$USAGE_PROFILE" -eq 3 ]; then
+if [ "$PROFILE_SOURCE" != "saved" ]; then
   save_profile
   say "已保存用途档位 ${USAGE_PROFILE}。"
 fi
@@ -331,28 +313,28 @@ if [ -n "$CUSTOM_PROFILE_DIR" ]; then
     /usr/bin/ruby "$PATCHER_SOURCE" \
       --profile-dir "$CUSTOM_PROFILE_DIR" \
       --policy "$POLICY_SOURCE" \
-      --backup-dir "$BACKUP_DIR" --json >/dev/null ||
+      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE" --json >/dev/null ||
       finish 1 failed patch_failed "配置处理失败。" patch_profiles
   else
     /usr/bin/ruby "$PATCHER_SOURCE" \
       --profile-dir "$CUSTOM_PROFILE_DIR" \
       --policy "$POLICY_SOURCE" \
-      --backup-dir "$BACKUP_DIR"
+      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE"
   fi
 else
   if [ "$JSON_OUTPUT" -eq 1 ]; then
     /usr/bin/ruby "$PATCHER_SOURCE" \
       --policy "$POLICY_SOURCE" \
-      --backup-dir "$BACKUP_DIR" --json >/dev/null ||
+      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE" --json >/dev/null ||
       finish 1 failed patch_failed "配置处理失败。" patch_profiles
   else
     /usr/bin/ruby "$PATCHER_SOURCE" \
       --policy "$POLICY_SOURCE" \
-      --backup-dir "$BACKUP_DIR"
+      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE"
   fi
 fi
 
-say "本次为单次运行，只处理 ClashX Meta 当前存储位置中的订阅。"
+say "本次为单次运行；当前存储位置中的全部订阅都已使用同一套国内域名直连规则。"
 say "当前订阅需要修改时，会通过本地控制器自动刷新并检查；失败时补丁程序会恢复原配置。"
 say "脚本没有退出、停止或重启 ClashX Meta，也没有切换订阅、代理组或节点。"
 finish 0 ok install_completed "Clash Patch 处理完成。" install

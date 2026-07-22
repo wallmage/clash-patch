@@ -102,8 +102,12 @@ function Assert-JavaScriptCanCompose([string]$Text) {
     }
 }
 
-function Build-GlobalScript([string]$EnginePath, [string]$TargetPath) {
+function Build-GlobalScript([string]$EnginePath, [string]$TargetPath, [int]$UsageProfile) {
+    if ($UsageProfile -notin @(1, 2, 3)) { throw "用途档位无效。" }
     $engine = Get-Content -LiteralPath $EnginePath -Raw -Encoding UTF8
+    $profileMarker = "const CLASH_PATCH_USAGE_PROFILE = 3;"
+    if (-not $engine.Contains($profileMarker)) { throw "全局扩展脚本缺少用途档位标记。" }
+    $engine = $engine.Replace($profileMarker, "const CLASH_PATCH_USAGE_PROFILE = $UsageProfile;")
     $begin = "// CLASH PATCH BEGIN"
     $end = "// CLASH PATCH END"
     $prefix = ""

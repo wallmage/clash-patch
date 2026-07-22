@@ -48,6 +48,22 @@ class MacosWrapperTest < Minitest::Test
     end
   end
 
+  def with_supported_mihomo_installer
+    Dir.mktmpdir do |package|
+      scripts = File.join(package, "scripts")
+      FileUtils.mkdir_p(File.join(scripts, "macos"))
+      FileUtils.mkdir_p(File.join(package, "references"))
+      FileUtils.cp(INSTALLER, File.join(scripts, "install_macos.sh"))
+      FileUtils.cp(RESULT_CONTRACT, File.join(scripts, "macos", "result_contract.rb"))
+      File.write(
+        File.join(scripts, "macos", "patch_profiles.rb"),
+        "if ARGV.include?('--print-core-status'); puts 'supported'; end\nexit 0\n"
+      )
+      File.write(File.join(package, "references", "policy.json"), "{}\n")
+      yield File.join(scripts, "install_macos.sh")
+    end
+  end
+
   def assert_json_result(stdout, status, command:)
     result = JSON.parse(stdout)
     assert_equal REQUIRED_RESULT_FIELDS.sort, result.keys.sort
@@ -77,16 +93,18 @@ class MacosWrapperTest < Minitest::Test
   end
 
   def test_installer_json_mode_reports_saved_profile_without_extra_output
-    Dir.mktmpdir do |home|
-      with_supported_app(home) do
-        _stdout, _stderr, status = run_script(INSTALLER, "--profile", "1", home: home)
-        assert status.success?
+    with_supported_mihomo_installer do |installer|
+      Dir.mktmpdir do |home|
+        with_supported_app(home) do
+          _stdout, _stderr, status = run_script(installer, "--profile", "1", home: home)
+          assert status.success?
 
-        stdout, stderr, status = run_script(INSTALLER, "--show-profile", "--json", home: home)
-        assert status.success?
-        assert_empty stderr
-        result = assert_json_result(stdout, status, command: "install")
-        assert_equal 1, result.fetch("profile")
+          stdout, stderr, status = run_script(installer, "--show-profile", "--json", home: home)
+          assert status.success?
+          assert_empty stderr
+          result = assert_json_result(stdout, status, command: "install")
+          assert_equal 1, result.fetch("profile")
+        end
       end
     end
   end
@@ -132,36 +150,40 @@ class MacosWrapperTest < Minitest::Test
     end
   end
 
-  def test_profiles_one_and_two_are_saved_and_reused_without_patching_subscriptions
-    [1, 2].each do |profile|
-      Dir.mktmpdir do |home|
-        with_supported_app(home) do
-          stdout, _stderr, status, state = run_script(INSTALLER, "--profile", profile.to_s, home: home)
-          assert status.success?, stdout
-          assert File.file?(state)
-          assert_includes stdout, "已保存用途档位 #{profile}"
-          assert_includes stdout, "未修改"
+  def test_profiles_one_and_two_are_saved_and_apply_the_common_subscription_baseline
+    with_supported_mihomo_installer do |installer|
+      [1, 2].each do |profile|
+        Dir.mktmpdir do |home|
+          with_supported_app(home) do
+            stdout, _stderr, status, state = run_script(installer, "--profile", profile.to_s, home: home)
+            assert status.success?, stdout
+            assert File.file?(state)
+            assert_includes stdout, "已保存用途档位 #{profile}"
+            assert_includes stdout, "全部订阅都已使用同一套国内域名直连规则"
 
-          stdout, _stderr, status = run_script(INSTALLER, "--show-profile", home: home)
-          assert status.success?
-          assert_equal "#{profile}\n", stdout
+            stdout, _stderr, status = run_script(installer, "--show-profile", home: home)
+            assert status.success?
+            assert_equal "#{profile}\n", stdout
 
-          stdout, _stderr, status = run_script(INSTALLER, home: home)
-          assert status.success?, stdout
-          refute_includes stdout, "已保存用途档位"
+            stdout, _stderr, status = run_script(installer, home: home)
+            assert status.success?, stdout
+            refute_includes stdout, "已保存用途档位"
+          end
         end
       end
     end
   end
 
   def test_environment_profile_is_supported_but_invalid_environment_is_rejected
-    Dir.mktmpdir do |home|
-      with_supported_app(home) do
-        stdout, _stderr, status = run_script(
-          INSTALLER, home: home, extra_env: { "CLASH_PATCH_USAGE_PROFILE" => "1" }
-        )
-        assert status.success?, stdout
-        assert_includes stdout, "已保存用途档位 1"
+    with_supported_mihomo_installer do |installer|
+      Dir.mktmpdir do |home|
+        with_supported_app(home) do
+          stdout, _stderr, status = run_script(
+            installer, home: home, extra_env: { "CLASH_PATCH_USAGE_PROFILE" => "1" }
+          )
+          assert status.success?, stdout
+          assert_includes stdout, "已保存用途档位 1"
+        end
       end
     end
 
@@ -191,10 +213,7 @@ class MacosWrapperTest < Minitest::Test
     with_missing_mihomo_installer do |installer|
       Dir.mktmpdir do |home|
         with_supported_app(home) do
-          _stdout, _stderr, status = run_script(installer, "--profile", "1", home: home)
-          assert status.success?
-
-          stdout, _stderr, status = run_script(installer, "--safe-update", home: home)
+          stdout, _stderr, status = run_script(installer, "--safe-update", "--profile", "1", home: home)
           assert_equal 8, status.exitstatus
           assert_includes stdout, "没有找到可用的 Mihomo"
         end

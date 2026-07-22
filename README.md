@@ -1,51 +1,152 @@
 # Clash Patch
 
-Clash Patch 是给 AI 助手使用的网络补丁与诊断 Skill，支持 macOS 的 ClashX Meta 和 Windows 的 Clash Verge Rev。它包含 Patch 和 Diagnostics 两个模块。
+Clash Patch 是给 AI 助手使用的网络补丁与诊断 Skill，支持 macOS 的 ClashX Meta 和 Windows 的 Clash Verge Rev。它包含 Patch 和 Diagnostics 两个模块：Patch 按你选择的用途档位，只做该档位需要的最少配置改动；Diagnostics 从一句模糊的网络故障描述出发，主动复现、取证、修复并复测。
+
+本文档面向用户，说明它能做什么、怎么做、绝不会做什么。给代理执行的流程规定在 `clash-patch/SKILL.md`，更细的产品规则和全部状态文案以 `clash-patch/references/patch-policy.md` 为准。
+
+## 支持范围
+
+- macOS 上使用 Mihomo 内核的最新版 ClashX Meta；
+- Windows 上使用 Mihomo 内核的最新版 Clash Verge Rev；
+- 两个平台都要求 Mihomo 1.19.27 或更高版本。
+
+旧版 ClashX、旧版 Clash Verge、Linux 和其他客户端不受支持；找不到内核、版本过旧或无法确认内核能力时只检查、不修改，并建议升级到受支持的客户端。
 
 ## 安全原则
 
-**绝对不要退出、停止或重启 Clash 客户端。** 中国用户通常依靠 Clash 连接 Codex；客户端退出后，修复可能中断。
+**绝对不要退出、停止或重启 Clash 客户端。** 中国用户通常依靠 Clash 连接 AI 助手；客户端退出后，修复可能中断。所有脚本和流程都遵守这一原则，也不会建议或要求你这样做。
 
-补丁不会退出或重启 Clash。只在用户选择的档位明确要求时，通过客户端界面切换 TUN 或 Clash 自己的系统代理；不会改写第三方 PAC，也不会切换订阅、代理组或节点。唯一的第三方兼容操作是：在符合下述条件时，通过 AdGuard for Mac 自己的界面切换过滤模式。macOS 修改当前订阅后会自动刷新并检查，失败时恢复。
+其余红线：
+
+- 只有用户选择的档位明确要求时，才通过客户端自己的界面切换 TUN 或 Clash 自己的系统代理；绝不改写第三方 PAC，也不切换订阅、代理组或节点。唯一的第三方兼容操作是：在符合后述条件时，通过 AdGuard for Mac 自己的界面切换过滤模式。
+- 只处理客户端当前存储位置中的订阅；读不到存储模式、或多个 iCloud 容器无法通过当前订阅唯一判断时停止，不猜。
+- 每份候选配置都必须通过 YAML 重读、二次转换一致性检查和 Mihomo 校验（最长 30 秒）；任何一步失败都保留原文件。
+- 不安装永久监听、LaunchAgent、`WatchPaths`、计划任务或后台服务；只清理能确认属于旧版 Clash Patch 的遗留监听，无法确认所有权的服务保持不动并报告。
+- 一切输出都不包含订阅地址、密码、UUID、私钥、控制器密钥或完整节点地址。
+- macOS 修改当前订阅后会通过本地控制器自动刷新并检查运行状态，失败时恢复修改前的内容。
 
 ## 两个模块
 
-- **Patch**：首次使用时先了解用途，只做该用途需要的最少改动。
-- **Diagnostics**：用户只要描述网络哪里不对，AI 助手就从本机复现、读取系统与应用证据、验证不同解释、完成修复并针对原问题复测。
+- **Patch**：首次使用时先了解用途，只做该用途需要的最少改动。只有档位 3 或你明确要求完整安全增强时，才应用完整的 DNS、AI 分流和 UDP/WebRTC 防护。
+- **Diagnostics**：你只要描述网络哪里不对（变慢、打不开、不稳定、分流异常等），AI 助手就从本机复现、读取系统与应用证据、验证不同解释、完成修复并针对原问题复测。
 
-Diagnostics 不要求用户会看日志，也不会因为提到 Clash 就先改配置。有 Computer Use 时，AI 助手必须先在用户实际使用的应用里复现，再检查当前档位允许且与症状相关的证据；浏览器白屏时会把主文档网络耗时、关键资源和首次显示分开记录。预计超过 10 分钟、且有多路独立只读证据时，可以让 Sub Agent 并行取证，但所有写入和最终判断仍由主代理依次完成。怀疑某个扩展或共同网络组件时，既测异常目标，也测至少两个健康对照：只影响单站就修它们之间的交互，多个无关目标都慢就修共同组件，不逐站添加例外。连续两次判断无效后必须恢复试验并重新取证，没有新证据不做第三次修改。修复后回到同一应用和操作连续复测，并确认当前档位要求的能力没有变坏；不能只凭配置或命令行结果宣布完成。
+Diagnostics 不要求你会看日志，也不会因为提到 Clash 就先改配置：它默认只读，先取证后下结论。有 Computer Use 时，必须先在用户实际使用的应用里复现原始症状，再检查当前档位允许且与症状相关的证据；浏览器白屏时会把 DNS、主文档与关键资源的网络耗时、首次显示和加载结束分开记录。怀疑某个扩展或共同网络组件时，既测异常目标，也测至少两个健康对照：只影响单站就修它们之间的交互，多个无关目标都慢就修共同组件，不逐站添加例外。连续两次判断无效后必须恢复全部试验并重新取证，没有新证据不做第三次修改。修复后回到同一应用和操作连续复测，并确认当前档位要求的能力没有变坏；不能只凭配置或命令行结果宣布完成。详细工作方式见下文“Diagnostics 工作方式”。
 
-## 首次选择
+## 首次选择：用途档位
 
-第一次在一台电脑上配置时，Skill 会问：“你使用网络代理主要用于哪些用途？”选择会保存在本机，以后可以修改。
+第一次在一台电脑上配置时，Skill 会问：“你使用网络代理主要用于哪些用途？”选择会保存在本机，以后可以修改：
 
-1. **普通浏览**：Twitter、Facebook、YouTube 等。只确认“设置为系统代理”已开启，不改 TUN 和订阅；测试 Google、Twitter 和常用站点。
-2. **海外 AI**：ChatGPT、Codex、Gemini、Perplexity 等，不含 Claude。开启 TUN，关闭 Clash 自己的系统代理开关；按下述规则处理 AdGuard for Mac；不打 DNS、WebRTC 或 AI 分组补丁；测试普通站、ChatGPT、Gemini 和 Agent 联网。
-3. **Claude/Claude Code**：完成第二档后，关闭订阅自动更新，再应用全部 DNS、WebRTC、AI 分流和 UDP 防护，并测试 Claude。全局 UDP 会影响 QUIC、游戏、语音和视频；AI 节点建议台湾家宽优先、其次日本家宽，但不会自动替用户切节点。
+- macOS 保存在 `~/Library/Application Support/ClashPatch/usage-profile.plist`；
+- Windows 保存在 Clash Verge Rev 应用目录中的 `clash-patch-usage-profile.json`；
+- 两个文件都只记录版本号和数字档位，不含任何订阅信息。
 
-用户明确说要配置 Claude 或 Claude Code 时会直接选择或升级为第三档。从第三档降到第一、二档时会先安全卸载能确认属于本工具的持续补丁，再保存新选择；不会为了恢复旧设置覆盖用户后来的修改，无法可靠恢复的旧订阅增强会明确说明仍然保留。
+| 档位 | 用途 | 会做什么 | 明确不做 | 验收 |
+| --- | --- | --- | --- | --- |
+| **1｜普通浏览** | 国内站、Twitter、Facebook、YouTube 等 | 给当前存储位置中的全部订阅安装共同国内域名直连基线；用 Computer Use 确认 Clash 客户端的“设置为系统代理”已开启 | 不改 TUN、IPv6、WebRTC、AI 分组、节点或订阅自动更新 | 国内站、Google、Twitter 和一个你常用的站点能稳定打开 |
+| **2｜海外 AI** | ChatGPT、Codex、Gemini、Perplexity 等，不含 Claude | 继承共同国内域名直连基线；开启 TUN，关闭 Clash 客户端自己的系统代理开关；macOS 上按下述规则处理 AdGuard for Mac | 不增加 WebRTC 或 AI 分组补丁，不改节点或订阅自动更新 | 上一档验收 + ChatGPT、Gemini 和命令行/Agent 联网 |
+| **3｜Claude/Claude Code** | Claude 网页、Claude Code，或需要完整泄漏防护 | 先完成档位 2，由安装程序直接关闭订阅自动更新，再应用全部 DNS、WebRTC、AI 分流和 UDP 防护 | 不替你选择订阅、代理组或节点 | 上一档验收 + Claude、实时分流、DNS 深度测试和两项 WebRTC 测试 |
 
-档位同时约束 Patch 和 Diagnostics。以后遇到故障，Skill 会先读取这个选择：第一档只解决普通境外网站浏览，不检查 TUN、DNS 泄漏、WebRTC 或 AI；第二档再照顾 TUN、普通海外 AI 和 Agent 联网，但不增加泄漏防护；第三档的任何修复都要同时保护现有 DNS、WebRTC 和 AI 分流。网站打不开或变慢不会自动把用户升到更高档位。
+档位 2、3 关闭系统代理，是为了避免 Clash 同时用系统代理和 TUN 重复接管同一流量，不是为了隐藏代理；只关闭 Clash 客户端自己的开关，不会清除 AdGuard、企业代理或安全软件的设置。档位 3 的全局 UDP 会影响 QUIC、游戏、语音和视频；AI 节点建议台湾家宽优先、其次日本家宽，但只在聊天中建议，不会自动替你切节点。
+
+用户明确说要配置 Claude 或 Claude Code 时，会直接选择或升级为档位 3；明确说要配置其他海外 AI（不含 Claude）时选择档位 2；只是报告某个网站故障则进入 Diagnostics，不借机改档。
+
+### 改档与降档
+
+你可以随时改档。升档时只补新增能力。从档位 3 降到档位 1 或 2 时，先读取并记录旧档位，运行对应平台的安全卸载（macOS 用 `bash clash-patch/scripts/uninstall_macos.sh`，Windows 用 `.\clash-patch\scripts\uninstall_windows.cmd`），再保存并执行新选择。卸载只能撤销能确认属于本工具且之后没有被继续修改的设置，不会为了降档覆盖你后来的改动；无法可靠恢复的旧订阅增强会明确说明仍然保留，不会伪装成已经恢复。
+
+### 档位同时约束诊断
+
+已保存的档位同时约束 Patch 和 Diagnostics。以后遇到故障，Skill 会先读取这个选择：
+
+- 档位 1 维护全部订阅共同的国内域名直连基线，并保障普通境外网站通过系统代理稳定浏览；不检查或修改 TUN，不运行 DNS 泄漏、WebRTC 或 AI 检查。
+- 档位 2 增加 TUN、普通海外 AI 与 Agent 联网，但仍不做泄漏、WebRTC 或 AI 分组检查。
+- 档位 3 维护完整增强；任何修改共同网络路径的修复，都要复测本次改动可能影响的第三档能力，不能为解决一个网站破坏 DNS、分流或 WebRTC 防护。
+
+网站打不开或变慢不会自动把你升到更高档位；只有你明确增加用途时才改档。
+
+## 三档共同的国内域名直连基线
+
+三个档位都会把同一份 MetaCubeX ChinaMax `cn.mrs` 规则提供器应用到当前存储位置中的全部订阅，并让 DNS 与连接路由共同引用它：国内域名由阿里和 DNSPod 的大陆 IP DoH 解析，再命中 `DIRECT`。规则提供器每天由 Mihomo 更新；安全更新订阅后也会重新应用。显式用户域名规则和档位 3 的 AI 规则优先，受管国内规则位于宽泛 GEO、其他规则集与 `MATCH` 前。默认名称或缓存路径被用户占用时自动编号，不覆盖用户配置。
+
+这是一项第一档共享修复：国内网站或应用间歇性打不开、同步失败，而实时连接误命中海外代理时，修复的是所有订阅的国内域名识别，不为 Kimi、欧陆词典或其他单站添加例外。诊断会直接核对每份订阅的规则提供器、DNS 引用、路由引用与实时 `DIRECT` 连接。
+
+## 档位 3 的其余完整补丁
+
+档位 3 对当前存储位置中的订阅应用以下改动，全部改写都经过备份、校验和失败恢复：
+
+### TUN 与 IPv6
+
+- 打开配置中的 TUN：`stack: system`、DNS 劫持（`any:53` 与 `tcp://any:53`）、`auto-route`、`auto-detect-interface`、`strict-route`。
+- 关闭配置中的 IPv6（顶层和 `dns` 内都关闭）。
+
+### DNS 按出站分流
+
+- 国内域名：共同基线的 `rule-set:<受管名称>` 负责主要识别，`geosite:cn` 作为档位 3 后备；两者都使用阿里（`223.5.5.5`）和 DNSPod（`1.12.12.12`）的大陆 IP DoH，并通过 `DIRECT` 连接。`direct-nameserver` 使用同一组大陆 DoH，并关闭 `direct-nameserver-follow-policy`。
+- 普通国外域名：继续使用通过原主代理组访问的 IP DoH（AdGuard 的两个非过滤地址 `94.140.14.140/141` 和 TWNIC Quad 101 `101.101.101.101`）。
+- AI 域名：改用通过 AI 分组访问的同一套 IP DoH，让 AI 的解析请求和网页连接使用同一个 AI 出口。
+- 所有受管查询都走 HTTPS、直接连接解析器 IP（无需先解析解析器域名）、不发送 ECS；明文 DNS、跳过证书校验（`skip-cert-verify`）或发送客户端子网（`ecs`/`ecs-override`）的解析器会被替换为受管 DoH。
+- 保留 `default-nameserver` 和 `proxy-server-nameserver` 的用户值（节点启动解析属于网络启动边界）；只有字段缺失或仍是旧版补丁写入的危险固定值（`1.1.1.1`/`8.8.8.8` 组合）时才迁移为 `system`。绝不把节点启动解析改成可能被阻断的境外地址。
+- 直连 DoH 会让阿里或 DNSPod 看到国内域名查询，但本地运营商只能看到加密的 HTTPS 连接；这属于受管的分流，不是意外泄露。
+
+### 主代理组与 AI 分组
+
+- 主代理组按顺序识别：最后一个 `MATCH` 指向的非 `DIRECT` 可选组 → 被宽泛规则（`MATCH`、`GEOIP`、`GEOSITE` 或广域 `RULE-SET`）引用超过一次的可选组 → 常见名称（`Proxy`、`Final`、`节点选择` 等）→ 第一个非纯 `DIRECT` 的 `select` 组。AI 命名的组在任何一步都不会成为主组；找不到时保持原文件不变，不会猜单个节点。
+- 已有可选 AI 分组时（名称含独立的 `AI`、`OpenAI`、`人工智能` 或 `🤖 AI`）直接复用：成员、顺序、图标和当前选择全部保持原样，只补全规则。
+- 没有 AI 分组时创建独立选择器「🤖 AI · Clash Patch」，加入订阅的全部真实节点和全部代理提供者；名称被占用时自动编号；找不到任何可用节点或代理提供者时不创建空组，保持原文件并说明原因。
+- 不创建额外的安全代理分组，也不替你选择节点；从旧版补丁升级时，会删除能确认属于旧版的安全代理分组，并把旧补丁 AI 组迁移为上述独立节点选择器。
+- AI 分组的意义是让普通流量和 AI 流量分开选路：主代理组可以选低倍率节点浏览、下载和看视频，AI 分组可以单独选信誉更好的家宽节点。
+
+### AI 规则
+
+规则的唯一数据来源是 `clash-patch/references/policy.json`（Windows 脚本内嵌的同一份策略由生成器写入并受一致性测试约束），覆盖：
+
+- Anthropic 与 Claude：应用、内容、MCP 和静态服务域名，以及官方公布的入站 IPv4 `160.79.104.0/23` 与 IPv6 `2607:6bc0::/48`（带 `no-resolve`）；
+- OpenAI、ChatGPT、Codex 使用的域名，含实时语音、静态资源、上传和明确属于 OpenAI 的验证服务；
+- Google AI 与 Gemini 域名；外加 `DOMAIN-KEYWORD,openai` 后备规则。
+
+明确不把 `raw.githubusercontent.com`、`storage.googleapis.com` 以及 `sentry.io`、`auth0.com`、`segment.io`、Stripe、Cloudflare Challenge 等共享服务整体交给 AI 组；`ai.com` 属于无关产品，也不会加入。AI 明确规则排在国内直连、GEO、所有 `RULE-SET` 和 `MATCH` 之前；你明确写给其他非主代理目标的同键规则保持原目标，并排在补丁规则之前；订阅里把 AI 域名交给主代理组的通用规则会被替换，避免 AI 流量绕过独立分组。
+
+### UDP 与 WebRTC 防护
+
+规则列表最前面依次放置 `NETWORK,UDP,<AI 分组>` 和 `NETWORK,UDP,REJECT`：所有 UDP（包括 HTTP/3/QUIC 和 WebRTC）统一交给 AI 分组，不会回到本地直连；所选节点不支持 UDP 时命中拒绝兜底，补丁会如实报告而不是假装通过。AI 分组的当前选择必须是代理节点，不能是 `DIRECT`；补丁不会替你切换分组或节点。
+
+同一个浏览器既能打开国内网站，也能打开 Claude 或 ChatGPT。WebRTC 连接只显示它要访问的 STUN 服务器，Clash 无法知道它来自哪个标签页，因此不能按浏览器应用或 AI 域名单独处理 WebRTC，UDP 规则必须覆盖全局——这也会影响 QUIC、游戏、语音和视频通话。国内网页的 DNS 和 TCP 仍按域名直连；如果浏览器使用 QUIC，这部分 UDP 会经过 AI 分组。这是共享浏览器中避免 WebRTC 直连所需的取舍。
+
+### REALITY 与其他保护
+
+- macOS 会保护已有且格式有效的 REALITY `short-id` 文本：不补齐、不截断、不猜测缺失值；Windows 脚本不处理该字段。
+- 订阅用 YAML 1.2 核心类型读取，`yes`、`on`、`0123`、`1:20` 和日期保持文本；多文档 YAML、循环别名和超出安全递归深度的文件按无效内容跳过，不影响同批其他订阅。
+- 候选写回前会重新解析并再次执行完整转换；二次转换仍报告变化（补丁不具备幂等性）时，保留原文件并标记“已跳过：二次转换不一致”。
+
+## Diagnostics 工作方式
+
+Diagnostics 默认只读，按下面的闭环工作，每一步都受当前档位约束：
+
+1. **把描述变成可观察的症状**：从原话中提取目标、动作、开始时间、频率和预期表现；能从本机直接读取的信息不会让你回答。
+2. **记录基线并复现**：记录时间、操作系统、活动网络、原始症状和已保存档位；有 Computer Use 且症状能在界面看到时，必须用你实际使用的应用、账号、目标和动作在修改前复现——`curl` 或配置检查只能作为分层证据，不能替代原场景。
+3. **缩小影响范围**：用范围矩阵判断是单个目标、一个应用、当前设备、当前网络还是共同路径——至少包含异常目标的单变量开关对照，以及至少两个健康对照在可疑组件开启时的表现。只有异常目标受影响就先查目标与组件的交互；健康对照也出现同类故障才修共同组件本身，不逐站加例外。
+4. **管理假设**：每个候选解释记录支持证据、反证和状态（已确认、有力支持、尚未证实、已排除）；关键判断至少需要第二种独立证据，并主动寻找反证。配置缺陷不等于故障原因。
+5. **修复**：一次只改变一个变量，保留修复前状态和恢复方法；与原始症状无关但值得保留的增强会单独说明，不冒充修复。涉及节点、代理组、订阅或 TUN 时仍遵守上面的安全原则。
+6. **复测**：用同一应用、目标和动作比较修改前后结果，并确认健康对照没有变坏；间歇性问题覆盖足够长的观察窗口，没有再次复现时写“暂未复现，观察中”，不写“已修复”。
+
+防线与协作规则：
+
+- 连续两次假设或修改未改善原始症状，立即执行诊断重置：停止试改、恢复全部未生效的试验、重新列出已确认/已排除/未知项；没有新证据不进行第三次修改。
+- 历史证据不足时，自动建立有开始时间、结束时间和采样间隔的观察窗口，不让用户决定该查哪个日志；问题再次出现后按时间线关联证据并关闭观察。
+- 多个无关目标都在内容开始传输前出现相同等待时，只盘点当前档位允许的接管层（档位 1 不检查 VPN/TUN）；用时间线和单变量切换证明重叠接管后做职责分层，同一流量层只保留一个透明接管者；无改善立即恢复原设置。
+- 预计超过 10 分钟且存在彼此独立的只读证据来源时，可以让多个 Sub Agent 并行取证；Sub Agent 只返回带时间戳的脱敏事实，所有写入、更新、恢复和最终判断仍由主代理串行完成。
+- 单项 Clash 配置修复留在 Diagnostics，只复用 Patch 的备份、候选校验、刷新和失败恢复机制；完整补丁只属于档位 3，不会伪装成单项修复。Windows 客户端正在运行时不修改当前运行配置，此类修改只能报告“已更新，尚未生效”，等待客户端以后正常加载或刷新。
+- 本机无法修复时，按已确认的问题类别在线搜索当前官方或第一方资料，并整理成可以直接照做的方案。
+
+最终用简体中文说明：发生了什么、证据、为什么会这样、做了什么、复测结果和仍未确认之处。
 
 ## AdGuard for Mac 兼容
 
-第二、三档会在开始和日常诊断时检查 AdGuard for Mac。发现 Clash TUN 与 AdGuard 的 `Network Extension` 同时接管网络时，Skill 直接走已验证的兼容路径：保留 Clash TUN，在 AdGuard 自己的界面中改为“自动代理”，然后复测至少三个无关网站、Safari 和 Chrome 的广告过滤，以及当前档位可能受影响的能力；不逐站添加例外。这个改动不是升档，也不会触发额外的 DNS、WebRTC 或 AI 补丁。
+档位 2、3 会在开始和日常诊断时检查 AdGuard for Mac。发现 Clash TUN 与 AdGuard 的 `Network Extension` 同时接管网络时，Skill 直接走已验证的兼容路径（这也是 [AdGuard 官方对部分 VPN 冲突的建议](https://adguard.com/kb/adguard-for-mac/solving-problems/big-sur-issues/)）：保留 Clash TUN，通过 Computer Use 在 AdGuard 自己的界面中改为“自动代理”，然后复测至少三个无关网站、Safari 和 Chrome 的广告过滤，以及当前档位可能受影响的能力；不逐站添加例外。这个改动不是升档，也不会触发额外的 DNS、WebRTC 或 AI 补丁。
 
-“自动代理”仍能过滤遵守系统代理的浏览器；不使用系统代理的非浏览器应用可能不再被 AdGuard 覆盖。第一档依赖 Clash 系统代理，不能让 AdGuard 再占用同一个系统代理位置，因此不会盲目套用第二、三档的组合。Windows 也不会照搬 macOS 模式。修改只能通过 AdGuard 界面完成；不得改写 PAC、直接编辑设置、停用或卸载 AdGuard。若切换后原始等待没有改善或过滤范围不符合用户需要，立即恢复原模式并继续取证。
+“自动代理”仍能过滤遵守系统代理的浏览器；不使用系统代理的非浏览器应用可能不再被 AdGuard 覆盖，修改前会向你说明。档位 1 依赖 Clash 系统代理，不能让 AdGuard 再占用同一个系统代理位置，因此不会盲目套用档位 2、3 的组合；Windows 的过滤机制不同，也不会照搬。修改只能通过 AdGuard 界面完成；不得改写 PAC、直接编辑设置、停用或卸载 AdGuard。仅检测到 AdGuard 不能证明当前故障由它造成；若切换后原始等待没有改善或过滤范围不符合你的需要，立即恢复原模式并继续取证。
 
-## 第三档补丁内容
-
-- 打开配置中的 TUN、DNS 劫持、自动路由和严格路由，关闭配置中的 IPv6。
-- 国内域名由 `geosite:cn` 交给阿里和 DNSPod 的大陆 IP DoH，并通过 `DIRECT` 连接，避免 Fake-IP 初次解析随代理节点位置获得境外 CDN。
-- 普通国外域名继续使用通过原主代理组访问的 IP DoH；AI 域名改用通过 AI 分组访问的 IP DoH。所有受管查询均加密，不使用 ECS。
-- 保留节点启动解析；缺失或仍是旧版危险固定值时才改用系统 DNS。原有 `direct-nameserver` 会替换为受管的大陆 DoH。
-- 已有 AI 分组时保留成员和选择，只补全 OpenAI、ChatGPT、Codex、Claude、Anthropic、Gemini 等规则。
-- 没有 AI 分组时创建独立选择器，加入订阅的全部真实节点和代理提供者。普通流量继续使用主代理组，AI 流量可以单独选择家宽节点。
-- 不创建额外的安全代理分组，也不替用户选择节点。家宽通常更适合 AI；有台湾家宽时优先台湾，没有时可考虑日本。
-- 所有 UDP（包括 HTTP/3/QUIC 和 WebRTC）统一交给 AI 分组；AI 分组当前选择不能是 `DIRECT`。代理不支持 UDP 时连接会失败，不会改走本地直连。
-- macOS 会保护已有且有效的 REALITY `short-id` 文本；Windows 脚本不处理该字段。
-
-同一个浏览器既能打开国内网站，也能打开 Claude 或 ChatGPT。WebRTC 连接只显示它要访问的 STUN 服务器，Clash 无法知道它来自哪个标签页，因此不能按浏览器应用或 AI 域名单独处理 WebRTC。UDP 规则必须覆盖全局，也会影响 QUIC、游戏、语音和视频通话。国内网页的 DNS 和 TCP 仍按域名直连；如果浏览器使用 QUIC，这部分 UDP 会经过 AI 分组。这是共享浏览器中避免 WebRTC 直连所需的取舍。
+非浏览器应用偶发证书身份错误时会走另一条已知诊断：如果系统日志证明该应用经本机 AdGuard 自动代理发生 TLS 信任失败，而同一服务器直连证书正常，则不会点击忽略证书的“继续”，不会加 Apple/iCloud 规则，也不会归咎于订阅节点。修复只通过 AdGuard 界面调整应用过滤范围或排除不兼容的非浏览器应用，并用原应用、Safari/Chrome 广告过滤和当前档位能力复测；无改善就恢复。
 
 ## 安装
 
@@ -69,48 +170,68 @@ bash clash-patch/scripts/install_macos.sh --profile N
 .\clash-patch\scripts\install_windows.cmd -UsageProfile N
 ```
 
-两个平台都必须让 Clash 保持运行。所有公开命令都支持 JSON v1：macOS 加 `--json`，Windows 加 `-Json`。不加参数时仍输出原来的中文说明；开启后，标准输出只有一个 JSON 对象，`exit_code` 与进程退出码一致，`code` 和 `operation` 是稳定的机器标识。`command` 只会是 `install`、`uninstall`、`patch` 或 `verify_routes`，字段及类型以 [`clash-patch/references/result-contract.json`](clash-patch/references/result-contract.json) 为准。机器输出不会包含订阅 URL、密钥、完整本机路径或节点名称；AI 助手调用脚本时优先读取 JSON，不从中文句子猜状态。
+前置条件：两个平台都必须让 Clash 保持运行。macOS 请用当前登录用户直接运行（不要 sudo 或 root），需要系统 Ruby 和已安装的 ClashX Meta；Windows 需要安装并打开过 Clash Verge Rev。不带参数再次运行安装程序时，按已保存的档位执行。
 
-## 平台机制
+### 公开命令
 
-### macOS
+- macOS 安装器：`--profile N`（保存并执行档位）、`--show-profile`（读取已保存档位，未保存时输出 `unset`）、`--safe-update`（安全更新全部远程订阅）、`--json`。
+- macOS 补丁程序 `scripts/macos/patch_profiles.rb`：`--dry-run`（只预览不写入）、`--no-reload`（只更新文件不刷新）、`--list-backups`、`--compare-backup ID`、`--restore-backup ID --expected-current-sha256 SHA256`、`--snapshot-initial`、`--print-core-status`、`--print-tun-state` 等；完整列表见 `--help`。
+- Windows 安装器：`-UsageProfile N`、`-ShowUsageProfile`、`-SnapshotProfiles`、`-VerifySafeUpdate`、`-ListBackups`、`-CompareBackup ID`、`-RestoreBackup ID -ExpectedCurrentSha256 SHA256`、`-AppHome`（指定应用目录）、`-MihomoPath`（指定内核路径）、`-Json`。
+- 分流验证：macOS 运行 `ruby clash-patch/scripts/macos/verify_routes.rb`；Windows 运行 `powershell.exe -NoProfile -File clash-patch/scripts/windows/verify_routes.ps1`（默认连接 `http://127.0.0.1:9097`，可用 `-ControllerUrl`、`-Secret`、`-MainGroup`、`-AiGroup` 调整）。
 
-公开入口和参数保持兼容，内部实现按配置转换、备份与事务、Mihomo 校验、订阅识别、安全更新、运行状态和命令行输出拆开。第一、二档只保存选择，不改订阅。第三档由安装程序直接关闭自动更新：把 ClashX Meta 的 `kAutoUpdateEnable` 设为 `0`，回读确认后才继续；不依赖 Computer Use。原值为开启时，修改前状态会保存为带日期的私密备份；已经关闭时不重复写。安装程序单次运行，只处理当前使用的本地目录或 iCloud 容器。每份顶层 YAML 都经过 YAML 1.2 读取、二次转换和 Mihomo 校验，最长等待 30 秒。第一次运行保存初始快照；以后每次写入前都创建带日期时间的版本化备份。当前订阅写入后通过本地控制器自动刷新，清除旧 Fake-IP 与 DNS 缓存，再检查运行状态；任一步失败都会恢复修改前的内容。
+### JSON v1 机器输出
 
-macOS 不安装永久监听、LaunchAgent、`WatchPaths` 或计划任务。安装程序只会删除能确认属于旧版 Clash Patch 的遗留监听。
+所有公开命令都支持 JSON v1：macOS 加 `--json`，Windows 加 `-Json`。不加参数时输出中文说明；开启后，标准输出只有一个 JSON 对象，`exit_code` 与进程退出码一致，`code` 和 `operation` 是稳定的机器标识，`command` 只会是 `install`、`uninstall`、`patch` 或 `verify_routes`，字段及类型以 [`clash-patch/references/result-contract.json`](clash-patch/references/result-contract.json) 为准。机器输出经过统一脱敏，不会包含订阅 URL、密钥、完整本机路径或节点名称；AI 助手调用脚本时优先读取 JSON，不从中文句子猜状态。
 
-### Windows
+常见退出码：`0` 成功；`1` 操作失败（已恢复或保持原样）；`2` 平台或客户端不受支持；`6` 安装包不完整；`10` 尚未选择用途档位；`64` 参数错误。macOS 安装器另有：`3` 缺系统 Ruby、`4` 找不到 ClashX Meta、`5` 找不到指定配置目录、`7` 档位保存位置不安全、`8` Mihomo 不可用或版本过旧、`9` 无法关闭订阅自动更新。Windows 安装器另有：`3` 安装包不完整（缺少全局扩展脚本）。
 
-第一、二档不会安装全局扩展脚本。第三档直接修改 Clash Verge Rev 的 `profiles.yaml`，把每个远程订阅的 `option.allow_auto_update` 设为 `false`；本地配置和其他订阅选项保持不变。修改前备份，写入后逐项回读确认，不依赖 Computer Use。随后使用全局扩展脚本 `profiles/Script.js`，在用户主动加载或刷新订阅时应用补丁，不需要计划任务或后台服务。Windows Computer Use 已在 2026 年 7 月提供；当前会话实际启用时，它与 macOS 一样负责界面开关、原应用复现和浏览器验收，但只能操作前台桌面，设备必须保持解锁。
+## macOS 平台机制
 
-客户端运行时只更新全局脚本和订阅清单中的自动更新字段，不碰 `verge.yaml`、`config.yaml` 或当前运行配置；客户端原本没有运行时，安装程序才事务式更新应用级 TUN 设置。脚本不会结束 Clash 进程。
+公开入口和参数保持兼容，内部实现按配置转换、备份与事务、Mihomo 校验、订阅识别、安全更新、运行状态和命令行输出拆开。
+
+- 安装程序单次运行，只处理当前使用的本地目录（`~/.config/clash.meta`）或当前 iCloud 容器；只枚举客户端实际使用的顶层 `.yaml`/`.yml`，排除旧 iCloud 容器、缓存、备份、日志和临时文件。`config.yaml` 是 ClashX Meta 的默认基础配置，不会被删除；当前选择其他订阅时安静跳过它。
+- 三个档位的安装程序都检查 Mihomo，并把共同国内域名直连基线写入当前存储位置中的全部订阅。档位 1、2 不增加 TUN、IPv6、WebRTC 或 AI 分组设置，也不改自动更新。档位 3 额外把 ClashX Meta 的 `kAutoUpdateEnable` 设为 `0`，回读确认后才继续。
+- 每份顶层 YAML 都经过 YAML 1.2 读取、二次转换和 Mihomo 校验，最长等待 30 秒。第一次运行保存初始快照；以后每次写入前都创建带日期时间的版本化备份（独占创建，目录权限 `700`、文件权限 `600`），保存在 `~/Library/Application Support/ClashPatch/backups`。
+- 写入有并发保护：文件加独占锁，校验或写入期间订阅被客户端刷新会重新读取并重试，连续变化则跳过该份并标记稍后重试；符号链接订阅写入真实目标，不用重命名替换符号链接本身。
+- 当前订阅写入后通过本地控制器自动刷新（`PUT /configs?force=true`），依次清除旧 Fake-IP 与 DNS 缓存，再检查 TUN 仍启用、原有代理组选择没有变化、国内和境外 DNS 查询成功、外网可连接；任一步失败都在当前进程内恢复修改前的内容，候选已被内核采用时再次加载原配置。不调用 AppleScript，不切换 TUN、订阅、代理组或节点。
+- 不安装永久监听、LaunchAgent、`WatchPaths` 或计划任务；只删除能通过 `Label` 和启动参数确认属于旧版 Clash Patch 的遗留监听（`com.clashpatch.profiles`、`com.wallny.clash-profile-patcher`）。
+
+## Windows 平台机制
+
+- 三个档位都会安装全局扩展脚本并写入数字档位，让每份订阅加载时使用共同国内域名直连基线。档位 1、2 只运行共同基线；档位 3 才修改 Clash Verge Rev 的 `profiles.yaml`，把每个远程订阅的 `option.allow_auto_update` 设为 `false`，并追加完整增强。
+- 补丁通过全局扩展脚本 `profiles/Script.js` 生效：之后每次加载或刷新订阅，客户端都会运行它并应用与 macOS 相同的策略（含二次转换一致性检查，不一致时返回原配置）。已有同步 `main` 的脚本会先改名保留、与补丁组合（先运行原脚本，再应用补丁）；检测到异步 `main`、递归 `main` 或补丁保留标识符时拒绝组合，原文件不被修改。
+- 客户端正在运行时，安装程序只更新全局脚本和 `profiles.yaml` 中的自动更新字段，不碰 `verge.yaml`、`config.yaml` 或当前运行配置；补丁内容等待各订阅随后正常加载或刷新时生效，此时只能写“已更新，尚未生效”。
+- 客户端原本没有运行时，安装程序才事务式更新应用级设置：`verge.yaml` 的 `enable_tun_mode` 设为 `true`、`enable_dns_settings` 设为 `false`，`config.yaml` 关闭 `ipv6` 并写入托管 TUN 块（保留非托管的 TUN 设置和行内注释）；同时把两份文件的原始字节和安装后哈希写入本地安装状态文件，供卸载核对。全部目标先备份再写入，任一失败整体回滚。
+- 每次写入前都创建带日期时间的版本化备份，保存在应用目录的 `clash-patch-backups`；备份停止继承目录权限，只允许当前用户、SYSTEM 和 Administrators 访问。
+- 脚本不会结束 Clash 进程。Windows Computer Use 已在 2026 年 7 月提供；当前会话实际启用时，它与 macOS 一样负责界面开关、原应用复现和浏览器验收，但只能操作前台桌面，设备必须保持解锁，不能操作 UAC 或管理员授权窗口。
 
 ## 安全更新
 
-用户要求“更新节点”或“更新订阅”时，Skill 会更新当前存储位置中的全部远程订阅，而不是只更新当前使用的一份。
+用户要求“更新节点”或“更新订阅”时，Skill 会更新当前存储位置中的全部远程订阅，而不是只更新当前使用的一份。安全更新是单次、由用户主动触发的操作；档位 3 继续关闭自动更新且不依赖 Computer Use，档位 1、2 不额外修改自动更新设置。每次写入前都会留下带日期时间的备份。
 
-- macOS 使用 `bash clash-patch/scripts/install_macos.sh --safe-update`。先下载并校验全部候选；档位 3 给每份候选重打完整补丁，档位 1、2 不增加第三档改动。只有全部成功才统一替换，任一份失败时尝试全部恢复；恢复本身出错会明确报告受影响订阅，不会误报“全部保持原样”。
-- Windows 先运行 `.\clash-patch\scripts\install_windows.cmd -SnapshotProfiles` 核对并备份全部远程订阅，再通过 Clash Verge Rev 的“全部更新”处理；随后运行 `-VerifySafeUpdate` 逐份检查 YAML、Mihomo 和自动更新状态，失败时恢复更新前文件。恢复前会独占文件并再次核对 SHA-256；发现订阅又被刷新时不覆盖新内容，保留清单并明确报告。文件恢复后仍会单独检查运行内核，不会把两者混为一谈。档位 3 的全局脚本会在每份加载时重打补丁。
-- 每次写入前都会留下带日期时间的备份。网络在某次改动后异常时，Skill 会先做当前配置与备份的配置差异比较；确需回滚时先备份当前版本，再校验目标和当前 SHA-256，失败时恢复回滚前版本。
-- 安全更新是单次、由用户主动触发的操作。档位 3 始终保持自动更新关闭；档位 1、2 不额外修改自动更新设置。
+- **macOS**：运行 `bash clash-patch/scripts/install_macos.sh --safe-update`。在内存中下载全部远程订阅（订阅地址只经标准输入交给 `curl`，不会出现在进程参数、日志或错误提示中；只接受 HTTPS 成功响应和有效 UTF-8 YAML）。三个档位都给每份候选重打共同国内域名直连基线；档位 3 再应用完整补丁，档位 1、2 不增加第三档改动。只有全部候选通过 YAML 重读、二次转换和 Mihomo 校验、且当前文件哈希仍与读取时一致，才在锁内统一替换；任一份失败时尝试全部恢复，恢复本身出错会逐份明确报告，不会误报“全部保持原样”。更新后刷新当前订阅并复核运行状态，失败时整批回滚。
+- **Windows**：先运行 `.\clash-patch\scripts\install_windows.cmd -SnapshotProfiles` 核对每个远程订阅与本地文件一一对应、建立脱敏清单并逐份备份（存在尚未验收的清单时必须先完成验收，不会覆盖）；再通过 Clash Verge Rev 界面的“全部更新”处理，没有该入口时逐份触发，但必须覆盖清单中的每一份。随后运行 `-VerifySafeUpdate` 逐份检查 YAML、Mihomo 和自动更新状态；失败时在独占文件期间再次核对 SHA-256，只恢复没有再次变化的文件——发现订阅又被刷新时不覆盖新内容，保留清单并明确报告。文件恢复后仍会单独检查运行内核，不会把文件恢复冒充运行状态恢复；档位 3 的全局脚本会在每份订阅随后加载时重打补丁。
+- 网络在某次改动后异常时，Skill 会先做当前配置与备份的配置差异比较；确需回滚时先备份当前版本，再校验目标和当前 SHA-256，失败时恢复回滚前版本。
 
 ## 配置历史与恢复
 
-第一次运行会保存初始快照；以后每次写入前都会保存带日期时间的修改前版本，历史备份不会被下一次操作覆盖。用户说“昨天改完今天变慢”时，Skill 会先列出备份，选择症状出现前最近的一份，只比较发生变化的字段名和文件哈希，不显示节点、订阅地址或其他配置值。时间只能帮助选择候选，不能单独证明某项改动造成故障。
+第一次运行会保存初始快照；以后每次写入前都会保存带日期时间的修改前版本，历史备份不会被下一次操作覆盖，卸载也不会删除备份。
 
-只有配置差异与现场证据相符时才恢复。恢复前会确认当前文件仍与比较时相同，并再备份一次当前版本；恢复后回到原应用和原操作复测。没有改善或验收失败时恢复回滚前版本。Windows 客户端正在运行时不会为了回滚而结束它，只完成安全比较并说明当前不能自动恢复。
+用户说“昨天改完今天变慢”时，Skill 会先列出备份（macOS `--list-backups`，Windows `-ListBackups`），选择症状出现前最近的一份，先做配置差异比较（`--compare-backup ID` / `-CompareBackup ID`）：只报告发生变化的字段名和文件 SHA-256，不显示节点、订阅地址或其他配置值。时间只能帮助选择候选，不能单独证明某项改动造成故障。
+
+只有配置差异与现场证据相符时才恢复。恢复（`--restore-backup ID --expected-current-sha256 SHA256` / `-RestoreBackup ID -ExpectedCurrentSha256 SHA256`）前先校验备份内容、确认当前文件仍与比较时相同，并再备份一次当前版本；恢复后回到原应用和原操作复测，没有改善或验收失败时恢复回滚前版本。Windows 客户端正在运行时不会为了回滚而结束它，只完成安全比较并说明当前不能自动恢复。
 
 ## 第三档验证
 
-先检查实时分流：macOS 使用 `scripts/macos/verify_routes.rb`，Windows 使用 `scripts/windows/verify_routes.ps1`。国内网站应获得大陆 CDN 并经过 `DIRECT`；Google 应经过主代理组当前节点；OpenAI、Anthropic 和 Claude 应经过 AI 分组当前节点。然后测试：
+先检查实时分流：macOS 使用 `scripts/macos/verify_routes.rb`，Windows 使用 `scripts/windows/verify_routes.ps1`。两者都通过 Mihomo 的 `/proxies` 与 `/connections` 实时记录验证：国内网站应获得大陆 CDN 并经过 `DIRECT`；Google 应经过主代理组当前节点；OpenAI、Anthropic 和 Claude 应经过 AI 分组当前节点；任何分组当前选择为 `DIRECT` 都判失败。只看配置文件或网页出口 IP 不足以证明分流正确。然后测试：
 
 1. [IPInfo WebRTC 检测](https://ipinfo.cv/webrtc-check)
 2. [DNS 泄漏检测](https://ip.net.coffee/dns/)：点击“深度测试”
 3. [IP Coffee WebRTC 检测](https://ip.net.coffee/webrtc/)
 
-这些第三方页面会收到浏览器公网 IP。有 Computer Use 时由 AI 助手自动打开并完成测试；没有时按聊天中的中文步骤手动测试并把红色结果截图发回。三项都没有红色提示，且没有未代理公网 IP、私网地址或本地运营商 DNS，才能说验证通过。
+这些第三方页面会收到浏览器公网 IP，但不会上传订阅、节点密码或配置文件；你可以拒绝使用，结果写成“未验证”。有 Computer Use 时由 AI 助手自动打开并完成测试；没有时按聊天中的中文步骤手动测试并把红色结果截图发回。三项都没有红色提示，且没有未代理公网 IP、私网地址或本地运营商 DNS，才能说验证通过。档位 1、2 不运行这些泄漏检查，也不会因此被判为失败。
 
-## 卸载与隐私
+## 卸载
 
 ```bash
 bash clash-patch/scripts/uninstall_macos.sh
@@ -120,6 +241,25 @@ bash clash-patch/scripts/uninstall_macos.sh
 .\clash-patch\scripts\uninstall_windows.cmd
 ```
 
-卸载不要求关闭客户端，也不会删除备份。输出不包含订阅地址、密码、UUID、私钥、控制器密钥或完整节点地址。遇到问题时只发送错误提示和测试截图，不要发送整份订阅。
+卸载不要求关闭客户端，也不会删除备份。
+
+- macOS：移除安装文件和能确认所有权的旧版监听；能确认安装前状态时恢复 TUN 启动偏好，无法确认时保留当前值并明确说明。订阅里的 DNS、WebRTC 和 AI 设置不会自动撤销，卸载输出会如实说明。
+- Windows：移除 `Script.js` 中的补丁块并恢复你原有的 `main`；客户端未运行时，按安装状态文件把 `config.yaml`、`verge.yaml` 逐字节恢复到安装前状态——检测到安装后有新改动时保留当前文件不覆盖，并保留状态文件供你手动处理；客户端正在运行时只移除补丁块，应用设置保持不动。
+
+## 隐私
+
+- 输出不包含订阅地址、密码、UUID、私钥、控制器密钥或完整节点地址；机器输出额外对 URL、凭据和本机路径做递归脱敏。
+- 配置差异比较只输出字段路径和哈希，不输出配置值；订阅地址在安全更新中只经标准输入传递，不进入进程参数和日志。
+- 备份只保存在本机：macOS 为仅当前用户可读写（`600`/`700`），Windows 仅当前用户、SYSTEM 和 Administrators 可访问。
+- 遇到问题时只发送错误提示和测试截图，不要发送整份订阅。
+
+## 限制与边界
+
+- 不支持旧版 ClashX、旧版 Clash Verge、Linux 或其他客户端；遇到时会建议安装受支持的最新版客户端，不做修改。
+- 不加入 Apple、iCloud、Speedtest 等个人规则；不为某个打不开的网站添加专用 DNS 例外，也不为测速成绩添加国内 DNS 例外——国内 CDN 错位时检查 `direct-nameserver` 和实时出站。
+- 不实现订阅后台监听；订阅更新只能由你显式触发“安全更新”。
+- 不做按应用隔离：同一个浏览器同时访问国内和 AI 网站，而 STUN 连接不携带原网页域名，Mihomo 无法判断它来自哪个标签页。
+- 不自动选择订阅、代理组或节点；节点建议（台湾家宽优先、其次日本家宽）只写在聊天中，最终选择完全交给你。
+- Windows 客户端正在运行时不修改当前运行配置；档位 3 的订阅增强在各订阅随后加载或刷新时生效。
 
 项目使用 [MIT License](LICENSE)。

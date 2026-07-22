@@ -258,28 +258,6 @@ if ($resolvedUsageProfile -notin @(1, 2, 3)) {
     Complete-InstallResult 64 "invalid_request" "invalid_usage_profile" "用途档位无效，只能是 1、2 或 3。"
 }
 $script:ClashPatchProfile = $resolvedUsageProfile
-if ($profileSource -ne "saved" -and $resolvedUsageProfile -ne 3) {
-    try {
-        Save-UsageProfile $usageStatePath $resolvedUsageProfile
-        Write-Info "已保存用途档位 $resolvedUsageProfile。"
-    } catch {
-        if (-not $Json) { [Console]::Error.WriteLine("[Clash 补丁] 无法保存用途档位：$($_.Exception.Message)") }
-        Complete-InstallResult 1 "failed" "usage_profile_save_failed" ("无法保存用途档位：" + $_.Exception.Message)
-    }
-}
-
-if ($resolvedUsageProfile -ne 3) {
-    if ($savedUsageProfile -eq 3 -and $profileSource -ne "saved") {
-        Write-Info "检测到从档位 3 改为轻量档位。安装程序不会覆盖后来产生的用户改动；请由本 skill 先运行安全卸载流程，并说明无法自动恢复的旧增强。"
-    }
-    if ($resolvedUsageProfile -eq 1) {
-        Write-Info "档位 1 只需要确认 Clash Verge Rev 的“设置为系统代理”已开启；未修改 TUN 或订阅。"
-    } else {
-        Write-Info "档位 2 只需要开启 TUN 并关闭 Clash Verge Rev 自己的系统代理开关；未修改订阅、DNS、WebRTC 或 AI 分组。"
-    }
-    Write-Info "请由本 skill 使用 Computer Use 完成客户端开关和对应网站复测。"
-    Complete-InstallResult 0 "ok" "usage_profile_saved" "用途档位已保存；需要由客户端界面完成对应开关与复测。" @("usage_profile")
-}
 
 if (-not (Test-Path -LiteralPath $enginePath -PathType Leaf)) {
     if (-not $Json) { [Console]::Error.WriteLine("[Clash 补丁] 安装包不完整：缺少 Windows 全局扩展脚本。") }
@@ -295,6 +273,30 @@ try {
         Save-UsageProfile $usageStatePath $resolvedUsageProfile
         Write-Info "已保存用途档位 $resolvedUsageProfile。"
     }
+    if ($resolvedUsageProfile -ne 3) {
+        if ($savedUsageProfile -eq 3 -and $profileSource -ne "saved") {
+            Write-Info "检测到从档位 3 改为轻量档位。安装程序不会覆盖后来产生的用户改动；请由本 skill 先运行安全卸载流程，并说明无法自动恢复的旧增强。"
+        }
+        New-Item -ItemType Directory -Path $profilesDirectory -Force | Out-Null
+        $scriptOutput = Build-GlobalScript $enginePath $targetScript $resolvedUsageProfile
+        $scriptBytes = ConvertTo-Utf8Bytes $scriptOutput
+        $scriptTarget = [pscustomobject]@{
+            Path = $targetScript
+            Bytes = $scriptBytes
+            Existed = (Test-Path -LiteralPath $targetScript)
+            OriginalBytes = $(if (Test-Path -LiteralPath $targetScript) { [System.IO.File]::ReadAllBytes($targetScript) } else { $null })
+        }
+        Backup-InitialOnce $scriptTarget.Path $backupRoot | Out-Null
+        Backup-Versioned $scriptTarget.Path $backupRoot "prewrite" | Out-Null
+        try {
+            Write-BytesAtomic $scriptTarget.Path $scriptTarget.Bytes
+        } catch {
+            Restore-Transaction @($scriptTarget)
+            throw
+        }
+        Write-Info "已为全部订阅安装共享国内域名直连规则；未修改 TUN、IPv6 或订阅自动更新。"
+        Complete-InstallResult 0 "ok" "installed_common_baseline" "已安装全部订阅共用的国内域名直连规则。" @("global_script", "cn_domain_baseline")
+    }
     if (-not (Test-Path -LiteralPath $profilesIndexPath -PathType Leaf)) {
         throw "找不到 Clash Verge Rev 的 profiles.yaml，无法自动关闭订阅更新。"
     }
@@ -305,7 +307,7 @@ try {
 
     if ($clientRunning) {
         New-Item -ItemType Directory -Path $profilesDirectory -Force | Out-Null
-        $scriptOutput = Build-GlobalScript $enginePath $targetScript
+        $scriptOutput = Build-GlobalScript $enginePath $targetScript $resolvedUsageProfile
         $scriptBytes = ConvertTo-Utf8Bytes $scriptOutput
         $runningTargets = @(
             [pscustomobject]@{ Path = $targetScript; Bytes = $scriptBytes; Existed = (Test-Path -LiteralPath $targetScript); OriginalBytes = $(if (Test-Path -LiteralPath $targetScript) { [System.IO.File]::ReadAllBytes($targetScript) } else { $null }) },
@@ -339,7 +341,7 @@ try {
     Assert-StateTargetUnchanged $previousConfig $configPath "config.yaml"
 
     New-Item -ItemType Directory -Path $profilesDirectory -Force | Out-Null
-    $scriptOutput = Build-GlobalScript $enginePath $targetScript
+    $scriptOutput = Build-GlobalScript $enginePath $targetScript $resolvedUsageProfile
     $vergeInput = if (Test-Path -LiteralPath $vergePath) { Get-Content -LiteralPath $vergePath -Raw -Encoding UTF8 } else { "" }
     $vergeOutput = Set-YamlTopLevelScalar $vergeInput "enable_tun_mode" "true"
     $vergeOutput = Set-YamlTopLevelScalar $vergeOutput "enable_dns_settings" "false"

@@ -11,7 +11,7 @@ module ClashPatch
     false
   end
 
-  def patch_path_once(path, policy, dry_run:, backup_root:, validator:)
+  def patch_path_once(path, policy, dry_run:, backup_root:, validator:, usage_profile: 3)
     write_path = File.realpath(path)
     outcome = nil
     File.open(write_path, dry_run ? "rb" : "r+b") do |source|
@@ -21,12 +21,12 @@ module ClashPatch
       raise InvalidConfigError, "配置不是有效的 UTF-8" unless original_text.valid_encoding?
 
       config = load_yaml(original_text, path)
-      result = patch(config, policy)
+      result = patch(config, policy, usage_profile: usage_profile)
       return result.merge(path: path) unless result[:changed]
 
       patched_text = dump_config(result[:config])
       candidate_config = load_yaml(patched_text, path)
-      second_pass = patch(candidate_config, policy)
+      second_pass = patch(candidate_config, policy, usage_profile: usage_profile)
       if second_pass[:changed] || second_pass[:config] != candidate_config
         return base_result(config, :non_idempotent).merge(path: path)
       end
@@ -82,9 +82,12 @@ module ClashPatch
     outcome
   end
 
-  def patch_path(path, policy, dry_run: false, backup_root: nil, validator: nil)
+  def patch_path(path, policy, dry_run: false, backup_root: nil, validator: nil, usage_profile: 3)
     MAX_PATCH_ATTEMPTS.times do
-      outcome = patch_path_once(path, policy, dry_run: dry_run, backup_root: backup_root, validator: validator)
+      outcome = patch_path_once(
+        path, policy, dry_run: dry_run, backup_root: backup_root,
+        validator: validator, usage_profile: usage_profile
+      )
       return outcome unless outcome == :retry
     end
     base_result(nil, :concurrent_change).merge(path: path)
@@ -98,7 +101,7 @@ module ClashPatch
 
   def run(directory: nil, directories: nil, policy_path:, dry_run: false, backup_root: nil,
           selected_name: nil, active_directory: nil, validator: nil, auto_reload: false,
-          socket: nil, requester: nil, connectivity_checker: nil)
+          socket: nil, requester: nil, connectivity_checker: nil, usage_profile: 3)
     policy = JSON.parse(File.read(policy_path, encoding: "UTF-8"))
     unless policy.is_a?(Hash) && policy["version"] == POLICY_VERSION
       raise InvalidConfigError, "不支持的策略版本"
@@ -113,14 +116,18 @@ module ClashPatch
         paths = paths.reject { |path| File.basename(path).casecmp("config.yaml").zero? }
       end
       paths.map do |path|
-        result = patch_path(path, policy, dry_run: dry_run, backup_root: backup_root, validator: validator)
+        result = patch_path(
+          path, policy, dry_run: dry_run, backup_root: backup_root,
+          validator: validator, usage_profile: usage_profile
+        )
         result[:active] = active_root && File.expand_path(File.dirname(path)) == File.expand_path(active_root) && active_profile?(path, selected)
         if auto_reload && !dry_run && result[:active] && result[:status] == :updated
           result = activate_updated_profile(
             result,
             socket: socket,
             requester: requester,
-            connectivity_checker: connectivity_checker
+            connectivity_checker: connectivity_checker,
+            require_tun: usage_profile >= 2
           )
         end
         result
@@ -131,4 +138,3 @@ module ClashPatch
   end
 
 end
-

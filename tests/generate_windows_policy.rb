@@ -9,6 +9,7 @@ mapping = {
   "resolvers" => "resolvers",
   "direct_resolvers" => "directResolvers",
   "bootstrap_fallback_resolvers" => "bootstrapFallbackResolvers",
+  "cn_domain_provider" => "cnDomainProvider",
   "main_group_names" => "mainGroupNames",
   "ai_group_names" => "aiGroupNames",
   "taiwan_tokens" => "taiwanTokens",

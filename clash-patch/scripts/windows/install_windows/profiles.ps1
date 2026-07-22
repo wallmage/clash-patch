@@ -82,10 +82,11 @@ function Get-RemoteSubscriptionTargets([string]$ProfilesIndexText, [string]$Dire
     $targets = @()
     $targetPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($item in $items) {
-        $matches = @(
+        $candidates = @(
             (Join-Path $Directory ($item.Uid + ".yaml")),
             (Join-Path $Directory ($item.Uid + ".yml"))
-        ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+        )
+        $matches = @($candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
         if ($matches.Count -ne 1) { throw "远程订阅无法对应到唯一配置文件：$($item.Uid)。" }
         $path = (Resolve-Path -LiteralPath $matches[0]).Path
         if (-not $targetPaths.Add($path)) { throw "多个远程订阅对应到同一配置文件。" }

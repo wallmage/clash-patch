@@ -233,13 +233,20 @@ try {
     Assert-True ($profileOne.ExitCode -eq 0) "profile 1 installer failed: $($profileOne.Output)"
     Assert-True ((Get-Content -LiteralPath (Join-Path $lightCase "config.yaml") -Raw) -eq $lightConfig) "profile 1 modified config.yaml"
     Assert-True ((Get-Content -LiteralPath (Join-Path $lightCase "verge.yaml") -Raw) -eq $lightVerge) "profile 1 modified verge.yaml"
-    Assert-True (-not (Test-Path -LiteralPath (Join-Path (Join-Path $lightCase "profiles") "Script.js"))) "profile 1 installed the full patch"
+    $lightScript = Join-Path (Join-Path $lightCase "profiles") "Script.js"
+    Assert-True (Test-Path -LiteralPath $lightScript -PathType Leaf) "profile 1 did not install the shared subscription patch"
+    $profileOneScript = Get-Content -LiteralPath $lightScript -Raw
+    Assert-True ($profileOneScript.Contains("const CLASH_PATCH_USAGE_PROFILE = 1;")) "profile 1 script has the wrong usage profile"
+    Assert-True ($profileOneScript.Contains("cnDomainProvider")) "profile 1 script omitted the China-domain provider"
     $savedProfileOne = Get-Content -LiteralPath (Join-Path $lightCase "clash-patch-usage-profile.json") -Raw | ConvertFrom-Json
     Assert-True ([int]$savedProfileOne.Profile -eq 1) "profile 1 was not saved"
     $profileTwo = Invoke-TestPowerShell $installer @("-AppHome", $lightCase, "-UsageProfile", "2")
     Assert-True ($profileTwo.ExitCode -eq 0) "profile 2 installer failed: $($profileTwo.Output)"
     Assert-True ((Get-Content -LiteralPath (Join-Path $lightCase "config.yaml") -Raw) -eq $lightConfig) "profile 2 modified config.yaml"
-    Assert-True (-not (Test-Path -LiteralPath (Join-Path (Join-Path $lightCase "profiles") "Script.js"))) "profile 2 installed the full patch"
+    Assert-True (Test-Path -LiteralPath $lightScript -PathType Leaf) "profile 2 removed the shared subscription patch"
+    $profileTwoScript = Get-Content -LiteralPath $lightScript -Raw
+    Assert-True ($profileTwoScript.Contains("const CLASH_PATCH_USAGE_PROFILE = 2;")) "profile 2 script has the wrong usage profile"
+    Assert-True ($profileTwoScript.Contains("cnDomainProvider")) "profile 2 script omitted the China-domain provider"
     $savedProfileTwo = Get-Content -LiteralPath (Join-Path $lightCase "clash-patch-usage-profile.json") -Raw | ConvertFrom-Json
     Assert-True ([int]$savedProfileTwo.Profile -eq 2) "profile 2 was not saved"
 

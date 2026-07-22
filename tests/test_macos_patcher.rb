@@ -29,6 +29,63 @@ class MacosPatcherTest < Minitest::Test
     assert File.file?(POLICY_PATH), "canonical policy is missing"
   end
 
+  def test_common_china_domain_baseline_applies_to_lightweight_profiles
+    original = base_config
+    original["ipv6"] = true
+    original["tun"] = { "enable" => false }
+
+    [1, 2].each do |usage_profile|
+      patched = ClashPatch.patch(original, @policy, usage_profile: usage_profile).fetch(:config)
+      provider_name = @policy.fetch("cn_domain_provider").fetch("name")
+      provider = patched.fetch("rule-providers").fetch(provider_name)
+
+      assert_equal "http", provider.fetch("type")
+      assert_equal "domain", provider.fetch("behavior")
+      assert_equal "mrs", provider.fetch("format")
+      assert_equal @policy.fetch("cn_domain_provider").fetch("url"), provider.fetch("url")
+      assert_equal "Main", provider.fetch("proxy")
+      assert_equal @policy.fetch("direct_resolvers"),
+                   patched.dig("dns", "nameserver-policy", "rule-set:#{provider_name}")
+      cn_index = patched.fetch("rules").index("RULE-SET,#{provider_name},DIRECT")
+      broad_index = patched.fetch("rules").index("GEOSITE,CN,DIRECT")
+      assert_operator cn_index, :<, broad_index
+      assert_equal true, patched.fetch("ipv6")
+      assert_equal({ "enable" => false }, patched.fetch("tun"))
+      refute patched.fetch("rules").any? { |rule| rule.start_with?("NETWORK,UDP,") }
+      assert_equal patched, ClashPatch.patch(patched, @policy, usage_profile: usage_profile).fetch(:config)
+    end
+  end
+
+  def test_common_china_domain_baseline_does_not_overwrite_user_provider_name
+    config = base_config
+    base_name = @policy.fetch("cn_domain_provider").fetch("name")
+    config["rule-providers"] = {
+      base_name => { "type" => "file", "behavior" => "domain", "path" => "./user-owned.yaml" }
+    }
+
+    patched = ClashPatch.patch(config, @policy, usage_profile: 1).fetch(:config)
+
+    assert_equal "./user-owned.yaml", patched.fetch("rule-providers").fetch(base_name).fetch("path")
+    assert patched.fetch("rule-providers").key?("#{base_name}-2")
+    assert_includes patched.fetch("rules"), "RULE-SET,#{base_name}-2,DIRECT"
+  end
+
+  def test_common_china_domain_baseline_does_not_reuse_user_provider_path
+    config = base_config
+    provider_policy = @policy.fetch("cn_domain_provider")
+    base_name = provider_policy.fetch("name")
+    config["rule-providers"] = {
+      "user-cn" => { "type" => "file", "behavior" => "domain", "path" => provider_policy.fetch("path") }
+    }
+
+    patched = ClashPatch.patch(config, @policy, usage_profile: 1).fetch(:config)
+
+    assert_equal provider_policy.fetch("path"), patched.fetch("rule-providers").fetch("user-cn").fetch("path")
+    assert_equal "./ruleset/#{base_name}-2.mrs",
+                 patched.fetch("rule-providers").fetch("#{base_name}-2").fetch("path")
+    assert_includes patched.fetch("rules"), "RULE-SET,#{base_name}-2,DIRECT"
+  end
+
   def test_result_contract_rejects_unstable_command_names
     assert_raises(ArgumentError) do
       ClashPatchResult.build(
@@ -902,6 +959,11 @@ class MacosPatcherTest < Minitest::Test
       assert_equal "fresh", config.fetch("subscription-marker")
       refute config.key?("tun")
       refute config.key?("ipv6")
+      provider_name = @policy.fetch("cn_domain_provider").fetch("name")
+      assert config.fetch("rule-providers").key?(provider_name)
+      assert_includes config.fetch("rules"), "RULE-SET,#{provider_name},DIRECT"
+      assert_equal @policy.fetch("direct_resolvers"),
+                   config.dig("dns", "nameserver-policy", "rule-set:#{provider_name}")
     end
   end
 
@@ -1994,6 +2056,28 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_run_applies_the_common_baseline_to_every_subscription_in_current_storage
+    Dir.mktmpdir do |directory|
+      names = ["MESL", "Yue.to | 悦通", "网际快车"]
+      names.each { |name| File.write(File.join(directory, "#{name}.yaml"), YAML.dump(base_config)) }
+      File.write(File.join(directory, "config.yaml"), YAML.dump(base_config))
+
+      results = ClashPatch.run(
+        directories: [directory], policy_path: POLICY_PATH,
+        selected_name: "MESL", usage_profile: 1
+      )
+
+      assert_equal names.sort, results.map { |result| File.basename(result.fetch(:path), ".yaml") }.sort
+      provider_name = @policy.fetch("cn_domain_provider").fetch("name")
+      names.each do |name|
+        config = ClashPatch.load_yaml(File.read(File.join(directory, "#{name}.yaml")))
+        assert config.fetch("rule-providers").key?(provider_name), name
+        assert_includes config.fetch("rules"), "RULE-SET,#{provider_name},DIRECT", name
+        refute config.key?("tun"), name
+      end
+    end
+  end
+
   def test_run_keeps_default_config_when_it_is_selected
     Dir.mktmpdir do |directory|
       config = File.join(directory, "config.yaml")
@@ -2523,6 +2607,28 @@ class MacosPatcherTest < Minitest::Test
     assert_equal "ok", ClashPatch.batch_json_status([{ status: :updated }]).first
     assert_equal "partial", ClashPatch.batch_json_status([{ status: :updated }, { status: :invalid }]).first
     assert_equal "failed", ClashPatch.batch_json_status([{ status: :invalid }]).first
+  end
+
+  def test_cli_returns_failure_when_any_profile_was_not_applied
+    results = [
+      { path: "/private/current.yaml", status: :reload_failed_rolled_back },
+      { path: "/private/other.yaml", status: :unchanged }
+    ]
+    ClashPatch.stub(:run, results) do
+      output, error = capture_io do
+        assert_equal 1, ClashPatch.cli(["--json", "--profile-dir", "/private", "--usage-profile", "3"])
+      end
+      assert_empty error
+      result = JSON.parse(output)
+      assert_equal "partial", result.fetch("status")
+      assert_equal 1, result.fetch("exit_code")
+    end
+
+    ClashPatch.stub(:run, results) do
+      _output, _error = capture_io do
+        assert_equal 1, ClashPatch.cli(["--profile-dir", "/private", "--usage-profile", "3"])
+      end
+    end
   end
 
   def test_patcher_is_split_into_explicit_modules_and_coverage_tracks_them

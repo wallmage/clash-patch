@@ -166,18 +166,13 @@ module ClashPatch
 
     config = load_yaml(text, target.fetch(:name))
     raise InvalidConfigError, "远程订阅内容无效" unless usable_config?(config)
-    candidate = config
-    if usage_profile == 3
-      patched = patch(config, policy)
-      raise InvalidConfigError, "远程订阅无法应用档位 3 补丁" unless %i[updated unchanged].include?(patched.fetch(:status))
-      candidate = patched.fetch(:config)
-    end
+    patched = patch(config, policy, usage_profile: usage_profile)
+    raise InvalidConfigError, "远程订阅无法应用共享补丁" unless %i[updated unchanged].include?(patched.fetch(:status))
+    candidate = patched.fetch(:config)
     output = dump_config(candidate).b
     reparsed = load_yaml(output.dup.force_encoding(Encoding::UTF_8), target.fetch(:name))
-    if usage_profile == 3
-      second = patch(reparsed, policy)
-      raise InvalidConfigError, "远程订阅二次转换不一致" if second.fetch(:changed) || dump_config(second.fetch(:config)).b != output
-    end
+    second = patch(reparsed, policy, usage_profile: usage_profile)
+    raise InvalidConfigError, "远程订阅二次转换不一致" if second.fetch(:changed) || dump_config(second.fetch(:config)).b != output
 
     Tempfile.create([".clash-patch-update-", ".yaml"], File.dirname(File.realpath(target.fetch(:path)))) do |temporary|
       temporary.binmode
@@ -376,4 +371,3 @@ module ClashPatch
   end
 
 end
-
