@@ -123,6 +123,24 @@ class SkillContractTest < Minitest::Test
     assert_includes policy, "共同组件本身"
   end
 
+  def test_diagnostics_resolves_overlapping_network_interceptors_by_responsibility
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+
+    [skill, policy, design].each do |document|
+      assert_includes document, "重叠接管"
+      assert_includes document, "职责分层"
+    end
+
+    assert_includes policy, "系统代理或 PAC"
+    assert_includes policy, "透明代理或内容过滤器"
+    assert_includes policy, "VPN 或 TUN"
+    assert_includes policy, "原有功能覆盖"
+    assert_includes policy, "安全属性"
+    assert_includes policy, "不逐站添加例外"
+  end
+
   def test_diagnostics_selects_tools_by_the_observed_symptom
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
 
