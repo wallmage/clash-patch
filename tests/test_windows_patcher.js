@@ -31,10 +31,12 @@ test('global transform applies common policy', { skip: !available }, () => {
   assert.deepEqual(patched.dns['direct-nameserver'], engine.CLASH_PATCH_POLICY.directResolvers);
   assert.equal(patched.dns['direct-nameserver-follow-policy'], false);
   assert.deepEqual(patched.dns['nameserver-policy']['geosite:cn'], engine.CLASH_PATCH_POLICY.directResolvers);
+  assert.ok(patched.dns['nameserver-policy']['+.openai.com'].every((value) => value.endsWith(`#${ai.name}`)));
   assert.deepEqual(ai.proxies, ['Main']);
-  const udpIndex = patched.rules.indexOf(`NETWORK,UDP,${safeGroup}`);
+  const udpIndex = patched.rules.indexOf(`NETWORK,UDP,${ai.name}`);
   assert.ok(udpIndex >= 0);
   assert.equal(patched.rules[udpIndex + 1], 'NETWORK,UDP,REJECT');
+  assert.equal(udpIndex, 0);
   assert.ok(patched.rules.includes('DOMAIN,raw.githubusercontent.com,AI'));
   assert.ok(patched.rules.includes('DOMAIN,storage.googleapis.com,AI'));
 });
@@ -49,8 +51,9 @@ test('reuses the existing AI group without creating visible groups', { skip: !av
   assert.equal(patched['proxy-groups'].some((group) => /^🤖 AI · Clash Patch(?: \d+)?$/.test(group.name)), false);
   assert.equal(patched['proxy-groups'].some((group) => /^🛡 安全代理 · Clash Patch(?: \d+)?$/.test(group.name)), false);
   assert.ok(patched.rules.includes('DOMAIN-SUFFIX,openai.com,AI'));
-  assert.deepEqual(patched.rules.slice(0, 2), ['NETWORK,UDP,Main', 'NETWORK,UDP,REJECT']);
+  assert.deepEqual(patched.rules.slice(0, 2), ['NETWORK,UDP,AI', 'NETWORK,UDP,REJECT']);
   assert.ok(patched.dns.nameserver.every((value) => value.endsWith('#Main')));
+  assert.ok(patched.dns['nameserver-policy']['+.openai.com'].every((value) => value.endsWith('#AI')));
 });
 
 test('creates an AI group with all inline nodes when the subscription has none', { skip: !available }, () => {
@@ -64,7 +67,8 @@ test('creates an AI group with all inline nodes when the subscription has none',
   assert.equal(Object.hasOwn(ai, 'use'), false);
   assert.equal(patched['proxy-groups'].some((group) => /^🛡 安全代理 · Clash Patch(?: \d+)?$/.test(group.name)), false);
   assert.ok(patched.rules.includes('DOMAIN-SUFFIX,openai.com,🤖 AI · Clash Patch'));
-  assert.deepEqual(patched.rules.slice(0, 2), ['NETWORK,UDP,Main', 'NETWORK,UDP,REJECT']);
+  assert.deepEqual(patched.rules.slice(0, 2), ['NETWORK,UDP,🤖 AI · Clash Patch', 'NETWORK,UDP,REJECT']);
+  assert.ok(patched.dns['nameserver-policy']['+.openai.com'].every((value) => value.endsWith('#🤖 AI · Clash Patch')));
 });
 
 test('new AI group includes every proxy provider', { skip: !available }, () => {
@@ -142,7 +146,7 @@ test('removes groups created by an older patch', { skip: !available }, () => {
   assert.equal(patched['proxy-groups'].some((group) => group.name === aiName || group.name === safeName), false);
   assert.equal(patched.rules.some((rule) => rule.includes(aiName) || rule.includes(safeName)), false);
   assert.equal(JSON.stringify(patched.dns).includes(safeName), false);
-  assert.deepEqual(patched.rules.slice(0, 2), ['NETWORK,UDP,Main', 'NETWORK,UDP,REJECT']);
+  assert.deepEqual(patched.rules.slice(0, 2), ['NETWORK,UDP,AI', 'NETWORK,UDP,REJECT']);
 });
 
 test('preserves bootstrap and replaces direct resolvers with managed mainland DoH', { skip: !available }, () => {
@@ -297,7 +301,7 @@ test('UDP guard precedes leaking rules without deleting them', { skip: !availabl
   ];
   config.rules = userRules.concat(config.rules);
   const patched = engine.clashPatchTransform(config, 'fixture');
-  const guard = `NETWORK,UDP,${engine.clashPatchRouteGroupName(patched)}`;
+  const guard = 'NETWORK,UDP,AI';
   assert.equal(patched.rules.indexOf(guard), 0);
   assert.equal(patched.rules[1], 'NETWORK,UDP,REJECT');
   for (const rule of userRules) {
@@ -372,7 +376,7 @@ test('keeps a non-select AI group and creates a non-conflicting selector', { ski
   assert.ok(created, 'a new AI selector must be created');
   assert.equal(created.type, 'select');
   assert.ok(patched.rules.includes('DOMAIN-SUFFIX,openai.com,🤖 AI · Clash Patch'));
-  assert.ok(patched.rules.includes(`NETWORK,UDP,${engine.clashPatchRouteGroupName(patched)}`));
+  assert.ok(patched.rules.includes('NETWORK,UDP,🤖 AI · Clash Patch'));
   for (const group of patched['proxy-groups']) {
     assert.ok(!(Array.isArray(group.proxies) && group.proxies.includes(group.name)), `group ${group.name} references itself`);
   }
@@ -406,7 +410,7 @@ test('patches and preserves a provider-only profile', { skip: !available }, () =
   assert.equal(engine.clashPatchDetectMain(config), 'Main');
   assert.deepEqual(patched['proxy-providers'], providers);
   assert.deepEqual(patched['proxy-groups'].find((group) => group.name === 'Main').use, ['provider1']);
-  assert.ok(patched.rules.includes(`NETWORK,UDP,${engine.clashPatchRouteGroupName(patched)}`));
+  assert.ok(patched.rules.includes('NETWORK,UDP,AI'));
   for (const group of patched['proxy-groups']) {
     assert.ok(!(Array.isArray(group.proxies) && group.proxies.includes(group.name)), `group ${group.name} references itself`);
   }

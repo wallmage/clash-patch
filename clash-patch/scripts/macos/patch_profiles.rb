@@ -21,6 +21,7 @@ module ClashPatch
   DIRECT_TYPES = %w[direct dns reject pass compatible rematch].freeze
   DIRECT_NAMES = %w[DIRECT REJECT REJECT-DROP PASS PASS-RULE COMPATIBLE REMATCH].freeze
   EXCLUDED_SAFE_TYPES = "Direct|Dns|Reject|Pass|Compatible|Rematch".freeze
+  LEGACY_QUIC_REJECT_RULE = "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT".freeze
 
   class InvalidConfigError < StandardError; end
 
@@ -388,7 +389,7 @@ module ClashPatch
     end.uniq
   end
 
-  def patch_dns(config, policy, route_group, owned_safe_names = [])
+  def patch_dns(config, policy, route_group, ai_group, owned_safe_names = [])
     dns = config["dns"].is_a?(Hash) ? config["dns"] : {}
     config["dns"] = dns
     dns["enable"] = true
@@ -398,6 +399,7 @@ module ClashPatch
     dns["use-system-hosts"] = true
 
     safe_resolvers = tagged_resolvers(policy, route_group)
+    ai_resolvers = tagged_resolvers(policy, ai_group)
     fallback_bootstrap = deep_copy(policy["bootstrap_fallback_resolvers"])
     legacy_default = ["1.1.1.1", "8.8.8.8"]
     legacy_proxy = [
@@ -432,7 +434,7 @@ module ClashPatch
       end
     end
     policies["geosite:cn"] = deep_copy(policy["direct_resolvers"])
-    ai_dns_patterns(policy).each { |pattern| policies[pattern] = deep_copy(safe_resolvers) }
+    ai_dns_patterns(policy).each { |pattern| policies[pattern] = deep_copy(ai_resolvers) }
     dns["nameserver-policy"] = policies
   end
 
@@ -503,9 +505,14 @@ module ClashPatch
     original_rules = Array(config["rules"])
     owned_udp_indexes = []
     original_rules.each_with_index do |rule, index|
+      if rule.to_s.gsub(/\s+/, "").casecmp(LEGACY_QUIC_REJECT_RULE).zero?
+        owned_udp_indexes << index
+        next
+      end
+
       info = rule_info(rule)
       next unless info[:type] == "NETWORK" && info[:payload].casecmp("UDP").zero? &&
-                  (owned_safe_names.include?(info[:target]) || info[:target] == route_group)
+                  (owned_safe_names.include?(info[:target]) || [route_group, ai_group].include?(info[:target]))
 
       owned_udp_indexes << index
       next_info = rule_info(original_rules[index + 1]) if index + 1 < original_rules.length
@@ -538,7 +545,7 @@ module ClashPatch
       end
     end
 
-    config["rules"] = ["NETWORK,UDP,#{route_group}", "NETWORK,UDP,REJECT"] + user_overrides + managed + remaining
+    config["rules"] = ["NETWORK,UDP,#{ai_group}", "NETWORK,UDP,REJECT"] + user_overrides + managed + remaining
   end
 
   def normalize_reality_short_ids(value)
@@ -588,7 +595,7 @@ module ClashPatch
     patched["ipv6"] = false
     patched["tun"] = {} unless patched["tun"].is_a?(Hash)
     TUN_POLICY.each { |key, value| patched["tun"][key] = deep_copy(value) }
-    patch_dns(patched, policy, route_group, owned_safe_names)
+    patch_dns(patched, policy, route_group, ai_group, owned_safe_names)
     patch_rules(patched, policy, ai_group, route_group, owned_ai_names, owned_safe_names)
     remove_owned_managed_groups(patched, (owned_ai_names - [ai_group]) + owned_safe_names)
     normalize_reality_short_ids(patched)

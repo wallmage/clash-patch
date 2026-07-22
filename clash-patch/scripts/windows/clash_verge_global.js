@@ -98,6 +98,7 @@ const CLASH_PATCH_AI_GROUP = "🤖 AI · Clash Patch";
 const CLASH_PATCH_SAFE_GROUP = "🛡 安全代理 · Clash Patch";
 const CLASH_PATCH_DIRECT_NAMES = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "PASS-RULE", "COMPATIBLE", "REMATCH"];
 const CLASH_PATCH_DIRECT_TYPES = ["direct", "dns", "reject", "pass", "compatible", "rematch"];
+const CLASH_PATCH_LEGACY_QUIC_REJECT_RULE = "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT";
 
 function clashPatchClone(value) {
   return JSON.parse(JSON.stringify(value));
@@ -431,7 +432,7 @@ function clashPatchNormalizedResolverEndpoints(config, values) {
   return normalized;
 }
 
-function clashPatchDns(config, routeGroup, ownedSafeNames) {
+function clashPatchDns(config, routeGroup, aiGroup, ownedSafeNames) {
   const dns = config.dns && typeof config.dns === "object" && !Array.isArray(config.dns) ? config.dns : {};
   config.dns = dns;
   dns.enable = true;
@@ -440,6 +441,7 @@ function clashPatchDns(config, routeGroup, ownedSafeNames) {
   dns["use-hosts"] = true;
   dns["use-system-hosts"] = true;
   const safeResolvers = clashPatchTaggedResolvers(routeGroup);
+  const aiResolvers = clashPatchTaggedResolvers(aiGroup);
   const fallbackBootstrap = CLASH_PATCH_POLICY.bootstrapFallbackResolvers.slice();
   const currentProxyBootstrap = Array.isArray(dns["proxy-server-nameserver"]) ? dns["proxy-server-nameserver"] : [];
   const serializedProxyBootstrap = JSON.stringify(currentProxyBootstrap);
@@ -477,7 +479,7 @@ function clashPatchDns(config, routeGroup, ownedSafeNames) {
     });
   });
   policies["geosite:cn"] = CLASH_PATCH_POLICY.directResolvers.slice();
-  clashPatchDnsPatterns().forEach(function (pattern) { policies[pattern] = safeResolvers.slice(); });
+  clashPatchDnsPatterns().forEach(function (pattern) { policies[pattern] = aiResolvers.slice(); });
   dns["nameserver-policy"] = policies;
 }
 
@@ -541,9 +543,14 @@ function clashPatchRules(config, aiGroup, routeGroup, ownedAiNames, ownedSafeNam
   const original = config.rules || [];
   const ownedUdpIndexes = [];
   original.forEach(function (rule, index) {
+    if (String(rule).replace(/\s+/g, "").toUpperCase() === CLASH_PATCH_LEGACY_QUIC_REJECT_RULE) {
+      ownedUdpIndexes.push(index);
+      return;
+    }
+
     const info = clashPatchRuleInfo(rule);
     if (info.type !== "NETWORK" || info.payload.toUpperCase() !== "UDP" ||
-        (ownedSafeNames.indexOf(info.target) === -1 && info.target !== routeGroup)) return;
+        (ownedSafeNames.indexOf(info.target) === -1 && info.target !== routeGroup && info.target !== aiGroup)) return;
     ownedUdpIndexes.push(index);
     if (index + 1 < original.length) {
       const next = clashPatchRuleInfo(original[index + 1]);
@@ -571,7 +578,7 @@ function clashPatchRules(config, aiGroup, routeGroup, ownedAiNames, ownedSafeNam
     else remaining.push(rule);
   });
 
-  config.rules = ["NETWORK,UDP," + routeGroup, "NETWORK,UDP,REJECT"].concat(userOverrides, managed, remaining);
+  config.rules = ["NETWORK,UDP," + aiGroup, "NETWORK,UDP,REJECT"].concat(userOverrides, managed, remaining);
 }
 
 function clashPatchApply(config, profileName) {
@@ -602,7 +609,7 @@ function clashPatchApply(config, profileName) {
   patched.tun["auto-route"] = true;
   patched.tun["auto-detect-interface"] = true;
   patched.tun["strict-route"] = true;
-  clashPatchDns(patched, routeGroup, ownedNames.safe);
+  clashPatchDns(patched, routeGroup, aiGroup, ownedNames.safe);
   clashPatchRules(patched, aiGroup, routeGroup, ownedNames.ai, ownedNames.safe);
   clashPatchRemoveOwnedManagedGroups(patched, ownedNames.ai.filter(function (name) { return name !== aiGroup; }).concat(ownedNames.safe));
   return patched;
@@ -633,10 +640,7 @@ if (typeof module !== "undefined" && module.exports) {
     clashPatchCompose: clashPatchCompose,
     clashPatchDetectMain: clashPatchDetectMain,
     clashPatchRenderAiRules: clashPatchRenderAiRules,
-    clashPatchRouteGroupName: function (config) {
-      const first = Array.isArray(config.rules) ? clashPatchRuleInfo(config.rules[0]) : null;
-      return first && first.type === "NETWORK" && first.payload.toUpperCase() === "UDP" ? first.target : null;
-    },
+    clashPatchRouteGroupName: clashPatchDetectMain,
     clashPatchTransform: clashPatchTransform,
     main: main
   };

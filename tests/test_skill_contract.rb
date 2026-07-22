@@ -378,6 +378,49 @@ class SkillContractTest < Minitest::Test
     %w[游戏 语音 视频 QUIC 第三方].each { |term| assert_includes source, term }
   end
 
+  def test_public_policy_routes_quic_with_the_shared_browser_udp_guard
+    retired_rule = "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT"
+    files = [
+      File.join(ROOT, "README.md"),
+      File.join(SKILL, "SKILL.md"),
+      File.join(SKILL, "references/patch-policy.md"),
+      File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md")
+    ]
+
+    files.each do |path|
+      source = File.read(path)
+      refute_includes source, retired_rule, path
+      assert_includes source, "QUIC", path
+      assert_includes source, "AI 分组", path
+    end
+  end
+
+  def test_shared_browser_policy_scopes_dns_but_not_webrtc_by_domain
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+
+    [skill, policy, design].each do |source|
+      %w[AI\ 分组 STUN 标签页 TCP DNS].each { |term| assert_includes source, term }
+    end
+    assert_includes policy, "NETWORK,UDP,<AI 分组>"
+    refute_includes policy, "NETWORK,UDP,<原主代理组>"
+  end
+
+  def test_diagnostics_separates_network_wait_from_browser_rendering
+    files = [
+      File.join(ROOT, "README.md"),
+      File.join(SKILL, "SKILL.md"),
+      File.join(SKILL, "references/patch-policy.md"),
+      File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md")
+    ]
+
+    files.each do |path|
+      source = File.read(path)
+      %w[主文档 扩展 对照 单站].each { |term| assert_includes source, term, path }
+    end
+  end
+
   def test_policy_documents_dns_filters_and_safety_migrations
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
     %w[exclude-filter empty-fallback skip-cert-verify ecs 160.79.104.0/21 ai.com proxy-server-nameserver system 二次转换].each do |term|

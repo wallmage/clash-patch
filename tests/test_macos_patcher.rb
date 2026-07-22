@@ -52,13 +52,14 @@ class MacosPatcherTest < Minitest::Test
     assert_equal @policy.fetch("direct_resolvers"), patched.dig("dns", "direct-nameserver")
     assert_equal false, patched.dig("dns", "direct-nameserver-follow-policy")
     assert_equal @policy.fetch("direct_resolvers"), patched.dig("dns", "nameserver-policy", "geosite:cn")
-    assert patched.dig("dns", "nameserver-policy", "+.openai.com").all? { |value| value.end_with?("##{result.fetch(:route_group)}") }
+    assert patched.dig("dns", "nameserver-policy", "+.openai.com").all? { |value| value.end_with?("##{result.fetch(:ai_group)}") }
 
     ai_group = patched.fetch("proxy-groups").find { |group| group["name"] == result.fetch(:ai_group) }
     assert_equal ["Main"], ai_group.fetch("proxies")
-    udp = "NETWORK,UDP,#{result.fetch(:route_group)}"
+    udp = "NETWORK,UDP,#{result.fetch(:ai_group)}"
     assert_includes patched.fetch("rules"), udp
     assert_equal "NETWORK,UDP,REJECT", patched.fetch("rules")[patched.fetch("rules").index(udp) + 1]
+    assert_equal 0, patched.fetch("rules").index(udp)
     assert_operator patched.fetch("rules").index(udp), :<, patched.fetch("rules").index("GEOSITE,CN,DIRECT")
     assert_includes patched.fetch("rules"), "DOMAIN,raw.githubusercontent.com,AI"
     assert_includes patched.fetch("rules"), "DOMAIN,storage.googleapis.com,AI"
@@ -76,8 +77,9 @@ class MacosPatcherTest < Minitest::Test
     assert_equal original_ai, patched.fetch("proxy-groups").find { |group| group["name"] == "AI" }
     refute patched.fetch("proxy-groups").any? { |group| ClashPatch.managed_group_name?(group["name"]) }
     assert_includes patched.fetch("rules"), "DOMAIN-SUFFIX,openai.com,AI"
-    assert_equal ["NETWORK,UDP,Main", "NETWORK,UDP,REJECT"], patched.fetch("rules").first(2)
+    assert_equal ["NETWORK,UDP,AI", "NETWORK,UDP,REJECT"], patched.fetch("rules").first(2)
     assert patched.dig("dns", "nameserver").all? { |value| value.end_with?("#Main") }
+    assert patched.dig("dns", "nameserver-policy", "+.openai.com").all? { |value| value.end_with?("#AI") }
   end
 
   def test_creates_ai_group_with_all_inline_nodes_when_subscription_has_none
@@ -94,6 +96,10 @@ class MacosPatcherTest < Minitest::Test
     refute ai_group.key?("use")
     refute patched.fetch("proxy-groups").any? { |group| ClashPatch.managed_name?(group["name"], ClashPatch::SAFE_GROUP_BASE) }
     assert_includes patched.fetch("rules"), "DOMAIN-SUFFIX,openai.com,🤖 AI · Clash Patch"
+    assert_equal "NETWORK,UDP,🤖 AI · Clash Patch", patched.fetch("rules")[0]
+    assert patched.dig("dns", "nameserver-policy", "+.openai.com").all? do |value|
+      value.end_with?("#🤖 AI · Clash Patch")
+    end
   end
 
   def test_new_ai_group_includes_every_proxy_provider
@@ -175,7 +181,7 @@ class MacosPatcherTest < Minitest::Test
     refute patched.fetch("proxy-groups").any? { |group| [ai_name, safe_name].include?(group["name"]) }
     refute patched.fetch("rules").any? { |rule| rule.include?(ai_name) || rule.include?(safe_name) }
     refute JSON.generate(patched.fetch("dns")).include?(safe_name)
-    assert_equal ["NETWORK,UDP,Main", "NETWORK,UDP,REJECT"], patched.fetch("rules").first(2)
+    assert_equal ["NETWORK,UDP,AI", "NETWORK,UDP,REJECT"], patched.fetch("rules").first(2)
   end
 
   def test_preserves_bootstrap_and_replaces_direct_resolvers_with_managed_mainland_doh
@@ -331,7 +337,7 @@ class MacosPatcherTest < Minitest::Test
 
     result = ClashPatch.patch(config, @policy)
     rules = result.fetch(:config).fetch("rules")
-    guard = "NETWORK,UDP,#{result.fetch(:route_group)}"
+    guard = "NETWORK,UDP,#{result.fetch(:ai_group)}"
 
     assert_equal 0, rules.index(guard)
     assert_equal "NETWORK,UDP,REJECT", rules[1]
@@ -661,7 +667,7 @@ class MacosPatcherTest < Minitest::Test
     assert_equal "select", created.fetch("type")
     assert_equal "🤖 AI · Clash Patch", result.fetch(:ai_group)
     assert_includes patched.fetch("rules"), "DOMAIN-SUFFIX,openai.com,🤖 AI · Clash Patch"
-    assert_includes patched.fetch("rules"), "NETWORK,UDP,#{result.fetch(:route_group)}"
+    assert_includes patched.fetch("rules"), "NETWORK,UDP,#{result.fetch(:ai_group)}"
     refute_self_reference(patched)
   end
 
@@ -695,7 +701,7 @@ class MacosPatcherTest < Minitest::Test
     assert_equal "Main", result.fetch(:main_group)
     assert_equal providers, patched.fetch("proxy-providers")
     assert_equal ["provider1"], patched.fetch("proxy-groups").find { |group| group["name"] == "Main" }.fetch("use")
-    assert_includes patched.fetch("rules"), "NETWORK,UDP,#{result.fetch(:route_group)}"
+    assert_includes patched.fetch("rules"), "NETWORK,UDP,#{result.fetch(:ai_group)}"
     refute_self_reference(patched)
   end
 
