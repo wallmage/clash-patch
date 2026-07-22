@@ -158,6 +158,31 @@ class SkillContractTest < Minitest::Test
     assert_includes windows_installer, "检测到从档位 3 改为轻量档位"
   end
 
+  def test_saved_profile_bounds_diagnostics_repairs_and_regression_checks
+    readme = File.read(File.join(ROOT, "README.md"))
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+    metadata = YAML.safe_load(File.read(File.join(SKILL, "agents/openai.yaml")))
+
+    [readme, skill, policy, design].each do |document|
+      assert_includes document, "Patch 和 Diagnostics"
+      assert_includes document, "诊断"
+      assert_includes document, "档位"
+    end
+
+    assert_includes skill, "Diagnostics 每次开始都先读取本机保存的档位"
+    assert_includes skill, "故障本身不能自动升档"
+    assert_includes policy, "用途档位是 Diagnostics 的需求边界"
+    assert_includes policy, "档位 1 不检查或修改 TUN"
+    assert_includes policy, "档位 1 不运行 DNS 泄漏、WebRTC 或 AI 检查"
+    assert_includes policy, "目标域名的普通 DNS 解析"
+    assert_includes policy, "档位 2 不运行 DNS 泄漏、WebRTC 或 AI 分组检查"
+    assert_includes policy, "档位 3 的既有能力"
+    assert_includes policy, "只重测可能受本次改动影响的第三档能力"
+    assert_includes metadata.dig("interface", "default_prompt"), "诊断前读取用途档位"
+  end
+
   def test_diagnostics_uses_a_universal_evidence_loop
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
 
