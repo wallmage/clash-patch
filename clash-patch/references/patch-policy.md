@@ -62,7 +62,7 @@ Clash Patch 有两个独立模块：
 
 档位 3 的完整补丁包括：TUN、DNS 劫持、自动与严格路由、IPv6 关闭、国内 DNS 直连大陆加密解析器、普通国外与 AI DNS 分流、AI 分组与规则、全局 UDP/WebRTC 防护和完整验证。节点只给建议：台湾家宽优先，其次日本家宽；不得自动切换节点。全局 UDP 也会影响 QUIC、游戏、语音和视频，必须在选择界面说明。
 
-macOS 用 `bash scripts/install_macos.sh --profile N` 保存档位，Windows 用 `.\scripts\install_windows.cmd -UsageProfile N`。档位 1、2 的安装程序保存后立即结束，不检查 Mihomo、不安装全局脚本、不修改任何订阅；客户端开关由有 Computer Use 的代理完成。只有档位 3 继续执行完整补丁。档位 3 必须先通过客户端界面关闭全部订阅的自动更新；macOS 安装器无法确认已关闭时必须停止且不改订阅。Windows 也通过 Computer Use 完成同一设置。无 Computer Use 时，只给出对应客户端的最短手动步骤，并把未能亲自确认的项目写成“未验证”。
+macOS 用 `bash scripts/install_macos.sh --profile N` 保存档位，Windows 用 `.\scripts\install_windows.cmd -UsageProfile N`。档位 1、2 的安装程序保存后立即结束，不检查 Mihomo、不安装全局脚本、不修改任何订阅；客户端开关由有 Computer Use 的代理完成。只有档位 3 继续执行完整补丁。档位 3 的订阅自动更新必须由安装程序直接关闭，不依赖 Computer Use，也不能要求小白用户手动操作。macOS 把 ClashX Meta 偏好项 `kAutoUpdateEnable` 写为布尔假值并立即回读；Windows 把 `profiles.yaml` 中每个 `type: remote` 项目的 `option.allow_auto_update` 写为 `false` 并逐项回读。任一平台无法安全识别、备份、写入或确认时，停止且不继续打补丁。
 
 ## Diagnostics 模块
 
@@ -160,7 +160,7 @@ Windows 历史总量优先读取 `ConnectionProfile.GetNetworkUsageAsync` 返回
 
 证据指向浏览器、应用、系统网络或本地缓存时，只修对应层，不顺手改 Clash。证据指向节点或服务端时，不擅自切换节点；说明已经排除的本机因素和用户需要做的最少选择。
 
-Windows 客户端运行时不得修改当前配置；安装器只能更新全局脚本，等待客户端以后正常加载或刷新订阅。此时只能写“已更新，尚未生效”，不能写成已立即生效或“已解决”，也不得为了复测而触发订阅切换、节点切换、代理组切换或 TUN 切换，更不得重启客户端。当前会话只能完成只读验证，或修复不需要改运行配置的那一层，并如实说明生效边界。
+Windows 客户端运行时不得修改当前配置；这里的当前配置是 `verge.yaml`、`config.yaml` 和 Mihomo 正在使用的运行配置。安装器可以更新全局脚本，也可以修改 `profiles.yaml` 中只负责订阅自动更新的字段。补丁内容仍要等待客户端以后正常加载或刷新订阅，此时只能写“已更新，尚未生效”，不能写成已立即生效或“已解决”，也不得为了复测而触发订阅切换、节点切换、代理组切换或 TUN 切换，更不得重启客户端。当前会话只能完成只读验证，或修复不需要改运行配置的那一层，并如实说明生效边界。
 
 本机无法修复，或修复依赖产品当前机制时，先确定问题类别，再在线搜索当前的官方或第一方资料；找不到第一方资料时才补充可靠的技术来源。搜索结果必须与本机证据吻合，并整理成用户可以直接照做的方案，不能只给链接或泛泛建议。
 
@@ -338,7 +338,7 @@ macOS 只允许单次显式运行。不得安装永久监听、LaunchAgent、`Ru
 
 Clash Verge Rev 每次加载或刷新订阅都会运行 `profiles/Script.js`。全局扩展脚本对传入配置应用相同策略。TUN 和顶层 IPv6 使用 Clash Verge Rev 的应用配置，因此不会被脚本后的应用设置覆盖。
 
-Windows 不安装永久监听、计划任务或后台服务。Clash Verge Rev 运行时只允许更新 `profiles/Script.js`，不得修改 `verge.yaml`、`config.yaml` 或当前运行配置。客户端原本没有运行时，才可用可信路径中的 Mihomo 做版本与候选配置检查，并按 YAML 映射节点修改应用设置。安装程序处理 `tun: null`、空格键名、行尾注释和块状 `dns-hijack`；无法安全合并的锚点与多文档 YAML 直接拒绝，`--- # 注释` 也算文档标记。全部候选先生成并检查，再写入；中途失败时继续恢复每一个目标，并按原始字节保留编码和 BOM。Windows 每次写入前创建带日期时间的版本化备份；备份停止继承目录权限，只允许当前用户、SYSTEM 和 Administrators 完全访问。
+Windows 不安装永久监听、计划任务或后台服务。Clash Verge Rev 运行时只允许更新 `profiles/Script.js` 和 `profiles.yaml` 中的 `option.allow_auto_update`，不得修改 `verge.yaml`、`config.yaml` 或当前运行配置。自动更新修改器只处理 `type: remote` 项目；保留本地项目、订阅地址、更新时间、间隔和其他选项。无法唯一识别 `items`、`type`、`option` 或目标字段，或遇到锚点、别名、重复键、行内复杂映射、多文档与制表符缩进时直接拒绝。每次实际写入前备份，写入后重新读取并确认所有远程订阅都是 `false`；任一步失败时恢复整个事务。客户端原本没有运行时，才可用可信路径中的 Mihomo 做版本与候选配置检查，并按 YAML 映射节点修改应用设置。安装程序处理 `tun: null`、空格键名、行尾注释和块状 `dns-hijack`；无法安全合并的锚点与多文档 YAML 直接拒绝，`--- # 注释` 也算文档标记。全部候选先生成并检查，再写入；中途失败时继续恢复每一个目标，并按原始字节保留编码和 BOM。Windows 每次写入前创建带日期时间的版本化备份；备份停止继承目录权限，只允许当前用户、SYSTEM 和 Administrators 完全访问。
 
 Windows 全局脚本也必须做二次转换一致性检查；结果不一致时返回原配置。任何流程都不得结束、暂停或重启 Clash 进程，也不得要求用户这样做。
 

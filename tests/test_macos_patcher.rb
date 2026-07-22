@@ -546,6 +546,60 @@ class MacosPatcherTest < Minitest::Test
     assert_equal :unknown, ClashPatch.subscription_auto_update_state(nil)
   end
 
+  def test_disables_subscription_auto_update_through_defaults_and_verifies_it
+    Dir.mktmpdir do |directory|
+      calls = []
+      values = ["1", "0"]
+      runner = lambda do |*arguments, **_options|
+        calls << arguments
+        if arguments[1] == "export"
+          ["plist", "", Struct.new(:success?).new(true)]
+        elsif arguments[1] == "write"
+          ["", "", Struct.new(:success?).new(true)]
+        elsif arguments[0] == "/usr/bin/plutil"
+          [values.shift, "", Struct.new(:success?).new(true)]
+        else
+          flunk("unexpected command: #{arguments.inspect}")
+        end
+      end
+
+      result = ClashPatch.disable_subscription_auto_update(backup_root: directory, runner: runner)
+
+      assert_equal :disabled, result.fetch(:status)
+      assert_equal "com.metacubex.ClashX.meta", result.fetch(:domain)
+      assert_includes calls, [
+        "/usr/bin/defaults", "write", "com.metacubex.ClashX.meta",
+        "kAutoUpdateEnable", "-bool", "false"
+      ]
+      backups = Dir.glob(File.join(directory, "*--preference--*.json.backup"))
+      assert_equal 1, backups.length
+      assert_equal 0, File.stat(backups.first).mode & 0o077
+      backup = JSON.parse(File.read(backups.first))
+      assert_equal "kAutoUpdateEnable", backup.fetch("Key")
+      assert_equal "1", backup.fetch("Value")
+      refute_includes File.read(backups.first), "kRemoteConfigs"
+    end
+  end
+
+  def test_auto_update_disable_is_idempotent_and_does_not_create_backup_when_already_off
+    Dir.mktmpdir do |directory|
+      runner = lambda do |*arguments, **_options|
+        if arguments[1] == "export"
+          ["plist", "", Struct.new(:success?).new(true)]
+        elsif arguments[0] == "/usr/bin/plutil"
+          ["0", "", Struct.new(:success?).new(true)]
+        else
+          flunk("automatic update was already disabled but tried to write: #{arguments.inspect}")
+        end
+      end
+
+      result = ClashPatch.disable_subscription_auto_update(backup_root: directory, runner: runner)
+
+      assert_equal :already_disabled, result.fetch(:status)
+      assert_empty Dir.glob(File.join(directory, "*.backup"))
+    end
+  end
+
   def test_remote_subscription_records_map_every_client_entry_without_exposing_urls
     Dir.mktmpdir do |directory|
       %w[MESL Yue Express].each { |name| File.write(File.join(directory, "#{name}.yaml"), YAML.dump(base_config)) }

@@ -194,11 +194,15 @@ if [ "$SAFE_UPDATE" -eq 0 ] && [ "$USAGE_PROFILE" -ne 3 ]; then
 fi
 
 if [ "$USAGE_PROFILE" -eq 3 ]; then
-  auto_update_state=$(/usr/bin/ruby "$PATCHER_SOURCE" --print-subscription-auto-update-state 2>/dev/null || true)
-  if [ "$auto_update_state" != "disabled" ]; then
-    say "档位 3 要求先在 ClashX Meta 界面关闭订阅自动更新；本次未修改任何订阅。"
+  if ! auto_update_result=$(/usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --disable-subscription-auto-update 2>&1); then
+    say "无法自动关闭 ClashX Meta 的订阅自动更新；本次未修改任何订阅。"
     exit 9
   fi
+  case "$auto_update_result" in
+    disabled) say "已自动关闭订阅更新，并保存修改前状态。" ;;
+    already_disabled) say "订阅自动更新已经关闭。" ;;
+    *) say "订阅自动更新回读结果异常；本次未修改任何订阅。"; exit 9 ;;
+  esac
 fi
 
 core_status=$(/usr/bin/ruby "$PATCHER_SOURCE" --print-core-status 2>/dev/null || true)

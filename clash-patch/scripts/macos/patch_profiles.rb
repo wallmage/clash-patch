@@ -8,6 +8,7 @@ require "open3"
 require "optparse"
 require "psych"
 require "tempfile"
+require "time"
 
 module ClashPatch
   module_function
@@ -1064,20 +1065,77 @@ module ClashPatch
     base_result(nil, :error).merge(path: path)
   end
 
-  def defaults_read(key)
+  def defaults_export_domain(runner: Open3.method(:capture3))
     %w[com.metacubex.ClashX.meta com.MetaCubeX.ClashX.meta].each do |domain|
-      plist, _export_error, export_status = Open3.capture3("/usr/bin/defaults", "export", domain, "-")
+      plist, _export_error, export_status = runner.call("/usr/bin/defaults", "export", domain, "-")
       next unless export_status.success? && !plist.empty?
 
-      value, _extract_error, extract_status = Open3.capture3(
-        "/usr/bin/plutil", "-extract", key, "raw", "-o", "-", "-", stdin_data: plist
-      )
-      value = value.strip
-      return value if extract_status.success? && !value.empty?
+      return { domain: domain, plist: plist }
     rescue StandardError
       next
     end
+    nil
+  end
+
+  def plist_raw_value(plist, key, runner: Open3.method(:capture3))
+    value, _extract_error, extract_status = runner.call(
+      "/usr/bin/plutil", "-extract", key, "raw", "-o", "-", "-", stdin_data: plist
+    )
+    value = value.to_s.strip
+    extract_status.success? && !value.empty? ? value : ""
+  rescue StandardError
     ""
+  end
+
+  def defaults_read(key, runner: Open3.method(:capture3))
+    exported = defaults_export_domain(runner: runner)
+    return "" unless exported
+
+    plist_raw_value(exported.fetch(:plist), key, runner: runner)
+  end
+
+  def disable_subscription_auto_update(backup_root:, runner: Open3.method(:capture3))
+    exported = defaults_export_domain(runner: runner)
+    raise InvalidConfigError, "无法读取 ClashX Meta 偏好设置" unless exported
+
+    domain = exported.fetch(:domain)
+    original = plist_raw_value(exported.fetch(:plist), "kAutoUpdateEnable", runner: runner)
+    state = subscription_auto_update_state(original)
+    return { status: :already_disabled, domain: domain } if state == :disabled
+    raise InvalidConfigError, "无法确认 ClashX Meta 订阅自动更新状态" unless state == :enabled
+
+    backup = {
+      "Version" => 1,
+      "Domain" => domain,
+      "Key" => "kAutoUpdateEnable",
+      "Value" => original,
+      "RecordedAt" => Time.now.iso8601
+    }
+    backup_path = File.join(backup_root, "clashx-meta-kAutoUpdateEnable.json")
+    created_backup = create_versioned_backup(
+      backup_path, backup_root, content: JSON.generate(backup) + "\n", reason: "preference"
+    )
+
+    _output, error, write_status = runner.call(
+      "/usr/bin/defaults", "write", domain, "kAutoUpdateEnable", "-bool", "false"
+    )
+    unless write_status.success?
+      runner.call("/usr/bin/defaults", "write", domain, "kAutoUpdateEnable", "-bool", "true")
+      raise IOError, "无法关闭 ClashX Meta 订阅自动更新：#{error.to_s.strip}"
+    end
+
+    verified_export = defaults_export_domain(runner: runner)
+    verified_value = if verified_export && verified_export.fetch(:domain) == domain
+                       plist_raw_value(verified_export.fetch(:plist), "kAutoUpdateEnable", runner: runner)
+                     else
+                       ""
+                     end
+    unless subscription_auto_update_state(verified_value) == :disabled
+      runner.call("/usr/bin/defaults", "write", domain, "kAutoUpdateEnable", "-bool", "true")
+      raise IOError, "ClashX Meta 订阅自动更新设置回读失败，已经恢复原值"
+    end
+
+    { status: :disabled, domain: domain, backup: created_backup }
   end
 
   def selected_profile_name
@@ -1646,6 +1704,7 @@ module ClashPatch
       print_tun_state: false,
       print_core_status: false,
       print_subscription_auto_update_state: false,
+      disable_subscription_auto_update: false,
       snapshot_initial: false,
       compare_backup: nil,
       restore_backup: nil,
@@ -1663,6 +1722,7 @@ module ClashPatch
       opts.on("--print-tun-state", "输出当前运行内核的 TUN 状态") { options[:print_tun_state] = true }
       opts.on("--print-core-status", "检查 Mihomo 内核是否满足最低版本") { options[:print_core_status] = true }
       opts.on("--print-subscription-auto-update-state", "输出订阅自动更新状态") { options[:print_subscription_auto_update_state] = true }
+      opts.on("--disable-subscription-auto-update", "关闭订阅自动更新并回读确认") { options[:disable_subscription_auto_update] = true }
       opts.on("--snapshot-initial", "为当前存储位置创建一次初始快照") { options[:snapshot_initial] = true }
       opts.on("--compare-backup ID", "比较指定备份与当前配置") { |value| options[:compare_backup] = value }
       opts.on("--restore-backup ID", "恢复指定备份") { |value| options[:restore_backup] = value }
@@ -1690,6 +1750,17 @@ module ClashPatch
     if options[:print_subscription_auto_update_state]
       puts subscription_auto_update_state
       return 0
+    end
+
+    if options[:disable_subscription_auto_update]
+      begin
+        result = disable_subscription_auto_update(backup_root: options[:backup_root])
+        puts result.fetch(:status)
+        return 0
+      rescue InvalidConfigError, SystemCallError, IOError => error
+        warn error.message
+        return 1
+      end
     end
 
     directories = options[:profile_dirs].empty? ? default_profile_directories : options[:profile_dirs]

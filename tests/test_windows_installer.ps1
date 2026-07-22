@@ -64,6 +64,7 @@ function Assert-InstallerRejectsScript([string]$Name, [string]$Script, [string]$
     New-Item -ItemType Directory -Path $profiles -Force | Out-Null
     [System.IO.File]::WriteAllText((Join-Path $case "config.yaml"), "ipv6: true`ntun: null`n")
     [System.IO.File]::WriteAllText((Join-Path $case "verge.yaml"), "enable_tun_mode: false`n")
+    [System.IO.File]::WriteAllText((Join-Path $case "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
     $scriptPath = Join-Path $profiles "Script.js"
     [System.IO.File]::WriteAllText($scriptPath, $Script)
     $result = Invoke-TestPowerShell $installer @("-AppHome", $case, "-MihomoPath", $fakeCore)
@@ -140,6 +141,34 @@ try {
     $commentedDocumentRejected = $false
     try { Test-GeneratedYaml "friend: true`n--- # second document`nother: false`n" "verge.yaml" | Out-Null } catch { $commentedDocumentRejected = $true }
     Assert-True $commentedDocumentRejected "commented YAML document marker was ignored"
+
+    $profilesIndexInput = @'
+current: R-first
+items:
+- uid: R-first
+  type: remote
+  name: First
+  option:
+    update_interval: 1440
+    allow_auto_update: true
+- uid: L-local
+  type: local
+  name: Local
+- uid: R-second
+  type: remote
+  name: Second
+  option: null
+'@
+    $profilesIndexOutput = Set-RemoteSubscriptionAutoUpdateDisabled $profilesIndexInput
+    Assert-True ([regex]::Matches($profilesIndexOutput, '(?m)^\s+allow_auto_update:\s+false\s*$').Count -eq 2) "not every remote subscription was disabled"
+    Assert-True ($profilesIndexOutput.Contains("type: local")) "local profile was removed"
+    Assert-True ($profilesIndexOutput.Contains("update_interval: 1440")) "unrelated remote option was removed"
+    Assert-True ((Set-RemoteSubscriptionAutoUpdateDisabled $profilesIndexOutput) -eq $profilesIndexOutput) "profiles.yaml transform is not idempotent"
+    Assert-RemoteSubscriptionAutoUpdateDisabled $profilesIndexOutput
+
+    $flowProfilesRejected = $false
+    try { Set-RemoteSubscriptionAutoUpdateDisabled "items: [{ type: remote }]`n" | Out-Null } catch { $flowProfilesRejected = $true }
+    Assert-True $flowProfilesRejected "inline profiles list was modified instead of rejected"
 
     Assert-True (Test-MihomoVersionText "Mihomo Meta v1.19.27") "minimum Mihomo version was rejected"
     Assert-True (-not (Test-MihomoVersionText "Mihomo Meta v1.19.26")) "old Mihomo version was accepted"
@@ -224,6 +253,7 @@ try {
 
     $nullCase = Join-Path $sandbox "null-case"
     New-Item -ItemType Directory -Path $nullCase -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $nullCase "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
     [System.IO.File]::WriteAllText((Join-Path $nullCase "config.yaml"), "ipv6 : true`ntun: null`n")
     [System.IO.File]::WriteAllText((Join-Path $nullCase "verge.yaml"), "enable_tun_mode: false`n")
     Invoke-Installer $nullCase
@@ -231,9 +261,14 @@ try {
     Assert-True ([regex]::Matches($nullOutput, '(?m)^tun\s*:').Count -eq 1) "tun: null produced duplicate tun keys"
     Assert-True ([regex]::Matches($nullOutput, '(?m)^ipv6\s*:').Count -eq 1) "spaced ipv6 produced duplicate ipv6 keys"
     Assert-True ($nullOutput.Contains("dns-hijack:`n") -or $nullOutput.Contains("dns-hijack:`r`n")) "dns-hijack block missing"
+    $nullProfilesIndex = Get-Content -LiteralPath (Join-Path $nullCase "profiles.yaml") -Raw
+    Assert-True ($nullProfilesIndex -match '(?m)^\s+allow_auto_update:\s+false\s*$') "profile 3 did not disable subscription auto-update"
+    $profilesBackups = @(Get-ChildItem -LiteralPath (Join-Path $nullCase "clash-patch-backups") -File | Where-Object { $_.Name -like "*--profiles.yaml.backup" })
+    Assert-True ($profilesBackups.Count -ge 1) "profiles.yaml was changed without a dated backup"
 
     $blockCase = Join-Path $sandbox "block-case"
     New-Item -ItemType Directory -Path $blockCase -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $blockCase "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
     $blockInput = "ipv6: true`ntun:`n  enable: false`n  dns-hijack:`n    - 0.0.0.0:53`n  device: Clash`n"
     [System.IO.File]::WriteAllText((Join-Path $blockCase "config.yaml"), $blockInput)
     [System.IO.File]::WriteAllText((Join-Path $blockCase "verge.yaml"), "enable_dns_settings: true`n")
@@ -247,6 +282,7 @@ try {
     $composeCase = Join-Path $sandbox "compose-case"
     $composeProfiles = Join-Path $composeCase "profiles"
     New-Item -ItemType Directory -Path $composeProfiles -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $composeCase "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
     $composeConfigOriginal = "ipv6: true`ntun: null`n"
     $composeVergeOriginal = "enable_tun_mode: false`nenable_dns_settings: true`n"
     [System.IO.File]::WriteAllText((Join-Path $composeCase "config.yaml"), $composeConfigOriginal)
@@ -269,6 +305,7 @@ try {
     $asyncCase = Join-Path $sandbox "async-case"
     $asyncProfiles = Join-Path $asyncCase "profiles"
     New-Item -ItemType Directory -Path $asyncProfiles -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $asyncCase "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
     $asyncConfig = "ipv6: true`ntun: null`n"
     $asyncVerge = "enable_tun_mode: false`n"
     $asyncScript = "async function main(config) { return config; }`n"
@@ -286,6 +323,7 @@ try {
     $templateMarkerCase = Join-Path $sandbox "template-marker-case"
     $templateMarkerProfiles = Join-Path $templateMarkerCase "profiles"
     New-Item -ItemType Directory -Path $templateMarkerProfiles -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $templateMarkerCase "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
     [System.IO.File]::WriteAllText((Join-Path $templateMarkerCase "config.yaml"), "ipv6: true`ntun: null`n")
     [System.IO.File]::WriteAllText((Join-Path $templateMarkerCase "verge.yaml"), "enable_tun_mode: false`n")
     $templateScript = @'
@@ -312,6 +350,7 @@ friend payload
 
     $invalidStateCase = Join-Path $sandbox "invalid-state-case"
     New-Item -ItemType Directory -Path $invalidStateCase -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $invalidStateCase "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
     $invalidStateConfig = "ipv6: true`ntun: null`n"
     $invalidStateVerge = "enable_tun_mode: false`n"
     [System.IO.File]::WriteAllText((Join-Path $invalidStateCase "config.yaml"), $invalidStateConfig)

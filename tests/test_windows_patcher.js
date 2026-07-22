@@ -749,11 +749,15 @@ test('Windows installation fails closed and preserves exact restore state', () =
   assert.match(installer, /Mihomo 1\.19\.27/);
   assert.match(installer, /Join-Path \(Join-Path \$env:LOCALAPPDATA "Clash Verge"\) "verge-mihomo\.exe"/);
   assert.match(installer, /function Test-ClashVergeRunning/);
-  assert.match(installer, /if \(\$clientRunning\)[\s\S]*Write-BytesAtomic \$targetScript \$scriptBytes[\s\S]*exit 0/);
+  assert.match(installer, /if \(\$clientRunning\)[\s\S]*\$runningTargets[\s\S]*Write-BytesAtomic \$target\.Path \$target\.Bytes[\s\S]*exit 0/);
   assert.match(installer, /WaitForExit\(\$TimeoutSeconds \* 1000\)/);
   assert.match(installer, /\$process\.Kill\(\)/);
   assert.doesNotMatch(installer, /Get-Process -Name "verge-mihomo"/);
   assert.match(installer, /function Write-BytesAtomic/);
+  assert.match(installer, /function Set-RemoteSubscriptionAutoUpdateDisabled/);
+  assert.match(installer, /function Assert-RemoteSubscriptionAutoUpdateDisabled/);
+  assert.match(installer, /allow_auto_update/);
+  assert.match(installer, /profiles\.yaml/);
   assert.match(installer, /OriginalBytes/);
   assert.match(installer, /install-state\.json/);
   assert.match(installer, /SetAccessRuleProtection/);

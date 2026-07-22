@@ -322,6 +322,12 @@ class SkillContractTest < Minitest::Test
     assert_includes installer, "--safe-update"
     assert_includes patcher, "--safe-update-all"
     assert_includes patcher, "--print-subscription-auto-update-state"
+    assert_includes patcher, "--disable-subscription-auto-update"
+    assert_includes installer, "--disable-subscription-auto-update"
+    assert_includes File.read(File.join(SKILL, "scripts/install_windows.ps1")), "allow_auto_update"
+    [readme, skill, policy, design].each do |document|
+      assert_includes document, "不依赖 Computer Use"
+    end
     assert_includes policy, "不得安装永久监听"
     refute_includes skill, "订阅以后刷新时，请再次运行"
   end
