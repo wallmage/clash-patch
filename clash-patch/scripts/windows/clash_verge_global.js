@@ -9,6 +9,10 @@ const CLASH_PATCH_POLICY = {
     "https://94.140.14.141/dns-query",
     "https://101.101.101.101/dns-query"
   ],
+  "directResolvers": [
+    "https://223.5.5.5/dns-query#DIRECT",
+    "https://1.12.12.12/dns-query#DIRECT"
+  ],
   "bootstrapFallbackResolvers": [
     "system"
   ],
@@ -451,6 +455,8 @@ function clashPatchDns(config, routeGroup, ownedSafeNames) {
   }
   dns.nameserver = safeResolvers.slice();
   if (Object.prototype.hasOwnProperty.call(dns, "fallback")) dns.fallback = safeResolvers.slice();
+  dns["direct-nameserver"] = CLASH_PATCH_POLICY.directResolvers.slice();
+  dns["direct-nameserver-follow-policy"] = false;
 
   const existing = dns["nameserver-policy"] && typeof dns["nameserver-policy"] === "object" ? dns["nameserver-policy"] : {};
   const policies = {};
@@ -470,6 +476,7 @@ function clashPatchDns(config, routeGroup, ownedSafeNames) {
       policies[pattern] = normalized || safeResolvers.slice();
     });
   });
+  policies["geosite:cn"] = CLASH_PATCH_POLICY.directResolvers.slice();
   clashPatchDnsPatterns().forEach(function (pattern) { policies[pattern] = safeResolvers.slice(); });
   dns["nameserver-policy"] = policies;
 }

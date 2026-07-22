@@ -110,7 +110,9 @@ class SkillContractTest < Minitest::Test
   def test_skill_names_every_guard_from_the_network_outage
     source = File.read(File.join(SKILL, "SKILL.md"))
 
-    assert_includes source, "保留 `default-nameserver`、`proxy-server-nameserver` 和 `direct-nameserver`"
+    assert_includes source, "保留 `default-nameserver` 和 `proxy-server-nameserver`"
+    assert_includes source, "大陆 IP DoH"
+    assert_includes source, "direct-nameserver-follow-policy"
     assert_includes source, "不得把节点启动解析改成 `1.1.1.1` 或 `8.8.8.8`"
     assert_includes source, "不安装 LaunchAgent、`WatchPaths` 或目录监听"
     assert_includes source, "REALITY `short-id`"
@@ -191,6 +193,10 @@ class SkillContractTest < Minitest::Test
       "https://94.140.14.141/dns-query",
       "https://101.101.101.101/dns-query"
     ], policy.fetch("resolvers")
+    assert_equal [
+      "https://223.5.5.5/dns-query#DIRECT",
+      "https://1.12.12.12/dns-query#DIRECT"
+    ], policy.fetch("direct_resolvers")
 
     public_source = Dir.glob(File.join(ROOT, "{README.md,clash-patch/**/*}"), File::FNM_EXTGLOB)
                        .select { |path| File.file?(path) }
@@ -231,6 +237,8 @@ class SkillContractTest < Minitest::Test
     %w[exclude-filter empty-fallback skip-cert-verify ecs 160.79.104.0/21 ai.com proxy-server-nameserver system 二次转换].each do |term|
       assert_includes policy, term
     end
+    assert_includes policy, "/cache/fakeip/flush"
+    assert_includes policy, "/cache/dns/flush"
   end
 
   def test_macos_installer_is_one_shot_and_removes_legacy_persistence

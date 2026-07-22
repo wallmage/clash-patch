@@ -7,6 +7,7 @@ policy = JSON.parse(File.binread(policy_path).force_encoding(Encoding::UTF_8))
 mapping = {
   "version" => "version",
   "resolvers" => "resolvers",
+  "direct_resolvers" => "directResolvers",
   "bootstrap_fallback_resolvers" => "bootstrapFallbackResolvers",
   "main_group_names" => "mainGroupNames",
   "ai_group_names" => "aiGroupNames",

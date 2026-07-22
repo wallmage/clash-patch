@@ -28,6 +28,9 @@ test('global transform applies common policy', { skip: !available }, () => {
   assert.equal(patched.ipv6, false);
   assert.equal(patched.dns.ipv6, false);
   assert.deepEqual(patched.tun['dns-hijack'], ['any:53', 'tcp://any:53']);
+  assert.deepEqual(patched.dns['direct-nameserver'], engine.CLASH_PATCH_POLICY.directResolvers);
+  assert.equal(patched.dns['direct-nameserver-follow-policy'], false);
+  assert.deepEqual(patched.dns['nameserver-policy']['geosite:cn'], engine.CLASH_PATCH_POLICY.directResolvers);
   assert.deepEqual(ai.proxies, ['Main']);
   const udpIndex = patched.rules.indexOf(`NETWORK,UDP,${safeGroup}`);
   assert.ok(udpIndex >= 0);
@@ -142,7 +145,7 @@ test('removes groups created by an older patch', { skip: !available }, () => {
   assert.deepEqual(patched.rules.slice(0, 2), ['NETWORK,UDP,Main', 'NETWORK,UDP,REJECT']);
 });
 
-test('preserves bootstrap and direct resolvers', { skip: !available }, () => {
+test('preserves bootstrap and replaces direct resolvers with managed mainland DoH', { skip: !available }, () => {
   const config = baseConfig();
   config.dns['default-nameserver'] = ['223.5.5.5', '119.29.29.29'];
   config.dns['proxy-server-nameserver'] = ['223.5.5.5', '120.53.53.53'];
@@ -152,7 +155,8 @@ test('preserves bootstrap and direct resolvers', { skip: !available }, () => {
 
   assert.deepEqual(dns['default-nameserver'], ['223.5.5.5', '119.29.29.29']);
   assert.deepEqual(dns['proxy-server-nameserver'], ['223.5.5.5', '120.53.53.53']);
-  assert.deepEqual(dns['direct-nameserver'], ['system']);
+  assert.deepEqual(dns['direct-nameserver'], engine.CLASH_PATCH_POLICY.directResolvers);
+  assert.equal(dns['direct-nameserver-follow-policy'], false);
 });
 
 test('managed DNS uses bootstrap-free IP DoH and rewrites other endpoints', { skip: !available }, () => {
@@ -162,6 +166,10 @@ test('managed DNS uses bootstrap-free IP DoH and rewrites other endpoints', { sk
     'https://101.101.101.101/dns-query'
   ];
   assert.deepEqual(engine.CLASH_PATCH_POLICY.resolvers, expectedResolvers);
+  assert.deepEqual(engine.CLASH_PATCH_POLICY.directResolvers, [
+    'https://223.5.5.5/dns-query#DIRECT',
+    'https://1.12.12.12/dns-query#DIRECT'
+  ]);
 
   const config = baseConfig();
   config.dns['proxy-server-nameserver'] = ['223.5.5.5', '120.53.53.53'];
@@ -186,7 +194,8 @@ test('uses system only when proxy bootstrap is missing', { skip: !available }, (
 
   assert.equal(Object.hasOwn(dns, 'default-nameserver'), false);
   assert.deepEqual(dns['proxy-server-nameserver'], ['system']);
-  assert.equal(Object.hasOwn(dns, 'direct-nameserver'), false);
+  assert.deepEqual(dns['direct-nameserver'], engine.CLASH_PATCH_POLICY.directResolvers);
+  assert.equal(dns['direct-nameserver-follow-policy'], false);
 });
 
 test('migrates the old unsafe bootstrap signature to system', { skip: !available }, () => {
@@ -311,6 +320,7 @@ test('exports the canonical policy without divergence', { skip: !available }, ()
   const mapping = {
     version: 'version',
     resolvers: 'resolvers',
+    direct_resolvers: 'directResolvers',
     bootstrap_fallback_resolvers: 'bootstrapFallbackResolvers',
     main_group_names: 'mainGroupNames',
     ai_group_names: 'aiGroupNames',

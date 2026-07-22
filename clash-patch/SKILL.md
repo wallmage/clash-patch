@@ -18,10 +18,11 @@ description: Use when an agent needs to inspect, repair, or safely apply DNS, We
 
 ## 事故防线
 
-- 保留 `default-nameserver`、`proxy-server-nameserver` 和 `direct-nameserver`。不得把节点启动解析改成 `1.1.1.1` 或 `8.8.8.8`；字段缺失或属于旧版危险值时按策略改用 `system`。
+- 保留 `default-nameserver` 和 `proxy-server-nameserver` 的安全用户值；字段缺失或属于旧版危险固定值时按策略迁移。不得把节点启动解析改成 `1.1.1.1` 或 `8.8.8.8`。把 `direct-nameserver` 统一设为策略中的大陆 IP DoH，并关闭 `direct-nameserver-follow-policy`，让已判定为 `DIRECT` 的国内域名获得大陆 CDN。不得使用明文 DNS、`system` 或 ECS 作为直连域名解析器。
 - macOS 不安装 LaunchAgent、`WatchPaths` 或目录监听，并清理能确认属于旧版 Clash Patch 的监听，避免补丁写入再次触发自己。
 - macOS 必须把已有且有效的 REALITY `short-id` 保持为文本；不补齐、不截断、不猜测。Windows 脚本不改该字段。
 - 任何候选都必须验证并再次转换；结果不一致、内核拒绝或超时就保留原订阅。当前订阅只允许通过本地控制器自动刷新；刷新或运行检查失败时立即恢复原文件和原运行配置，绝不退出 Clash。
+- macOS 当前订阅刷新成功后，必须通过本地控制器依次清除 Fake-IP 和 DNS 缓存，再做 DNS 与连接验证；缓存清理失败也要恢复原配置。
 - `config.yaml` 是 ClashX Meta 的默认基础配置，不得删除；当前选择其他订阅时安静跳过它，不把它当成无效订阅报错。
 
 ## 执行
@@ -34,6 +35,8 @@ description: Use when an agent needs to inspect, repair, or safely apply DNS, We
 
 macOS 只单次处理当前存储位置，不安装 LaunchAgent 或 `WatchPaths`。当前订阅修改后自动刷新，并检查 TUN、DNS、外网连通性和原有代理组选择；失败时自动恢复。Windows 使用全局扩展脚本；客户端运行时只更新 `profiles/Script.js`。两个平台都必须让 Clash 保持运行。
 
+DNS 必须按出站拆分：用 `nameserver-policy` 的 `geosite:cn` 把国内域名交给大陆加密 DNS，并通过 `DIRECT` 连接；代理和 AI 域名继续使用通过原主代理组访问的受管 DoH。`direct-nameserver` 作为直连出站的同一套后备，不得为单个国内网站添加 DNS 例外。
+
 订阅已有可选 AI 分组时，直接复用，只补全规则；不得修改它的成员或当前选择。没有 AI 分组时才创建独立的 `🤖 AI · Clash Patch`，加入订阅全部可用的真实节点和代理提供者，让主代理组与 AI 节点互不影响。找不到任何可用节点或代理提供者时不创建无意义的分组。不得创建第二个安全代理分组，也不得替用户选择节点。
 
 通用 UDP 会影响 WebRTC、游戏、语音、视频通话和 QUIC，执行前告诉用户。家宽通常更适合 AI；有台湾家宽时优先建议台湾，没有时可建议日本，最终由用户选择。
@@ -43,6 +46,8 @@ macOS 只单次处理当前存储位置，不安装 LaunchAgent 或 `WatchPaths`
 ## 验证
 
 macOS 先运行 `ruby scripts/macos/verify_routes.rb`，通过 Mihomo 实时连接记录验证分流：访问 Google 时必须经过当前主代理节点；访问 OpenAI、Anthropic 或 Claude 时必须经过 AI 分组当前节点。任何一项走错都要继续修复，不能只看 YAML 规则。其他平台使用可用的本地控制器执行同等检查。
+
+再验证用户报告的国内站点；没有指定站点时使用常见国内域名。通过 Mihomo `/dns/query` 读取当前 A/CNAME，同时直接查询策略中的两套大陆 DoH，确认当前结果来自同类大陆 CDN，而不是代理节点所在地的解析结果。随后记录 HTTPS 的 DNS、TCP、TLS、首字节和总耗时，并从 `/connections` 确认连接链为 `DIRECT`。解析位置、实时时间和连接链缺一项都不能写成通过。
 
 然后使用 Computer Use 自动打开以下页面并完成操作。它们会收到浏览器公网 IP；用户已经要求运行本 skill 时可视为同意执行这些指定测试：
 

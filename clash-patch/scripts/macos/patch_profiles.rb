@@ -413,6 +413,8 @@ module ClashPatch
     end
     dns["nameserver"] = deep_copy(safe_resolvers)
     dns["fallback"] = deep_copy(safe_resolvers) if dns.key?("fallback")
+    dns["direct-nameserver"] = deep_copy(policy["direct_resolvers"])
+    dns["direct-nameserver-follow-policy"] = false
 
     existing = dns["nameserver-policy"].is_a?(Hash) ? dns["nameserver-policy"] : {}
     policies = {}
@@ -429,6 +431,7 @@ module ClashPatch
         policies[pattern] = normalized || deep_copy(safe_resolvers)
       end
     end
+    policies["geosite:cn"] = deep_copy(policy["direct_resolvers"])
     ai_dns_patterns(policy).each { |pattern| policies[pattern] = deep_copy(safe_resolvers) }
     dns["nameserver-policy"] = policies
   end
@@ -1132,6 +1135,14 @@ module ClashPatch
     )
     unless code == 204
       return result.merge(status: rollback_after_reload_failure(result, nil, nil))
+    end
+
+    caches_flushed = ["/cache/fakeip/flush", "/cache/dns/flush"].all? do |endpoint|
+      cache_code, _cache_body = requester.call("POST", endpoint, nil)
+      [200, 204].include?(cache_code)
+    end
+    unless caches_flushed
+      return result.merge(status: rollback_after_reload_failure(result, requester, result[:path]))
     end
 
     healthy = tun_state(requester: requester) == :enabled

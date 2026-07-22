@@ -49,6 +49,9 @@ class MacosPatcherTest < Minitest::Test
     assert_equal true, patched.dig("tun", "strict-route")
     assert_equal ["any:53", "tcp://any:53"], patched.dig("tun", "dns-hijack")
     assert patched.dig("dns", "nameserver").all? { |value| value.end_with?("##{result.fetch(:route_group)}") }
+    assert_equal @policy.fetch("direct_resolvers"), patched.dig("dns", "direct-nameserver")
+    assert_equal false, patched.dig("dns", "direct-nameserver-follow-policy")
+    assert_equal @policy.fetch("direct_resolvers"), patched.dig("dns", "nameserver-policy", "geosite:cn")
     assert patched.dig("dns", "nameserver-policy", "+.openai.com").all? { |value| value.end_with?("##{result.fetch(:route_group)}") }
 
     ai_group = patched.fetch("proxy-groups").find { |group| group["name"] == result.fetch(:ai_group) }
@@ -175,7 +178,7 @@ class MacosPatcherTest < Minitest::Test
     assert_equal ["NETWORK,UDP,Main", "NETWORK,UDP,REJECT"], patched.fetch("rules").first(2)
   end
 
-  def test_preserves_bootstrap_and_direct_resolvers
+  def test_preserves_bootstrap_and_replaces_direct_resolvers_with_managed_mainland_doh
     config = base_config
     config["dns"]["default-nameserver"] = ["223.5.5.5", "119.29.29.29"]
     config["dns"]["proxy-server-nameserver"] = ["223.5.5.5", "120.53.53.53"]
@@ -185,7 +188,8 @@ class MacosPatcherTest < Minitest::Test
 
     assert_equal ["223.5.5.5", "119.29.29.29"], patched.fetch("default-nameserver")
     assert_equal ["223.5.5.5", "120.53.53.53"], patched.fetch("proxy-server-nameserver")
-    assert_equal ["system"], patched.fetch("direct-nameserver")
+    assert_equal @policy.fetch("direct_resolvers"), patched.fetch("direct-nameserver")
+    assert_equal false, patched.fetch("direct-nameserver-follow-policy")
   end
 
   def test_managed_dns_uses_bootstrap_free_ip_doh_and_rewrites_other_endpoints
@@ -195,6 +199,10 @@ class MacosPatcherTest < Minitest::Test
       "https://101.101.101.101/dns-query"
     ]
     assert_equal expected_resolvers, @policy.fetch("resolvers")
+    assert_equal [
+      "https://223.5.5.5/dns-query#DIRECT",
+      "https://1.12.12.12/dns-query#DIRECT"
+    ], @policy.fetch("direct_resolvers")
 
     config = base_config
     config["dns"]["proxy-server-nameserver"] = ["223.5.5.5", "120.53.53.53"]
@@ -219,7 +227,8 @@ class MacosPatcherTest < Minitest::Test
 
     refute patched.key?("default-nameserver")
     assert_equal ["system"], patched.fetch("proxy-server-nameserver")
-    refute patched.key?("direct-nameserver")
+    assert_equal @policy.fetch("direct_resolvers"), patched.fetch("direct-nameserver")
+    assert_equal false, patched.fetch("direct-nameserver-follow-policy")
   end
 
   def test_migrates_the_old_unsafe_bootstrap_signature_to_system
@@ -779,6 +788,8 @@ class MacosPatcherTest < Minitest::Test
         case [method, endpoint]
         when ["GET", "/proxies"] then [200, proxy_body]
         when ["PUT", "/configs?force=true"] then [204, ""]
+        when ["POST", "/cache/fakeip/flush"] then [204, ""]
+        when ["POST", "/cache/dns/flush"] then [204, ""]
         when ["GET", "/configs"] then [200, JSON.generate("tun" => { "enable" => true })]
         else
           if method == "GET" && endpoint.start_with?("/dns/query?")
@@ -798,6 +809,8 @@ class MacosPatcherTest < Minitest::Test
       assert_includes ClashPatch.chinese_status(active), "已更新并自动生效"
       assert_includes ClashPatch.chinese_status(inactive), "已更新，选择该订阅时生效"
       assert requests.any? { |method, endpoint, _body| method == "PUT" && endpoint == "/configs?force=true" }
+      assert requests.any? { |method, endpoint, _body| method == "POST" && endpoint == "/cache/fakeip/flush" }
+      assert requests.any? { |method, endpoint, _body| method == "POST" && endpoint == "/cache/dns/flush" }
     end
   end
 

@@ -11,8 +11,9 @@ Clash Patch 是给 AI 助手使用的 Clash 配置补丁，支持 macOS 的 Clas
 ## 补丁内容
 
 - 打开配置中的 TUN、DNS 劫持、自动路由和严格路由，关闭配置中的 IPv6。
-- 使用通过原主代理组访问的 IP DoH，避免解析器域名错误或节点拒绝 Google、Cloudflare DNS。
-- 保留节点启动解析；缺失或仍是旧版危险固定值时才改用系统 DNS。
+- 国内域名由 `geosite:cn` 交给阿里和 DNSPod 的大陆 IP DoH，并通过 `DIRECT` 连接，避免 Fake-IP 初次解析随代理节点位置获得境外 CDN。
+- 国外和 AI 域名继续使用通过原主代理组访问的 IP DoH；所有受管查询均加密，不使用 ECS。
+- 保留节点启动解析；缺失或仍是旧版危险固定值时才改用系统 DNS。原有 `direct-nameserver` 会替换为受管的大陆 DoH。
 - 已有 AI 分组时保留成员和选择，只补全 OpenAI、ChatGPT、Codex、Claude、Anthropic、Gemini 等规则。
 - 没有 AI 分组时创建独立选择器，加入订阅的全部真实节点和代理提供者。普通流量继续使用主代理组，AI 流量可以单独选择家宽节点。
 - 不创建额外的安全代理分组，也不替用户选择节点。家宽通常更适合 AI；有台湾家宽时优先台湾，没有时可考虑日本。
@@ -49,7 +50,7 @@ bash clash-patch/scripts/install_macos.sh
 
 ### macOS
 
-安装程序单次运行，只处理 ClashX Meta 当前使用的本地目录或 iCloud 容器。每份顶层 YAML 都经过 YAML 1.2 读取、二次转换和 Mihomo 校验，最长等待 30 秒。修改前创建一次性备份。当前订阅写入后通过 Mihomo 本地控制器自动刷新，并检查 TUN、DNS、外网连通性和原有代理组选择；任一步失败都会恢复修改前的内容。整个过程不退出或重启 ClashX Meta。
+安装程序单次运行，只处理 ClashX Meta 当前使用的本地目录或 iCloud 容器。每份顶层 YAML 都经过 YAML 1.2 读取、二次转换和 Mihomo 校验，最长等待 30 秒。修改前创建一次性备份。当前订阅写入后通过 Mihomo 本地控制器自动刷新，清除旧 Fake-IP 与 DNS 缓存，再检查 TUN、DNS、外网连通性和原有代理组选择；任一步失败都会恢复修改前的内容。整个过程不退出或重启 ClashX Meta。
 
 macOS 不安装 LaunchAgent 或 `WatchPaths`。安装程序会删除能确认属于旧版 Clash Patch 的目录监听。订阅以后刷新时，需要再次运行 skill。
 
@@ -61,7 +62,7 @@ Clash Verge Rev 的全局扩展脚本 `profiles/Script.js` 会在订阅加载或
 
 ## 验证
 
-先检查实时分流：Google 应经过主代理组当前节点；OpenAI、Anthropic 和 Claude 应经过 AI 分组当前节点。然后测试：
+先检查实时分流：国内网站应获得大陆 CDN 并经过 `DIRECT`；Google 应经过主代理组当前节点；OpenAI、Anthropic 和 Claude 应经过 AI 分组当前节点。然后测试：
 
 1. [IPInfo WebRTC 检测](https://ipinfo.cv/webrtc-check)
 2. [DNS 泄漏检测](https://ip.net.coffee/dns/)：点击“深度测试”
