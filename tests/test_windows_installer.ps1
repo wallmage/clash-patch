@@ -161,15 +161,23 @@ try {
     Assert-True ($timeoutWatch.Elapsed.TotalSeconds -lt 4) "hanging Mihomo process was not terminated promptly"
 
     $backupSource = Join-Path $sandbox "backup-source.txt"
+    $versionedBackupRoot = Join-Path $sandbox "versioned-backups"
     $backupBytes = [byte[]](0xEF, 0xBB, 0xBF, 0x66, 0x69, 0x72, 0x73, 0x74)
     [System.IO.File]::WriteAllBytes($backupSource, $backupBytes)
-    Backup-Once $backupSource
+    $firstVersionedBackup = Backup-Versioned $backupSource $versionedBackupRoot "prewrite"
     [System.IO.File]::WriteAllText($backupSource, "second")
-    Backup-Once $backupSource
-    $savedBackup = [System.IO.File]::ReadAllBytes("$backupSource.clash-patch.original.backup")
-    Assert-True (([Convert]::ToBase64String($savedBackup)) -eq ([Convert]::ToBase64String($backupBytes))) "exclusive backup was overwritten"
+    $secondVersionedBackup = Backup-Versioned $backupSource $versionedBackupRoot "prewrite"
+    Assert-True ($firstVersionedBackup -ne $secondVersionedBackup) "versioned backups collided"
+    Assert-True ((Split-Path -Leaf $firstVersionedBackup) -match '^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d{7}[+-]\d{4}--prewrite--[0-9a-f]{16}--backup-source\.txt\.backup$') "versioned backup name lacks a date: $firstVersionedBackup"
+    $savedBackup = [System.IO.File]::ReadAllBytes($firstVersionedBackup)
+    Assert-True (([Convert]::ToBase64String($savedBackup)) -eq ([Convert]::ToBase64String($backupBytes))) "first versioned backup changed"
+    Assert-True ((Get-Content -LiteralPath $secondVersionedBackup -Raw) -eq "second") "second versioned backup did not capture the next write"
+    $initialOne = Backup-InitialOnce $backupSource $versionedBackupRoot
+    $initialTwo = Backup-InitialOnce $backupSource $versionedBackupRoot
+    Assert-True (-not [string]::IsNullOrWhiteSpace($initialOne)) "initial backup was not created"
+    Assert-True ([string]::IsNullOrWhiteSpace($initialTwo)) "initial backup was duplicated"
     if ($onWindows) {
-        $backupAcl = Get-Acl -LiteralPath "$backupSource.clash-patch.original.backup"
+        $backupAcl = Get-Acl -LiteralPath $firstVersionedBackup
         Assert-True $backupAcl.AreAccessRulesProtected "backup ACL still inherits permissions"
         $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
         $hasCurrentUser = @($backupAcl.Access | Where-Object {

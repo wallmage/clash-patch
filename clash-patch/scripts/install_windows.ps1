@@ -2,7 +2,12 @@
     [string]$AppHome = "",
     [string]$MihomoPath = "",
     [int]$UsageProfile = 0,
-    [switch]$ShowUsageProfile
+    [switch]$ShowUsageProfile,
+    [switch]$SnapshotProfiles,
+    [switch]$ListBackups,
+    [string]$CompareBackup = "",
+    [string]$RestoreBackup = "",
+    [string]$ExpectedCurrentSha256 = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,9 +105,27 @@ function Protect-BackupAcl([string]$Path) {
     Set-Acl -LiteralPath $Path -AclObject $security
 }
 
-function Backup-Once([string]$Path) {
+function Get-PathKey([string]$Path) {
+    $absolute = [System.IO.Path]::GetFullPath($Path)
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($absolute)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join '').Substring(0, 16)
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Backup-Versioned([string]$Path, [string]$BackupRoot, [string]$Reason = "prewrite") {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
-    $destination = "$Path.clash-patch.original.backup"
+    if ($Reason -notmatch '^[a-z][a-z0-9-]{0,31}$') { throw "备份原因无效。" }
+    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) {
+        New-Item -ItemType Directory -Path $BackupRoot -Force | Out-Null
+    }
+    $key = Get-PathKey $Path
+    $basename = Split-Path -Leaf $Path
+    $stamp = (Get-Date).ToString("yyyy-MM-dd_HH-mm-ss.fffffffzzz").Replace(":", "")
+    $destination = Join-Path $BackupRoot ("$stamp--$Reason--$key--$basename.backup")
     $sourceStream = $null
     $backupStream = $null
     $created = $false
@@ -122,9 +145,6 @@ function Backup-Once([string]$Path) {
     if ($null -ne $failure) {
         if ($created -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
             Remove-Item -LiteralPath $destination -Force
-        } elseif (-not $created -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
-            Protect-BackupAcl $destination
-            return
         }
         throw $failure
     }
@@ -136,6 +156,20 @@ function Backup-Once([string]$Path) {
         }
         throw
     }
+    return $destination
+}
+
+function Backup-InitialOnce([string]$Path, [string]$BackupRoot) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
+    $key = Get-PathKey $Path
+    $basename = Split-Path -Leaf $Path
+    if (Test-Path -LiteralPath $BackupRoot -PathType Container) {
+        $existing = Get-ChildItem -LiteralPath $BackupRoot -File | Where-Object {
+            $_.Name -like "*--initial--$key--$basename.backup"
+        } | Select-Object -First 1
+        if ($null -ne $existing) { return }
+    }
+    return (Backup-Versioned $Path $BackupRoot "initial")
 }
 
 function Write-BytesAtomic([string]$Path, [byte[]]$Bytes) {
@@ -704,11 +738,86 @@ if ([string]::IsNullOrWhiteSpace($AppHome) -or -not (Test-Path -LiteralPath $App
 
 # Clash Verge Rev 的全局扩展脚本位置：profiles/Script.js。
 $profilesDirectory = Join-Path $AppHome "profiles"
+$backupRoot = Join-Path $AppHome "clash-patch-backups"
 $vergePath = Join-Path $AppHome "verge.yaml"
 $configPath = Join-Path $AppHome "config.yaml"
 $statePath = Join-Path $AppHome "clash-patch-install-state.json"
 $usageStatePath = Join-Path $AppHome "clash-patch-usage-profile.json"
 $targetScript = Join-Path $profilesDirectory "Script.js"
+
+function Get-BackupTarget([string]$BackupId) {
+    if ([string]::IsNullOrWhiteSpace($BackupId) -or $BackupId -ne (Split-Path -Leaf $BackupId) -or $BackupId -notlike "*.backup") {
+        throw "备份编号无效。"
+    }
+    $backupPath = Join-Path $backupRoot $BackupId
+    if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) { throw "找不到指定备份。" }
+    if ($BackupId -notmatch '--([0-9a-f]{16})--(.+)\.backup$') { throw "备份编号无效。" }
+    $key = $Matches[1]
+    $basename = $Matches[2]
+    $candidates = @($targetScript, $vergePath, $configPath, $statePath)
+    if (Test-Path -LiteralPath $profilesDirectory -PathType Container) {
+        $candidates += @(Get-ChildItem -LiteralPath $profilesDirectory -File | ForEach-Object { $_.FullName })
+    }
+    $matches = @($candidates | Select-Object -Unique | Where-Object {
+        (Test-Path -LiteralPath $_ -PathType Leaf) -and
+        (Split-Path -Leaf $_) -eq $basename -and
+        (Get-PathKey $_) -eq $key
+    })
+    if ($matches.Count -ne 1) { throw "备份无法对应到唯一的当前配置。" }
+    return [pscustomobject]@{ BackupPath = $backupPath; TargetPath = $matches[0] }
+}
+
+if ($SnapshotProfiles) {
+    if (-not (Test-Path -LiteralPath $profilesDirectory -PathType Container)) { throw "找不到订阅目录。" }
+    $profiles = @(Get-ChildItem -LiteralPath $profilesDirectory -File | Where-Object { $_.Extension -match '^\.ya?ml$' })
+    foreach ($profile in $profiles) {
+        Backup-InitialOnce $profile.FullName $backupRoot | Out-Null
+        Backup-Versioned $profile.FullName $backupRoot "pre-update" | Out-Null
+    }
+    Write-Info "已为 $($profiles.Count) 份订阅创建安全更新前备份。"
+    exit 0
+}
+
+if ($ListBackups) {
+    if (Test-Path -LiteralPath $backupRoot -PathType Container) {
+        Get-ChildItem -LiteralPath $backupRoot -File -Filter "*.backup" | Sort-Object Name -Descending | ForEach-Object { $_.Name }
+    }
+    exit 0
+}
+
+if (-not [string]::IsNullOrWhiteSpace($CompareBackup)) {
+    $resolved = Get-BackupTarget $CompareBackup
+    $backupHash = (Get-FileHash -LiteralPath $resolved.BackupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $currentHash = (Get-FileHash -LiteralPath $resolved.TargetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    [pscustomobject]@{
+        Backup = $CompareBackup
+        Profile = (Split-Path -Leaf $resolved.TargetPath)
+        Same = ($backupHash -eq $currentHash)
+        BackupSha256 = $backupHash
+        CurrentSha256 = $currentHash
+        ConfigurationDifference = $(if ($backupHash -eq $currentHash) { "无配置差异" } else { "存在配置差异；为保护隐私不输出配置值" })
+    } | ConvertTo-Json
+    exit 0
+}
+
+if (-not [string]::IsNullOrWhiteSpace($RestoreBackup)) {
+    if (Test-ClashVergeRunning) { throw "Clash Verge Rev 正在运行，不能安全恢复配置；未修改任何文件。" }
+    if ($ExpectedCurrentSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "恢复时必须提供预期 SHA-256。" }
+    $resolved = Get-BackupTarget $RestoreBackup
+    $currentHash = (Get-FileHash -LiteralPath $resolved.TargetPath -Algorithm SHA256).Hash
+    if ($currentHash -ne $ExpectedCurrentSha256) { throw "当前配置已变化，拒绝覆盖。" }
+    $restoreBytes = [System.IO.File]::ReadAllBytes($resolved.BackupPath)
+    $currentBytes = [System.IO.File]::ReadAllBytes($resolved.TargetPath)
+    Backup-Versioned $resolved.TargetPath $backupRoot "pre-restore" | Out-Null
+    try {
+        Write-BytesAtomic $resolved.TargetPath $restoreBytes
+    } catch {
+        Write-BytesAtomic $resolved.TargetPath $currentBytes
+        throw
+    }
+    Write-Info "备份已恢复；恢复前版本已经另行备份。"
+    exit 0
+}
 $enginePath = Join-Path (Join-Path $PSScriptRoot "windows") "clash_verge_global.js"
 
 try {
@@ -784,7 +893,7 @@ try {
         New-Item -ItemType Directory -Path $profilesDirectory -Force | Out-Null
         $scriptOutput = Build-GlobalScript $enginePath $targetScript
         $scriptBytes = ConvertTo-Utf8Bytes $scriptOutput
-        Backup-Once $targetScript
+        Backup-Versioned $targetScript $backupRoot "prewrite" | Out-Null
         Write-BytesAtomic $targetScript $scriptBytes
         Write-Info "Clash Verge Rev 保持运行；已更新全局扩展脚本。"
         Write-Info "config.yaml、verge.yaml 和当前运行配置均未修改。下次订阅刷新时应用补丁。"
@@ -830,7 +939,10 @@ try {
         [pscustomobject]@{ Path = $configPath; Bytes = $configBytes; Existed = (Test-Path -LiteralPath $configPath); OriginalBytes = $(if (Test-Path -LiteralPath $configPath) { [System.IO.File]::ReadAllBytes($configPath) } else { $null }) },
         [pscustomobject]@{ Path = $statePath; Bytes = $stateBytes; Existed = (Test-Path -LiteralPath $statePath); OriginalBytes = $(if (Test-Path -LiteralPath $statePath) { [System.IO.File]::ReadAllBytes($statePath) } else { $null }) }
     )
-    foreach ($target in $targets) { Backup-Once $target.Path }
+    foreach ($target in $targets) {
+        Backup-InitialOnce $target.Path $backupRoot | Out-Null
+        Backup-Versioned $target.Path $backupRoot "prewrite" | Out-Null
+    }
 
     try {
         if (Test-ClashVergeRunning) { throw "检测到 Clash Verge Rev 在安装期间启动；已撤销本次文件修改。" }

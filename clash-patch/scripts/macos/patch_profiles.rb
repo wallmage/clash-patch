@@ -3,6 +3,7 @@
 require "digest"
 require "fileutils"
 require "json"
+require "base64"
 require "open3"
 require "optparse"
 require "psych"
@@ -690,25 +691,189 @@ module ClashPatch
     end.compact
   end
 
-  def backup_once(path, backup_root, content: nil)
-    FileUtils.mkdir_p(backup_root)
-    FileUtils.chmod(0o700, backup_root)
-    key = Digest::SHA256.hexdigest(File.expand_path(path))[0, 16]
-    destination = File.join(backup_root, "#{key}-#{File.basename(path)}.backup")
-    begin
-      File.open(destination, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |backup|
-        if content
-          backup.write(content)
-        else
-          File.open(path, "rb") { |source| IO.copy_stream(source, backup) }
-        end
-        backup.flush
-        backup.fsync
-      end
-    rescue Errno::EEXIST
-      # The first complete patch attempt owns the one-time backup.
+  def backup_key(path)
+    Digest::SHA256.hexdigest(File.expand_path(path))[0, 16]
+  end
+
+  def secure_backup_root!(backup_root)
+    root = File.expand_path(backup_root)
+    raise InvalidConfigError, "备份目录不能是符号链接" if File.symlink?(root)
+    raise InvalidConfigError, "备份位置不是目录" if File.exist?(root) && !File.directory?(root)
+
+    FileUtils.mkdir_p(root, mode: 0o700)
+    FileUtils.chmod(0o700, root)
+    Dir.children(root).each do |name|
+      path = File.join(root, name)
+      next unless name.end_with?(".backup") && File.file?(path) && !File.symlink?(path)
+
+      FileUtils.chmod(0o600, path)
+    rescue SystemCallError
+      next
     end
+    root
+  end
+
+  def backup_entries_for(path, backup_root, reason: nil)
+    root = File.expand_path(backup_root)
+    return [] unless File.directory?(root) && !File.symlink?(root)
+
+    key = backup_key(path)
+    suffix = "--#{key}--#{File.basename(path)}.backup"
+    reason_token = reason && "--#{reason}--#{key}--"
+    Dir.children(root).select do |name|
+      name.end_with?(suffix) && (!reason_token || name.include?(reason_token)) &&
+        File.file?(File.join(root, name)) && !File.symlink?(File.join(root, name))
+    end.sort.map { |name| File.join(root, name) }
+  end
+
+  def create_versioned_backup(path, backup_root, content: nil, reason: "prewrite")
+    raise InvalidConfigError, "备份原因无效" unless reason.match?(/\A[a-z][a-z0-9-]{0,31}\z/)
+
+    root = secure_backup_root!(backup_root)
+    bytes = content.nil? ? File.binread(File.realpath(path)) : content.b
+    key = backup_key(path)
+    destination = nil
+    100.times do
+      timestamp = Time.now.strftime("%Y-%m-%d_%H-%M-%S.%9N%z")
+      candidate = File.join(root, "#{timestamp}--#{reason}--#{key}--#{File.basename(path)}.backup")
+      begin
+        File.open(candidate, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |backup|
+          backup.write(bytes)
+          backup.flush
+          backup.fsync
+        end
+        destination = candidate
+        break
+      rescue Errno::EEXIST
+        Thread.pass
+      end
+    end
+    raise IOError, "无法创建唯一的版本化备份" unless destination
+
     FileUtils.chmod(0o600, destination)
+    destination
+  rescue StandardError
+    FileUtils.rm_f(destination) if destination && File.exist?(destination)
+    raise
+  end
+
+  def snapshot_initial_profiles(directories, backup_root)
+    directories.each_with_object([]) do |directory, snapshots|
+      profile_paths(directory).each do |path|
+        if backup_entries_for(path, backup_root, reason: "initial").empty?
+          snapshots << create_versioned_backup(path, backup_root, reason: "initial")
+        end
+      end
+    end
+  end
+
+  def resolve_backup_id(backup_id, backup_root)
+    raise InvalidConfigError, "备份编号无效" unless backup_id == File.basename(backup_id.to_s) && backup_id.end_with?(".backup")
+
+    root = File.expand_path(backup_root)
+    path = File.join(root, backup_id)
+    raise InvalidConfigError, "找不到指定备份" unless File.file?(path) && !File.symlink?(path)
+
+    path
+  end
+
+  def find_backup_target(backup_id, directories)
+    matches = directories.flat_map { |directory| profile_paths(directory) }.select do |path|
+      backup_id.include?("--#{backup_key(path)}--") && backup_id.end_with?("--#{File.basename(path)}.backup")
+    end
+    raise InvalidConfigError, "备份无法对应到当前存储位置中的唯一配置" unless matches.length == 1
+
+    matches.first
+  end
+
+  def redacted_changed_paths(before, after, prefix = nil, output = [], limit = 200)
+    return output if output.length >= limit || before == after
+
+    if before.is_a?(Hash) && after.is_a?(Hash)
+      (before.keys | after.keys).map(&:to_s).sort.each do |key|
+        break if output.length >= limit
+        path = prefix ? "#{prefix}.#{key}" : key
+        before_key = before.key?(key) ? key : before.keys.find { |candidate| candidate.to_s == key }
+        after_key = after.key?(key) ? key : after.keys.find { |candidate| candidate.to_s == key }
+        if before_key.nil? || after_key.nil?
+          output << path
+        else
+          redacted_changed_paths(before[before_key], after[after_key], path, output, limit)
+        end
+      end
+    else
+      output << (prefix || "配置")
+    end
+    output
+  end
+
+  def compare_backup(backup_id, directories:, backup_root:)
+    backup_path = resolve_backup_id(backup_id, backup_root)
+    target = find_backup_target(backup_id, directories)
+    backup_bytes = File.binread(backup_path)
+    current_bytes = File.binread(File.realpath(target))
+    backup_config = load_yaml(backup_bytes.dup.force_encoding(Encoding::UTF_8), backup_id)
+    current_config = load_yaml(current_bytes.dup.force_encoding(Encoding::UTF_8), target)
+    {
+      backup_id: backup_id,
+      profile: File.basename(target),
+      same: backup_bytes == current_bytes,
+      backup_sha256: Digest::SHA256.hexdigest(backup_bytes),
+      current_sha256: Digest::SHA256.hexdigest(current_bytes),
+      changes: redacted_changed_paths(backup_config, current_config)
+    }
+  end
+
+  def restore_backup(backup_id, directories:, backup_root:, expected_current_sha256:, validator:)
+    return { status: :restore_conflict } unless expected_current_sha256.to_s.match?(/\A[0-9a-f]{64}\z/i)
+
+    backup_path = resolve_backup_id(backup_id, backup_root)
+    target = find_backup_target(backup_id, directories)
+    write_path = File.realpath(target)
+    backup_bytes = File.binread(backup_path)
+    backup_text = backup_bytes.dup.force_encoding(Encoding::UTF_8)
+    raise InvalidConfigError, "备份不是有效的 UTF-8" unless backup_text.valid_encoding?
+
+    load_yaml(backup_text, backup_id)
+    Tempfile.create([File.basename(write_path), ".restore"], File.dirname(write_path)) do |temporary|
+      temporary.binmode
+      temporary.write(backup_bytes)
+      temporary.flush
+      temporary.fsync
+      validation = validator.call(temporary.path)
+      return { status: :validation_timeout, path: target } if validation == :timeout
+      return { status: :validation_failed, path: target } unless validation == true
+    end
+
+    current_bytes = File.binread(write_path)
+    return { status: :restore_conflict, path: target } unless Digest::SHA256.hexdigest(current_bytes).casecmp(expected_current_sha256).zero?
+    return { status: :no_change, path: target } if current_bytes == backup_bytes
+
+    create_versioned_backup(target, backup_root, content: current_bytes, reason: "pre-restore")
+    File.open(write_path, "r+b") do |source|
+      source.flock(File::LOCK_EX)
+      locked_bytes = source.read
+      unless locked_source_current?(source, target, write_path) &&
+             Digest::SHA256.hexdigest(locked_bytes).casecmp(expected_current_sha256).zero?
+        return { status: :restore_conflict, path: target }
+      end
+      source.rewind
+      source.write(backup_bytes)
+      source.truncate(backup_bytes.bytesize)
+      source.flush
+      source.fsync
+    end
+    {
+      status: :updated,
+      path: target,
+      rollback_bytes: current_bytes,
+      patched_digest: Digest::SHA256.hexdigest(backup_bytes),
+      restored_backup: backup_id
+    }
+  rescue Psych::Exception, InvalidConfigError, SystemStackError
+    { status: :invalid_backup }
+  rescue SystemCallError, IOError
+    { status: :io_error }
   end
 
   def mihomo_version(text)
@@ -854,7 +1019,7 @@ module ClashPatch
         if !locked_source_current?(source, path, write_path) || source.read != original_bytes
           outcome = :retry
         else
-          backup_once(path, backup_root, content: original_bytes) if backup_root
+          create_versioned_backup(path, backup_root, content: original_bytes, reason: "prewrite") if backup_root
           source.rewind
           if !locked_source_current?(source, path, write_path) || source.read != original_bytes
             outcome = :retry
@@ -929,6 +1094,207 @@ module ClashPatch
     return :local if %w[0 false no].include?(normalized)
 
     :unknown
+  end
+
+  def subscription_auto_update_state(value = defaults_read("kAutoUpdateEnable"))
+    normalized = value.to_s.strip.downcase
+    return :disabled if %w[0 false no].include?(normalized)
+    return :enabled if %w[1 true yes].include?(normalized)
+
+    :unknown
+  end
+
+  def remote_subscription_records(raw = defaults_read("kRemoteConfigs"))
+    decoded = Base64.strict_decode64(raw.to_s.strip)
+    records = JSON.parse(decoded)
+    raise InvalidConfigError, "远程订阅清单无效" unless records.is_a?(Array) && !records.empty?
+
+    records.map do |record|
+      name = record.is_a?(Hash) ? record["name"].to_s.strip : ""
+      url = record.is_a?(Hash) ? record["url"].to_s.strip : ""
+      raise InvalidConfigError, "远程订阅清单缺少名称或地址" if name.empty? || url.empty?
+      raise InvalidConfigError, "远程订阅地址不是 HTTPS" unless url.start_with?("https://")
+      raise InvalidConfigError, "远程订阅名称包含非法字符" if name.include?("/") || name.include?("\\") || name.include?("\0")
+
+      { name: name, url: url }
+    end
+  rescue ArgumentError, JSON::ParserError
+    raise InvalidConfigError, "远程订阅清单无效"
+  end
+
+  def remote_subscription_targets(directories, records = remote_subscription_records)
+    paths = directories.flat_map { |directory| profile_paths(directory) }
+    targets = records.map do |record|
+      matches = paths.select do |path|
+        basename = File.basename(path)
+        stem = basename.sub(/\.ya?ml\z/i, "")
+        basename.casecmp(record.fetch(:name)).zero? || stem.casecmp(record.fetch(:name)).zero?
+      end
+      raise InvalidConfigError, "远程订阅无法对应到唯一配置文件" unless matches.length == 1
+
+      record.merge(path: matches.first)
+    end
+    raise InvalidConfigError, "多个远程订阅对应到同一配置文件" unless targets.map { |target| File.expand_path(target.fetch(:path)) }.uniq.length == targets.length
+
+    targets
+  end
+
+  def curl_config_value(value)
+    raise InvalidConfigError, "远程订阅地址无效" if value.include?("\r") || value.include?("\n")
+
+    value.gsub("\\", "\\\\").gsub('"', '\\"')
+  end
+
+  def fetch_remote_subscription(target, timeout_seconds: VALIDATION_TIMEOUT_SECONDS)
+    config = <<~CURL
+      url = "#{curl_config_value(target.fetch(:url))}"
+      silent
+      show-error
+      fail
+      location
+      proto = "=https"
+      max-time = #{Integer(timeout_seconds)}
+    CURL
+    stdout, _stderr, status = Open3.capture3(
+      "/usr/bin/curl", "--config", "-", stdin_data: config, binmode: true
+    )
+    raise InvalidConfigError, "远程订阅下载失败" unless status.success? && !stdout.empty?
+
+    stdout
+  rescue KeyError, ArgumentError
+    raise InvalidConfigError, "远程订阅下载失败"
+  end
+
+  def build_update_candidate(target, source, policy, usage_profile, validator)
+    bytes = source.to_s.b
+    text = bytes.dup.force_encoding(Encoding::UTF_8)
+    raise InvalidConfigError, "远程订阅内容不是有效 UTF-8" unless text.valid_encoding?
+
+    config = load_yaml(text, target.fetch(:name))
+    raise InvalidConfigError, "远程订阅内容无效" unless usable_config?(config)
+    candidate = config
+    if usage_profile == 3
+      patched = patch(config, policy)
+      raise InvalidConfigError, "远程订阅无法应用档位 3 补丁" unless %i[updated unchanged].include?(patched.fetch(:status))
+      candidate = patched.fetch(:config)
+    end
+    output = dump_config(candidate).b
+    reparsed = load_yaml(output.dup.force_encoding(Encoding::UTF_8), target.fetch(:name))
+    if usage_profile == 3
+      second = patch(reparsed, policy)
+      raise InvalidConfigError, "远程订阅二次转换不一致" if second.fetch(:changed) || dump_config(second.fetch(:config)).b != output
+    end
+
+    Tempfile.create([".clash-patch-update-", ".yaml"], File.dirname(File.realpath(target.fetch(:path)))) do |temporary|
+      temporary.binmode
+      temporary.write(output)
+      temporary.flush
+      temporary.fsync
+      validation = validator.call(temporary.path)
+      raise InvalidConfigError, "远程订阅校验超时" if validation == :timeout
+      raise InvalidConfigError, "远程订阅未通过 Mihomo 校验" unless validation == true
+    end
+    output
+  end
+
+  def replace_profile_bytes(path, bytes)
+    write_path = File.realpath(path)
+    File.open(write_path, "r+b") do |source|
+      source.flock(File::LOCK_EX)
+      source.rewind
+      source.write(bytes)
+      source.truncate(bytes.bytesize)
+      source.flush
+      source.fsync
+    end
+  end
+
+  def default_safe_update_activation(items, usage_profile, selected_name = selected_profile_name)
+    active = items.find { |item| active_profile?(item.fetch(:path), selected_name) }
+    return true unless active
+
+    result = {
+      path: active.fetch(:path), status: :updated, active: true,
+      rollback_bytes: active.fetch(:original), patched_digest: Digest::SHA256.hexdigest(active.fetch(:candidate))
+    }
+    activate_updated_profile(result, require_tun: usage_profile >= 2).fetch(:reloaded, false)
+  end
+
+  def safe_update_all(targets:, policy:, backup_root:, usage_profile:, fetcher: method(:fetch_remote_subscription),
+                      validator: method(:validate_with_mihomo), activation: nil, selected_name: nil)
+    raise InvalidConfigError, "用途档位无效" unless [1, 2, 3].include?(usage_profile)
+    raise InvalidConfigError, "没有可更新的远程订阅" unless targets.is_a?(Array) && !targets.empty?
+
+    items = targets.map do |target|
+      path = target.fetch(:path)
+      original = File.binread(File.realpath(path))
+      source = fetcher.call(target)
+      candidate = build_update_candidate(target, source, policy, usage_profile, validator)
+      { name: target.fetch(:name), path: path, original: original, candidate: candidate }
+    rescue StandardError
+      return { status: :aborted, failed_profile: target[:name].to_s, reason: :download_or_validation_failed }
+    end
+
+    handles = []
+    begin
+      items.sort_by { |item| File.expand_path(item.fetch(:path)) }.each do |item|
+        handle = File.open(File.realpath(item.fetch(:path)), "r+b")
+        handle.flock(File::LOCK_EX)
+        handles << [item, handle]
+      end
+      unless handles.all? { |item, handle| handle.rewind && handle.read == item.fetch(:original) }
+        return { status: :aborted, failed_profile: "", reason: :concurrent_change }
+      end
+
+      handles.each do |item, _handle|
+        create_versioned_backup(item.fetch(:path), backup_root, content: item.fetch(:original), reason: "pre-update")
+      end
+      handles.each do |item, handle|
+        handle.rewind
+        handle.write(item.fetch(:candidate))
+        handle.truncate(item.fetch(:candidate).bytesize)
+        handle.flush
+        handle.fsync
+      end
+    rescue StandardError
+      handles.each do |item, handle|
+        begin
+          handle.rewind
+          handle.write(item.fetch(:original))
+          handle.truncate(item.fetch(:original).bytesize)
+          handle.flush
+          handle.fsync
+        rescue StandardError
+          nil
+        end
+      end
+      return { status: :aborted, failed_profile: "", reason: :write_failed }
+    ensure
+      handles.each { |_item, handle| handle.close rescue nil }
+    end
+
+    activation ||= ->(updated_items) { default_safe_update_activation(updated_items, usage_profile, selected_name) }
+    activated = begin
+      activation.call(items)
+    rescue StandardError
+      false
+    end
+    unless activated
+      items.each do |item|
+        current = File.binread(File.realpath(item.fetch(:path)))
+        next if current == item.fetch(:original)
+        return { status: :rollback_failed, failed_profile: item.fetch(:name), reason: :activation_failed } unless current == item.fetch(:candidate)
+
+        replace_profile_bytes(item.fetch(:path), item.fetch(:original))
+      end
+      return { status: :aborted, failed_profile: "", reason: :activation_failed }
+    end
+
+    { status: :updated, count: items.length, profiles: items.map { |item| item.fetch(:name) } }
+  rescue InvalidConfigError
+    raise
+  rescue StandardError
+    { status: :aborted, failed_profile: "", reason: :unexpected_error }
   end
 
   def clashx_app_paths
@@ -1129,7 +1495,7 @@ module ClashPatch
     false
   end
 
-  def activate_updated_profile(result, socket: nil, requester: nil, connectivity_checker: nil)
+  def activate_updated_profile(result, socket: nil, requester: nil, connectivity_checker: nil, require_tun: true)
     if requester.nil?
       socket ||= controller_socket
       return result.merge(status: rollback_after_reload_failure(result, nil, nil)) unless socket
@@ -1156,7 +1522,7 @@ module ClashPatch
       return result.merge(status: rollback_after_reload_failure(result, requester, result[:path]))
     end
 
-    healthy = tun_state(requester: requester) == :enabled
+    healthy = !require_tun || tun_state(requester: requester) == :enabled
     after = healthy ? runtime_selections(requester) : nil
     healthy &&= after.is_a?(Hash)
     healthy &&= before.all? { |name, selected| !after.key?(name) || after[name] == selected }
@@ -1278,7 +1644,14 @@ module ClashPatch
       dry_run: false,
       auto_reload: true,
       print_tun_state: false,
-      print_core_status: false
+      print_core_status: false,
+      print_subscription_auto_update_state: false,
+      snapshot_initial: false,
+      compare_backup: nil,
+      restore_backup: nil,
+      expected_current_sha256: nil,
+      safe_update_all: false,
+      usage_profile: nil
     }
     parser = OptionParser.new do |opts|
       opts.banner = "用法：patch_profiles.rb [选项]"
@@ -1289,6 +1662,13 @@ module ClashPatch
       opts.on("--no-reload", "只更新文件，不自动刷新当前订阅") { options[:auto_reload] = false }
       opts.on("--print-tun-state", "输出当前运行内核的 TUN 状态") { options[:print_tun_state] = true }
       opts.on("--print-core-status", "检查 Mihomo 内核是否满足最低版本") { options[:print_core_status] = true }
+      opts.on("--print-subscription-auto-update-state", "输出订阅自动更新状态") { options[:print_subscription_auto_update_state] = true }
+      opts.on("--snapshot-initial", "为当前存储位置创建一次初始快照") { options[:snapshot_initial] = true }
+      opts.on("--compare-backup ID", "比较指定备份与当前配置") { |value| options[:compare_backup] = value }
+      opts.on("--restore-backup ID", "恢复指定备份") { |value| options[:restore_backup] = value }
+      opts.on("--expected-current-sha256 SHA256", "恢复前要求当前配置哈希匹配") { |value| options[:expected_current_sha256] = value }
+      opts.on("--safe-update-all", "安全更新当前存储位置中的全部远程订阅") { options[:safe_update_all] = true }
+      opts.on("--usage-profile N", Integer, "安全更新采用的用途档位") { |value| options[:usage_profile] = value }
       opts.on("-h", "--help", "显示帮助") do
         puts opts
         return 0
@@ -1307,10 +1687,53 @@ module ClashPatch
       return 0
     end
 
+    if options[:print_subscription_auto_update_state]
+      puts subscription_auto_update_state
+      return 0
+    end
+
     directories = options[:profile_dirs].empty? ? default_profile_directories : options[:profile_dirs]
     if directories.empty?
       warn "没有找到 ClashX Meta 配置目录。"
       return 2
+    end
+
+    if options[:snapshot_initial]
+      snapshot_initial_profiles(directories, options[:backup_root]).each { |path| puts File.basename(path) }
+      return 0
+    end
+
+    if options[:compare_backup]
+      puts JSON.generate(compare_backup(options[:compare_backup], directories: directories, backup_root: options[:backup_root]))
+      return 0
+    end
+
+    if options[:restore_backup]
+      result = restore_backup(
+        options[:restore_backup], directories: directories, backup_root: options[:backup_root],
+        expected_current_sha256: options[:expected_current_sha256], validator: method(:validate_with_mihomo)
+      )
+      puts JSON.generate(result.reject { |key, _value| key == :rollback_bytes })
+      return result[:status] == :updated || result[:status] == :no_change ? 0 : 1
+    end
+
+    if options[:safe_update_all]
+      unless [1, 2, 3].include?(options[:usage_profile])
+        warn "安全更新必须指定用途档位 1、2 或 3。"
+        return 64
+      end
+      policy = JSON.parse(File.read(options[:policy], encoding: "UTF-8"))
+      targets = remote_subscription_targets(directories)
+      result = safe_update_all(
+        targets: targets, policy: policy, backup_root: options[:backup_root],
+        usage_profile: options[:usage_profile], selected_name: selected_profile_name
+      )
+      if result[:status] == :updated
+        puts "全部远程订阅已安全更新：#{result.fetch(:count)} 份。"
+        return 0
+      end
+      warn "安全更新失败；全部订阅保持原样。"
+      return 1
     end
 
     results = run(

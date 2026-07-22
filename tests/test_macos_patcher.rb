@@ -452,6 +452,236 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_every_write_creates_a_dated_versioned_backup
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config)
+      File.write(profile, original)
+
+      first = ClashPatch.patch_path(profile, @policy, backup_root: backup_root)
+      changed_again = ClashPatch.load_yaml(File.read(profile))
+      changed_again["ipv6"] = true
+      changed_again["friend-marker"] = "before-second-write"
+      second_source = YAML.dump(changed_again)
+      File.write(profile, second_source)
+      second = ClashPatch.patch_path(profile, @policy, backup_root: backup_root)
+
+      backups = Dir.glob(File.join(backup_root, "*.backup")).sort
+      assert first.fetch(:changed)
+      assert second.fetch(:changed)
+      assert_equal 2, backups.length
+      backups.each do |path|
+        assert_match(/\A\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d{9}[+-]\d{4}--prewrite--[0-9a-f]{16}--friend\.yaml\.backup\z/, File.basename(path))
+      end
+      assert_includes backups.map { |path| File.binread(path) }, original.b
+      assert_includes backups.map { |path| File.binread(path) }, second_source.b
+    end
+  end
+
+  def test_initial_snapshot_is_created_once_without_modifying_profiles
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config)
+      File.write(profile, original)
+
+      first = ClashPatch.snapshot_initial_profiles([directory], backup_root)
+      second = ClashPatch.snapshot_initial_profiles([directory], backup_root)
+      backups = Dir.glob(File.join(backup_root, "*.backup"))
+
+      assert_equal 1, first.length
+      assert_empty second
+      assert_equal 1, backups.length
+      assert_includes File.basename(backups.first), "--initial--"
+      assert_equal original.b, File.binread(backups.first)
+      assert_equal original.b, File.binread(profile)
+    end
+  end
+
+  def test_backup_compare_and_restore_are_redacted_reversible_and_hash_guarded
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config)
+      File.write(profile, original)
+      backup = ClashPatch.create_versioned_backup(profile, backup_root, content: original, reason: "prewrite")
+      changed = base_config
+      changed["dns"] = { "nameserver" => ["https://secret.example/dns-query"] }
+      changed["rules"] = ["DOMAIN-SUFFIX,private.example,DIRECT", "MATCH,Main"]
+      File.write(profile, YAML.dump(changed))
+
+      comparison = ClashPatch.compare_backup(
+        File.basename(backup), directories: [directory], backup_root: backup_root
+      )
+      assert_equal false, comparison.fetch(:same)
+      assert comparison.fetch(:changes).any? { |path| path == "dns" || path.start_with?("dns.") }
+      assert_includes comparison.fetch(:changes), "rules"
+      refute_includes JSON.generate(comparison), "secret.example"
+      refute_includes JSON.generate(comparison), "private.example"
+
+      wrong = ClashPatch.restore_backup(
+        File.basename(backup), directories: [directory], backup_root: backup_root,
+        expected_current_sha256: "0" * 64, validator: ->(_candidate) { true }
+      )
+      assert_equal :restore_conflict, wrong.fetch(:status)
+
+      current_sha = Digest::SHA256.hexdigest(File.binread(profile))
+      restored = ClashPatch.restore_backup(
+        File.basename(backup), directories: [directory], backup_root: backup_root,
+        expected_current_sha256: current_sha, validator: ->(_candidate) { true }
+      )
+      assert_equal :updated, restored.fetch(:status)
+      assert_equal original.b, File.binread(profile)
+      assert_equal 2, Dir.glob(File.join(backup_root, "*.backup")).length
+      assert Dir.glob(File.join(backup_root, "*--pre-restore--*.backup")).any?
+    end
+  end
+
+  def test_subscription_auto_update_state_is_explicit
+    assert_equal :disabled, ClashPatch.subscription_auto_update_state("0")
+    assert_equal :disabled, ClashPatch.subscription_auto_update_state("false")
+    assert_equal :enabled, ClashPatch.subscription_auto_update_state("1")
+    assert_equal :enabled, ClashPatch.subscription_auto_update_state("true")
+    assert_equal :unknown, ClashPatch.subscription_auto_update_state(nil)
+  end
+
+  def test_remote_subscription_records_map_every_client_entry_without_exposing_urls
+    Dir.mktmpdir do |directory|
+      %w[MESL Yue Express].each { |name| File.write(File.join(directory, "#{name}.yaml"), YAML.dump(base_config)) }
+      records = %w[MESL Yue Express].map.with_index do |name, index|
+        { "name" => name, "url" => "https://subscriptions.invalid/private-#{index}", "updateTime" => 100 + index }
+      end
+      raw = Base64.strict_encode64(JSON.generate(records))
+
+      parsed = ClashPatch.remote_subscription_records(raw)
+      targets = ClashPatch.remote_subscription_targets([directory], parsed)
+
+      assert_equal 3, targets.length
+      assert_equal %w[Express MESL Yue], targets.map { |target| File.basename(target.fetch(:path), ".yaml") }.sort
+      refute_includes JSON.generate(targets.map { |target| target.reject { |key, _value| key == :url } }), "subscriptions.invalid"
+    end
+  end
+
+  def test_remote_subscription_url_is_passed_to_curl_over_stdin_not_process_arguments
+    url = "https://subscriptions.invalid/private-token"
+    status = Struct.new(:success?).new(true)
+    capture = lambda do |*arguments, **options|
+      refute arguments.join(" ").include?(url)
+      assert_includes options.fetch(:stdin_data), url
+      [YAML.dump(base_config), "", status]
+    end
+
+    body = Open3.stub(:capture3, capture) do
+      ClashPatch.fetch_remote_subscription({ name: "private", url: url })
+    end
+
+    assert_includes body, "proxy-groups"
+  end
+
+  def test_safe_update_all_is_transactional_and_reapplies_profile_three_patch
+    Dir.mktmpdir do |directory|
+      backup_root = File.join(directory, "backups")
+      targets = %w[MESL Yue Express].map.with_index do |name, index|
+        path = File.join(directory, "#{name}.yaml")
+        source = base_config
+        source["subscription-marker"] = "old-#{index}"
+        File.write(path, YAML.dump(source))
+        { name: name, path: path, url: "https://subscriptions.invalid/#{index}" }
+      end
+      fetcher = lambda do |target|
+        source = base_config
+        source["subscription-marker"] = "new-#{target.fetch(:name)}"
+        YAML.dump(source)
+      end
+      activated = false
+
+      result = ClashPatch.safe_update_all(
+        targets: targets, policy: @policy, backup_root: backup_root, usage_profile: 3,
+        fetcher: fetcher, validator: ->(_path) { true },
+        activation: ->(_items) { activated = true; true }
+      )
+
+      assert_equal :updated, result.fetch(:status)
+      assert_equal 3, result.fetch(:count)
+      assert activated
+      targets.each do |target|
+        config = ClashPatch.load_yaml(File.read(target.fetch(:path)))
+        assert_equal "new-#{target.fetch(:name)}", config.fetch("subscription-marker")
+        assert_equal false, config.fetch("ipv6")
+        assert_equal true, config.dig("tun", "enable")
+      end
+      assert_equal 3, Dir.glob(File.join(backup_root, "*--pre-update--*.backup")).length
+    end
+  end
+
+  def test_safe_update_all_leaves_every_profile_untouched_when_one_download_is_invalid
+    Dir.mktmpdir do |directory|
+      targets = %w[first second third].map do |name|
+        path = File.join(directory, "#{name}.yaml")
+        File.write(path, YAML.dump(base_config.merge("subscription-marker" => "old-#{name}")))
+        { name: name, path: path, url: "https://subscriptions.invalid/#{name}" }
+      end
+      originals = targets.to_h { |target| [target.fetch(:path), File.binread(target.fetch(:path))] }
+      fetcher = lambda do |target|
+        target.fetch(:name) == "second" ? "<html>expired</html>" : YAML.dump(base_config)
+      end
+
+      result = ClashPatch.safe_update_all(
+        targets: targets, policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 3,
+        fetcher: fetcher, validator: ->(_path) { true }, activation: ->(_items) { flunk "must not activate" }
+      )
+
+      assert_equal :aborted, result.fetch(:status)
+      assert_equal "second", result.fetch(:failed_profile)
+      targets.each { |target| assert_equal originals.fetch(target.fetch(:path)), File.binread(target.fetch(:path)) }
+      refute Dir.exist?(File.join(directory, "backups"))
+      refute_includes JSON.generate(result), "subscriptions.invalid"
+    end
+  end
+
+  def test_safe_update_all_does_not_add_profile_three_patch_to_lightweight_profiles
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "ordinary.yaml")
+      File.write(path, YAML.dump(base_config))
+      downloaded = base_config.merge("subscription-marker" => "fresh")
+
+      result = ClashPatch.safe_update_all(
+        targets: [{ name: "ordinary", path: path, url: "https://subscriptions.invalid/ordinary" }],
+        policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 2,
+        fetcher: ->(_target) { YAML.dump(downloaded) }, validator: ->(_path) { true },
+        activation: ->(_items) { true }
+      )
+
+      assert_equal :updated, result.fetch(:status)
+      config = ClashPatch.load_yaml(File.read(path))
+      assert_equal "fresh", config.fetch("subscription-marker")
+      refute config.key?("tun")
+      refute config.key?("ipv6")
+    end
+  end
+
+  def test_safe_update_all_rolls_back_every_profile_when_runtime_activation_fails
+    Dir.mktmpdir do |directory|
+      targets = %w[first second].map do |name|
+        path = File.join(directory, "#{name}.yaml")
+        File.write(path, YAML.dump(base_config.merge("subscription-marker" => "old-#{name}")))
+        { name: name, path: path, url: "https://subscriptions.invalid/#{name}" }
+      end
+      originals = targets.map { |target| [target.fetch(:path), File.binread(target.fetch(:path))] }.to_h
+
+      result = ClashPatch.safe_update_all(
+        targets: targets, policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 3,
+        fetcher: ->(target) { YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}")) },
+        validator: ->(_path) { true }, activation: ->(_items) { raise "controller failed" }
+      )
+
+      assert_equal :aborted, result.fetch(:status)
+      assert_equal :activation_failed, result.fetch(:reason)
+      targets.each { |target| assert_equal originals.fetch(target.fetch(:path)), File.binread(target.fetch(:path)) }
+    end
+  end
+
   def test_refresh_during_validation_is_reloaded_before_write
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
@@ -508,17 +738,18 @@ class MacosPatcherTest < Minitest::Test
       File.write(profile, YAML.dump(base_config))
       refreshed = base_config
       refreshed["friend-marker"] = "refresh-during-backup"
-      original_backup = ClashPatch.method(:backup_once)
+      original_backup = ClashPatch.method(:create_versioned_backup)
       injected = false
-      backup_with_refresh = lambda do |path, root, content: nil|
-        original_backup.call(path, root, content: content)
+      backup_with_refresh = lambda do |path, root, content: nil, reason: "prewrite"|
+        result = original_backup.call(path, root, content: content, reason: reason)
         next if injected
 
         injected = true
         File.write(profile, YAML.dump(refreshed))
+        result
       end
 
-      result = ClashPatch.stub(:backup_once, backup_with_refresh) do
+      result = ClashPatch.stub(:create_versioned_backup, backup_with_refresh) do
         ClashPatch.patch_path(profile, @policy, backup_root: backup_root, validator: ->(_candidate) { true })
       end
       written = ClashPatch.load_yaml(File.read(profile))
@@ -720,7 +951,8 @@ class MacosPatcherTest < Minitest::Test
 
       assert_equal "first-backup", File.read(existing)
       assert_equal "600", format("%o", File.stat(existing).mode & 0o777)
-      assert_equal 1, Dir.glob(File.join(backup, "*.backup")).length
+      assert_equal 2, Dir.glob(File.join(backup, "*.backup")).length
+      assert_equal 1, Dir.glob(File.join(backup, "*--prewrite--*.backup")).length
     end
   end
 

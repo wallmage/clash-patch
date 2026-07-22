@@ -18,13 +18,14 @@ POLICY_SOURCE="$SCRIPT_DIR/../references/policy.json"
 USAGE_PROFILE=""
 PROFILE_SOURCE=""
 SHOW_PROFILE=0
+SAFE_UPDATE=0
 
 say() {
   /usr/bin/printf '%s\n' "[Clash 补丁] $1"
 }
 
 usage() {
-  /usr/bin/printf '%s\n' "用法：install_macos.sh [--profile 1|2|3] [--show-profile]"
+  /usr/bin/printf '%s\n' "用法：install_macos.sh [--profile 1|2|3] [--show-profile] [--safe-update]"
 }
 
 read_saved_profile() {
@@ -66,6 +67,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --show-profile)
       SHOW_PROFILE=1
+      shift
+      ;;
+    --safe-update)
+      SAFE_UPDATE=1
       shift
       ;;
     -h|--help)
@@ -125,6 +130,10 @@ remove_legacy_agent() {
   if legacy_agent_owned "$candidate" "$expected_label" "$expected_patcher"; then
     /bin/launchctl bootout "gui/$USER_ID/$expected_label" >/dev/null 2>&1 || true
     /bin/rm -f "$candidate"
+    if [ -f "$expected_patcher" ] && [ ! -L "$expected_patcher" ]; then
+      /bin/rm -f "$expected_patcher"
+      /bin/rmdir "$(/usr/bin/dirname "$expected_patcher")" >/dev/null 2>&1 || true
+    fi
     say "已移除旧版自动目录监听：${expected_label}。"
   else
     say "发现同名但无法确认属于 Clash 补丁的 LaunchAgent，已保留：${expected_label}。"
@@ -171,7 +180,7 @@ fi
 remove_legacy_agent "$CURRENT_PLIST" "$CURRENT_LABEL" "$CURRENT_PATCHER"
 remove_legacy_agent "$LEGACY_PLIST" "$LEGACY_LABEL" "$LEGACY_PATCHER"
 
-if [ "$USAGE_PROFILE" -ne 3 ]; then
+if [ "$SAFE_UPDATE" -eq 0 ] && [ "$USAGE_PROFILE" -ne 3 ]; then
   if [ "$PREVIOUS_PROFILE" = "3" ] && [ "$PROFILE_SOURCE" != "saved" ]; then
     say "检测到从档位 3 改为轻量档位。安装程序不会覆盖后来产生的用户改动；请由本 skill 先运行安全卸载流程，并说明无法自动恢复的旧订阅增强。"
   fi
@@ -182,6 +191,14 @@ if [ "$USAGE_PROFILE" -ne 3 ]; then
   fi
   say "请由本 skill 使用 Computer Use 完成客户端开关和对应网站复测。"
   exit 0
+fi
+
+if [ "$USAGE_PROFILE" -eq 3 ]; then
+  auto_update_state=$(/usr/bin/ruby "$PATCHER_SOURCE" --print-subscription-auto-update-state 2>/dev/null || true)
+  if [ "$auto_update_state" != "disabled" ]; then
+    say "档位 3 要求先在 ClashX Meta 界面关闭订阅自动更新；本次未修改任何订阅。"
+    exit 9
+  fi
 fi
 
 core_status=$(/usr/bin/ruby "$PATCHER_SOURCE" --print-core-status 2>/dev/null || true)
@@ -198,6 +215,31 @@ fi
 /bin/chmod 700 "$INSTALL_DIR" "$BACKUP_DIR"
 
 if [ -n "$CUSTOM_PROFILE_DIR" ]; then
+  /usr/bin/ruby "$PATCHER_SOURCE" --profile-dir "$CUSTOM_PROFILE_DIR" --backup-dir "$BACKUP_DIR" --snapshot-initial
+else
+  /usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --snapshot-initial
+fi
+
+if [ "$SAFE_UPDATE" -eq 1 ]; then
+  if [ -n "$CUSTOM_PROFILE_DIR" ]; then
+    /usr/bin/ruby "$PATCHER_SOURCE" \
+      --profile-dir "$CUSTOM_PROFILE_DIR" \
+      --policy "$POLICY_SOURCE" \
+      --backup-dir "$BACKUP_DIR" \
+      --safe-update-all \
+      --usage-profile "$USAGE_PROFILE"
+  else
+    /usr/bin/ruby "$PATCHER_SOURCE" \
+      --policy "$POLICY_SOURCE" \
+      --backup-dir "$BACKUP_DIR" \
+      --safe-update-all \
+      --usage-profile "$USAGE_PROFILE"
+  fi
+  say "安全更新已完成：当前存储位置中的全部远程订阅已一起更新。"
+  exit 0
+fi
+
+if [ -n "$CUSTOM_PROFILE_DIR" ]; then
   /usr/bin/ruby "$PATCHER_SOURCE" \
     --profile-dir "$CUSTOM_PROFILE_DIR" \
     --policy "$POLICY_SOURCE" \
@@ -211,4 +253,3 @@ fi
 say "本次为单次运行，只处理 ClashX Meta 当前存储位置中的订阅。"
 say "当前订阅需要修改时，会通过本地控制器自动刷新并检查；失败时补丁程序会恢复原配置。"
 say "脚本没有退出、停止或重启 ClashX Meta，也没有切换订阅、代理组或节点。"
-say "订阅以后刷新时，请再次运行本 skill。"

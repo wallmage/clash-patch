@@ -63,7 +63,7 @@ class SkillContractTest < Minitest::Test
     skill = File.read(File.join(SKILL, "SKILL.md"))
 
     assert_operator readme.lines.length, :<=, 125
-    assert_operator skill.lines.length, :<=, 100
+    assert_operator skill.lines.length, :<=, 110
     assert_includes skill, "详细产品规则和全部状态以"
   end
 
@@ -152,7 +152,7 @@ class SkillContractTest < Minitest::Test
     assert_includes skill, "uninstall_windows.cmd"
     assert_includes policy, "旧订阅增强仍可能保留"
     assert_includes policy, "只有档位 3"
-    assert_includes mac_installer, 'if [ "$USAGE_PROFILE" -ne 3 ]'
+    assert_includes mac_installer, 'if [ "$SAFE_UPDATE" -eq 0 ] && [ "$USAGE_PROFILE" -ne 3 ]'
     assert_includes mac_installer, "检测到从档位 3 改为轻量档位"
     assert_includes windows_installer, 'if ($resolvedUsageProfile -ne 3)'
     assert_includes windows_installer, "检测到从档位 3 改为轻量档位"
@@ -268,6 +268,62 @@ class SkillContractTest < Minitest::Test
     assert_includes policy, "不能仅凭检测到 AdGuard"
     assert_includes policy, "无改善立即恢复"
     assert_includes design, "Patch 和 Diagnostics"
+  end
+
+  def test_configuration_history_is_versioned_compared_and_safely_restored
+    readme = File.read(File.join(ROOT, "README.md"))
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+    mac_patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
+    mac_installer = File.read(File.join(SKILL, "scripts/install_macos.sh"))
+    windows_installer = File.read(File.join(SKILL, "scripts/install_windows.ps1"))
+
+    [readme, skill, policy, design].each do |document|
+      assert_includes document, "每次写入"
+      assert_includes document, "日期时间"
+      assert_includes document, "配置差异"
+      assert_includes document, "回滚"
+    end
+
+    assert_includes skill, "修改前的版本"
+    assert_includes skill, "先备份当前版本"
+    assert_includes policy, "不能仅凭时间接近"
+    assert_includes policy, "预期 SHA-256"
+    assert_includes policy, "不得自动删除历史备份"
+    assert_includes policy, "不输出配置值"
+    assert_includes policy, "失败时恢复回滚前版本"
+    assert_includes mac_patcher, "--snapshot-initial"
+    assert_includes mac_patcher, "--compare-backup"
+    assert_includes mac_patcher, "--restore-backup"
+    assert_includes mac_installer, "--snapshot-initial"
+    assert_includes windows_installer, "ListBackups"
+    assert_includes windows_installer, "CompareBackup"
+    assert_includes windows_installer, "RestoreBackup"
+    assert_includes windows_installer, "clash-patch-backups"
+    assert_includes windows_installer, "yyyy-MM-dd_HH-mm-ss"
+  end
+
+  def test_safe_update_replaces_all_subscriptions_as_one_transaction
+    readme = File.read(File.join(ROOT, "README.md"))
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+    installer = File.read(File.join(SKILL, "scripts/install_macos.sh"))
+    patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
+
+    [readme, skill, policy, design].each do |document|
+      assert_includes document, "安全更新"
+      assert_includes document, "全部远程订阅"
+      assert_includes document, "全部保持原样"
+      assert_includes document, "档位 3"
+      assert_includes document, "关闭自动更新"
+    end
+    assert_includes installer, "--safe-update"
+    assert_includes patcher, "--safe-update-all"
+    assert_includes patcher, "--print-subscription-auto-update-state"
+    assert_includes policy, "不得安装永久监听"
+    refute_includes skill, "订阅以后刷新时，请再次运行"
   end
 
   def test_diagnostics_selects_tools_by_the_observed_symptom
@@ -427,7 +483,7 @@ class SkillContractTest < Minitest::Test
     assert_includes source, "大陆 IP DoH"
     assert_includes source, "direct-nameserver-follow-policy"
     assert_includes source, "不得把节点启动解析改成 `1.1.1.1` 或 `8.8.8.8`"
-    assert_includes source, "不安装 LaunchAgent、`WatchPaths` 或目录监听"
+    assert_includes source, "不得安装永久监听、LaunchAgent、`WatchPaths`、计划任务或目录监听"
     assert_includes source, "REALITY `short-id`"
     assert_includes source, "只允许通过本地控制器自动刷新"
     assert_includes source, "失败时立即恢复原文件和原运行配置"
@@ -626,7 +682,7 @@ class SkillContractTest < Minitest::Test
     patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
 
     assert_operator mac_install.index('id -u'), :<, mac_install.index("\n  save_profile\n")
-    assert_operator mac_install.index('if [ "$USAGE_PROFILE" -ne 3 ]'), :<, mac_install.index('core_status=')
+    assert_operator mac_install.index('if [ "$SAFE_UPDATE" -eq 0 ] && [ "$USAGE_PROFILE" -ne 3 ]'), :<, mac_install.index('core_status=')
     assert_operator mac_install.index('plutil -extract Label'), :<, mac_install.index('launchctl bootout')
     assert_operator mac_install.index('ProgramArguments.0'), :<, mac_install.index('launchctl bootout')
     assert_operator mac_install.index('ProgramArguments.1'), :<, mac_install.index('launchctl bootout')

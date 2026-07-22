@@ -1,4 +1,4 @@
 interface:
   display_name: "Clash 补丁与诊断"
-  short_description: "按用途配置 Clash，或取证诊断并修复网络问题"
-  default_prompt: "使用 $clash-patch 配置或诊断网络；诊断前读取用途档位，只检查、修复和复测该档位需要的能力，并只处理 Clash 当前存储位置；绝对不要退出、停止或重启 Clash 客户端。"
+  short_description: "按用途配置、诊断或安全更新 Clash 订阅"
+  default_prompt: "使用 $clash-patch 配置、诊断或安全更新网络；诊断前读取用途档位，只处理当前存储位置。用户要求更新节点时更新全部远程订阅，档位 3 保持自动更新关闭；绝对不要退出、停止或重启 Clash 客户端。"

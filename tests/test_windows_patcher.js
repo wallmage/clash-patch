@@ -444,7 +444,7 @@ test('PowerShell installer uses the documented global script and app settings', 
   assert.match(source, /function Build-GlobalScript/);
   assert.match(source, /function Write-Utf8Atomic/);
   const preflight = source.indexOf('$scriptOutput = Build-GlobalScript');
-  const firstBackup = source.indexOf('foreach ($target in $targets) { Backup-Once');
+  const firstBackup = source.indexOf('Backup-Versioned $target.Path $backupRoot "prewrite"');
   assert.ok(preflight !== -1 && firstBackup !== -1 && preflight < firstBackup, 'all transformations must be prepared before files change');
 });
 

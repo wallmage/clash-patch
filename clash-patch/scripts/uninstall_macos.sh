@@ -36,6 +36,10 @@ remove_owned_agent() {
     if launch_agent_owned "$candidate" "$expected_label" "$expected_patcher"; then
       /bin/launchctl bootout "gui/$USER_ID/$expected_label" >/dev/null 2>&1 || true
       /bin/rm -f "$candidate"
+      if [ -f "$expected_patcher" ] && [ ! -L "$expected_patcher" ]; then
+        /bin/rm -f "$expected_patcher"
+        /bin/rmdir "$(/usr/bin/dirname "$expected_patcher")" >/dev/null 2>&1 || true
+      fi
       say "已移除旧版自动目录监听：${expected_label}。"
     else
       say "发现同名但无法确认属于 Clash 补丁的 LaunchAgent，已保留：${expected_label}。"
@@ -86,7 +90,7 @@ fi
   "$INSTALL_DIR/patch-error.log"
 /bin/rmdir "$INSTALL_DIR" >/dev/null 2>&1 || true
 
-say "自动补丁已移除，不会再在登录或订阅刷新时运行。"
+say "Clash Patch 安装文件已移除；当前版本没有后台监听任务。"
 if [ -d "$BACKUP_DIR" ]; then
   say "原始订阅备份仍保留在本机；卸载程序没有删除或还原它们。"
 fi
