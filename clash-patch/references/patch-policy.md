@@ -58,7 +58,7 @@ Clash Patch 有两个独立模块：
 | **档位 2｜海外 AI** | ChatGPT、Codex、Gemini、Perplexity 等，不含 Claude | 用 Computer Use 开启 TUN，并关闭 Clash 客户端自己的系统代理开关 | 档位 2 不应用 DNS、WebRTC 或 AI 分组补丁，不修改订阅和节点 | Google、Twitter、ChatGPT、Gemini 能稳定打开；命令行或 Agent 应用能联网 |
 | **档位 3｜Claude/Claude Code** | Claude 网页、Claude Code，或需要完整泄漏防护 | 先完成档位 2，再运行完整补丁 | 不自动选择订阅、代理组或节点 | 完成普通站、其他 AI、Claude、分流、DNS 深度测试和两项 WebRTC 测试 |
 
-档位 2、3 关闭系统代理的目的，是避免 Clash 同时用系统代理和 TUN 重复接管同一流量，不是为了隐藏代理。只关闭 Clash 客户端自己的系统代理开关；不得清除或覆盖 AdGuard、其他 PAC、企业代理或安全软件的设置。发现第三方接管时先按 Diagnostics 的重叠接管流程确认兼容性，不能用 `networksetup`、注册表或系统代理命令把其他产品的配置抹掉。
+档位 2、3 关闭系统代理的目的，是避免 Clash 同时用系统代理和 TUN 重复接管同一流量，不是为了隐藏代理。只关闭 Clash 客户端自己的系统代理开关；除下述 AdGuard for Mac 已知兼容路径外，不得清除或覆盖 AdGuard、其他 PAC、企业代理或安全软件的设置。不能用 `networksetup`、注册表或系统代理命令把其他产品的配置抹掉。
 
 档位 3 的完整补丁包括：TUN、DNS 劫持、自动与严格路由、IPv6 关闭、国内 DNS 直连大陆加密解析器、普通国外与 AI DNS 分流、AI 分组与规则、全局 UDP/WebRTC 防护和完整验证。节点只给建议：台湾家宽优先，其次日本家宽；不得自动切换节点。全局 UDP 也会影响 QUIC、游戏、语音和视频，必须在选择界面说明。
 
@@ -131,6 +131,16 @@ Diagnostics 默认只读。没有证据不能下结论，也不得直接执行 P
 确认重叠接管后做职责分层：同一流量层只保留一个透明接管者；内容过滤只覆盖浏览器时，可以把它放到遵守系统代理的应用层，让 VPN 或 TUN 继续负责最终分流、DNS 和 UDP；需要覆盖全部应用或特殊协议时，选择厂商支持的其他组合或明确排除范围。具体模式由用户需要的覆盖范围和厂商限制决定，不能把某个产品的兼容开关写成通用答案。
 
 修复验收同时包含三类结果：原始症状在至少三个不同目标上连续复测；广告过滤、证书处理或应用覆盖等原有功能覆盖仍符合用户需要；当前档位中可能受本次修改影响的能力和安全属性保持正常。只有档位 3 才把 DNS 泄漏、WebRTC 和 AI 分流列为安全回归项。删除诊断期间添加的临时站点规则，不逐站添加例外。任何必要项目不通过都恢复修改前的接管模式，并保留“尚未解决”。
+
+### AdGuard for Mac 已知兼容路径
+
+这是 macOS 上 Clash TUN 与 AdGuard for Mac 共存的产品规则，同时用于 Patch 和 Diagnostics。[AdGuard 官方兼容说明](https://adguard.com/kb/adguard-for-mac/solving-problems/big-sur-issues/)也把从 `Network Extension` 改为 `Automatic Proxy` 作为与部分 VPN 或透明代理冲突时的处理方式。该规则只适用于档位 2、3，因为这两档由 Clash TUN 负责最终分流；它不是升档，不增加当前档位之外的 DNS、WebRTC、AI 分组或订阅改动。档位 1 依赖 Clash 的系统代理，不能让 AdGuard 自动代理再占用同一个位置；Windows 的过滤机制也不同，两者都不能照搬。
+
+Patch 在切换档位 2、3 的客户端开关时同时检查 AdGuard for Mac。检测到 AdGuard 正在使用 `Network Extension`，就记录当前模式和保护状态，通过 Computer Use 只通过 AdGuard 界面切换到“自动代理”，保持 Clash TUN 开启、Clash 自己的系统代理关闭。不得用 `networksetup`、defaults、Plist 编辑或脚本改写 AdGuard 与系统 PAC，不得退出、停用、卸载或重启 AdGuard，也不得添加逐站例外。已经是自动代理时不重复修改。
+
+Diagnostics 遇到多个无关网站都先空白或转圈约 10–30 秒、随后很快显示，并且现场存在 Clash TUN 与 AdGuard `Network Extension` 时，直接把这条已知兼容路径作为第一项单变量对照，不再从零试一串站点规则。仍要在切换前用原应用复现并记录等待时间；不能仅凭检测到 AdGuard 就宣布故障原因。切换后用同一应用和动作连续复测原目标及至少三个无关目标，并确认 Safari 和 Chrome 的广告过滤仍符合用户需要。档位 2 再复测普通 AI 与 Agent 联网；档位 3 只复测本次共同网络路径可能影响的分流、DNS 与 WebRTC 能力。
+
+自动代理只覆盖遵守系统代理的程序，Safari 和 Chrome 等浏览器通常仍会被过滤；非浏览器应用可能不再经过 AdGuard，必须在修改前向用户说明。任何原始等待无改善、广告过滤失效、档位能力变坏或覆盖范围不符合用户需要的情况，都要无改善立即恢复到修改前模式，并继续通用诊断。不能把这个 AdGuard 专用兼容开关写成其他过滤器或 VPN 的通用答案。
 
 macOS 当前流量优先使用 `nettop` 的按进程/连接 CSV、活动监视器的网络计数、`netstat -ib`、系统 DNS/路由状态和 Mihomo 连接记录。macOS 不保证保存一份可直接按应用回放的长期流量历史；历史不足时建立观察窗口，并用相关应用日志补充，不能假装已取得过去的逐应用字节。
 

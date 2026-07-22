@@ -244,6 +244,32 @@ class SkillContractTest < Minitest::Test
     assert_includes policy, "不逐站添加例外"
   end
 
+  def test_macos_adguard_uses_the_known_clash_compatibility_path
+    readme = File.read(File.join(ROOT, "README.md"))
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+
+    [readme, skill, policy, design].each do |document|
+      assert_includes document, "AdGuard for Mac"
+      assert_includes document, "Network Extension"
+      assert_includes document, "自动代理"
+    end
+
+    assert_includes skill, "档位 2、3"
+    assert_includes skill, "不得逐站添加例外"
+    assert_includes policy, "已知兼容路径"
+    assert_includes policy, "不是升档"
+    assert_includes policy, "只通过 AdGuard 界面"
+    assert_includes policy, "不得用 `networksetup`"
+    assert_includes policy, "Safari 和 Chrome"
+    assert_includes policy, "非浏览器应用"
+    assert_includes policy, "至少三个无关目标"
+    assert_includes policy, "不能仅凭检测到 AdGuard"
+    assert_includes policy, "无改善立即恢复"
+    assert_includes design, "Patch 和 Diagnostics"
+  end
+
   def test_diagnostics_selects_tools_by_the_observed_symptom
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
 
