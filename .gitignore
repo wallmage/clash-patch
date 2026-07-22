@@ -1,5 +1,10 @@
 .DS_Store
-docs/
+docs/*
+!docs/superpowers/
+docs/superpowers/*
+!docs/superpowers/specs/
+docs/superpowers/specs/*
+!docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md
 tests/baseline.md
 dist/
 *.zip

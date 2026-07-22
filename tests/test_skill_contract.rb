@@ -28,6 +28,7 @@ class SkillContractTest < Minitest::Test
     tests/test_skill_contract.rb
     tests/test_windows_installer.ps1
     tests/test_windows_patcher.js
+    docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md
     LICENSE
   ].freeze
 
@@ -36,9 +37,12 @@ class SkillContractTest < Minitest::Test
     assert_empty missing, "missing public files: #{missing.join(', ')}"
   end
 
-  def test_tests_are_distributed_but_working_material_is_ignored
+  def test_tests_and_product_spec_are_distributed_but_generated_material_is_ignored
     ignore = File.read(File.join(ROOT, ".gitignore"))
-    assert_includes ignore.lines.map(&:strip), "docs/"
+    ignore_lines = ignore.lines.map(&:strip)
+
+    assert_includes ignore_lines, "docs/*"
+    assert_includes ignore_lines, "!docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"
     assert_includes ignore.lines.map(&:strip), "tests/baseline.md"
     refute_includes ignore.lines.map(&:strip), "tests/"
     assert_includes ignore.lines.map(&:strip), "dist/"
@@ -101,6 +105,22 @@ class SkillContractTest < Minitest::Test
     assert_includes policy, "第二种独立证据"
     assert_includes policy, "反证"
     assert_includes policy, "解释全部已知现象"
+  end
+
+  def test_diagnostics_has_reproduction_scope_and_reset_gates
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+
+    assert_includes skill, "有 Computer Use"
+    assert_includes skill, "修改前复现"
+    assert_includes skill, "两次假设"
+    assert_includes skill, "诊断重置"
+    assert_includes policy, "配置缺陷不等于故障原因"
+    assert_includes policy, "至少两个健康对照"
+    assert_includes policy, "恢复全部未生效的试验"
+    assert_includes policy, "没有新的证据不得进行第三次修改"
+    assert_includes policy, "不能因为单个目标的对照结果就停用或删除整个组件"
+    assert_includes policy, "共同组件本身"
   end
 
   def test_diagnostics_selects_tools_by_the_observed_symptom
