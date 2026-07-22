@@ -24,8 +24,11 @@ class SkillContractTest < Minitest::Test
     clash-patch/scripts/windows/clash_verge_global.js
     .github/workflows/test.yml
     tests/fixtures/main_group_cases.json
+    tests/baseline.md
+    tests/coverage_ruby.rb
     tests/generate_windows_policy.rb
     tests/test_macos_patcher.rb
+    tests/test_macos_wrappers.rb
     tests/test_skill_contract.rb
     tests/test_windows_installer.ps1
     tests/test_windows_patcher.js
@@ -44,7 +47,7 @@ class SkillContractTest < Minitest::Test
 
     assert_includes ignore_lines, "docs/*"
     assert_includes ignore_lines, "!docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"
-    assert_includes ignore.lines.map(&:strip), "tests/baseline.md"
+    refute_includes ignore.lines.map(&:strip), "tests/baseline.md"
     refute_includes ignore.lines.map(&:strip), "tests/"
     assert_includes ignore.lines.map(&:strip), "dist/"
   end
@@ -837,8 +840,25 @@ class SkillContractTest < Minitest::Test
     uses.each { |entry| assert_match(/@[0-9a-f]{40}\z/, entry, entry) }
     assert_includes workflow, "runs-on: macos-15"
     assert_includes workflow, "/usr/bin/ruby tests/test_macos_patcher.rb"
+    assert_includes workflow, "ruby tests/coverage_ruby.rb"
+    assert_includes workflow, "ruby tests/test_macos_wrappers.rb"
+    assert_includes workflow, "/usr/bin/ruby tests/test_macos_wrappers.rb"
+    assert_includes workflow, "--test-coverage-lines=100"
+    assert_includes workflow, "--test-coverage-functions=100"
+    assert_includes workflow, "--test-coverage-branches=80"
     assert_includes workflow, "shell: powershell"
     assert_includes workflow, "Get-Command powershell.exe"
+  end
+
+  def test_production_coverage_cannot_be_inflated_with_ignore_markers
+    production = Dir.glob(File.join(SKILL, "scripts/**/*.{rb,js,ps1,sh,cmd}"))
+    markers = [":nocov:", "c8 ignore", "istanbul ignore", "coverage:ignore", "node:coverage"]
+    offenders = production.each_with_object([]) do |path, found|
+      text = File.read(path).downcase
+      markers.each { |marker| found << "#{path}: #{marker}" if text.include?(marker) }
+    end
+
+    assert_empty offenders, "production coverage exclusions are forbidden: #{offenders.join(', ')}"
   end
 
   def test_license_is_mit

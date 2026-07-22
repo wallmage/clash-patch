@@ -24,8 +24,10 @@
 
 ```sh
 ruby tests/test_macos_patcher.rb
+ruby tests/coverage_ruby.rb
+ruby tests/test_macos_wrappers.rb
 ruby tests/test_skill_contract.rb
-node --test tests/test_windows_patcher.js
+node --experimental-test-coverage --test --test-coverage-include=clash-patch/scripts/windows/clash_verge_global.js --test-coverage-lines=100 --test-coverage-functions=100 --test-coverage-branches=80 tests/test_windows_patcher.js
 ruby tests/generate_windows_policy.rb --check
 ruby -c clash-patch/scripts/macos/patch_profiles.rb
 ruby -c clash-patch/scripts/macos/verify_routes.rb

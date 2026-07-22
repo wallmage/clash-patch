@@ -535,6 +535,43 @@ test('DNS policy accounts for exclusion, empty fallback, and DNS outbounds', { s
   assert.deepEqual(mainGroup, originalMain);
 });
 
+test('DNS policy rejects unsafe group filters and honors case-insensitive exclusions', { skip: !available }, () => {
+  const config = baseConfig();
+  config.proxies.push(
+    { name: 'Taiwan Backup', type: 'ss', server: 'tw-backup.example', password: 'fixture-secret' },
+    { name: 'Japan Backup', type: 'ss', server: 'jp-backup.example', password: 'fixture-secret' }
+  );
+  config['proxy-groups'].push(
+    { name: 'CaseFiltered', type: 'select', proxies: ['Taiwan Backup', 'Japan Backup'], 'exclude-filter': '(?i)taiwan' },
+    { name: 'InvalidFilter', type: 'select', proxies: ['Japan Backup'], 'exclude-filter': '[' }
+  );
+  config.dns['nameserver-policy'] = {
+    '+.case-filtered.example': ['https://1.1.1.1/dns-query#CaseFiltered'],
+    '+.invalid-filter.example': ['https://1.1.1.1/dns-query#InvalidFilter']
+  };
+
+  const patched = engine.clashPatchTransform(config, 'fixture');
+  const routeGroup = engine.clashPatchRouteGroupName(patched);
+  assert.deepEqual(
+    patched.dns['nameserver-policy']['+.case-filtered.example'],
+    engine.CLASH_PATCH_POLICY.resolvers.map((resolver) => `${resolver}#CaseFiltered`)
+  );
+  assert.ok(patched.dns['nameserver-policy']['+.invalid-filter.example'].every((endpoint) => {
+    return endpoint.endsWith(`#${routeGroup}`);
+  }));
+});
+
+test('nested rules and the legacy QUIC guard are handled without weakening user rules', { skip: !available }, () => {
+  const config = baseConfig();
+  const nestedUserRule = 'AND,((NETWORK,UDP),(DST-PORT,3478)),REJECT';
+  const legacyQuicGuard = 'AND,((NETWORK,UDP),(DST-PORT,443)),REJECT';
+  config.rules.unshift(nestedUserRule, legacyQuicGuard);
+
+  const patched = engine.clashPatchTransform(config, 'fixture');
+  assert.ok(patched.rules.includes(nestedUserRule), 'a user nested rule was removed');
+  assert.equal(patched.rules.includes(legacyQuicGuard), false, 'the managed legacy guard was retained');
+});
+
 test('DNS policy rejects privacy-weakening resolver options', { skip: !available }, () => {
   const config = baseConfig();
   const target = '台湾家宽 01';

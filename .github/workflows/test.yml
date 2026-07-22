@@ -19,12 +19,14 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
-      - name: Ruby 3.3 regression suite
-        run: ruby tests/test_macos_patcher.rb
+      - name: Ruby 3.3 regression suite and production coverage
+        run: ruby tests/coverage_ruby.rb
       - name: Ruby 3.3 skill contract suite
         run: ruby tests/test_skill_contract.rb
+      - name: macOS command wrapper behavior
+        run: ruby tests/test_macos_wrappers.rb
       - name: Windows engine suite
-        run: node --test tests/test_windows_patcher.js
+        run: node --experimental-test-coverage --test --test-coverage-include=clash-patch/scripts/windows/clash_verge_global.js --test-coverage-lines=100 --test-coverage-functions=100 --test-coverage-branches=80 tests/test_windows_patcher.js
       - name: Generated policy parity
         run: ruby tests/generate_windows_policy.rb --check
       - name: Ruby 3.3 syntax checks
@@ -38,6 +40,8 @@ jobs:
         run: /usr/bin/ruby tests/test_macos_patcher.rb
       - name: Contract regressions on the production runtime
         run: /usr/bin/ruby tests/test_skill_contract.rb
+      - name: Command wrappers on the production runtime
+        run: /usr/bin/ruby tests/test_macos_wrappers.rb
       - name: macOS syntax checks
         run: |
           /usr/bin/ruby -c clash-patch/scripts/macos/patch_profiles.rb

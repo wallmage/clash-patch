@@ -1989,6 +1989,7 @@ class MacosPatcherTest < Minitest::Test
   end
 
   def test_generated_profile_passes_installed_mihomo_validation
+    skip "set CLASH_PATCH_RUN_INSTALLED_CORE_TEST=1 to test the locally installed Mihomo core" unless ENV["CLASH_PATCH_RUN_INSTALLED_CORE_TEST"] == "1"
     core = ClashPatch.mihomo_core_path
     skip "ClashX Meta Mihomo core is not installed" unless core
 
@@ -2048,6 +2049,297 @@ class MacosPatcherTest < Minitest::Test
       assert_includes policy_document, status
     end
     assert_includes skill_document, "全部状态以"
+  end
+
+  def test_rule_parser_keeps_nested_commas_and_identifies_no_resolve_target
+    rule = "AND,((NETWORK,UDP),(DST-PORT,443)),Reject,no-resolve"
+
+    assert_equal ["AND", "((NETWORK,UDP),(DST-PORT,443))", "Reject", "no-resolve"], ClashPatch.split_rule_fields(rule)
+    info = ClashPatch.rule_info(rule)
+    assert_equal "AND", info.fetch(:type)
+    assert_equal "((NETWORK,UDP),(DST-PORT,443))", info.fetch(:payload)
+    assert_equal "Reject", info.fetch(:target)
+  end
+
+  def test_group_safety_rejects_invalid_or_unsupported_member_filters
+    config = base_config
+    config["proxy-groups"] << { "name" => "Filtered", "type" => "select", "proxies" => ["台湾家宽 01"], "exclude-filter" => "[" }
+    refute ClashPatch.group_cannot_reach_direct?(config, "Filtered")
+
+    config["proxy-groups"].last["exclude-filter"] = "(?=台湾)"
+    refute ClashPatch.group_cannot_reach_direct?(config, "Filtered")
+  end
+
+  def test_group_safety_accepts_an_explicit_safe_empty_fallback
+    config = base_config
+    config["proxy-groups"] << { "name" => "Fallback", "type" => "select", "proxies" => [], "empty-fallback" => "台湾家宽 01" }
+
+    assert ClashPatch.group_cannot_reach_direct?(config, "Fallback")
+  end
+
+  def test_managed_select_group_lookup_recognizes_an_owned_ai_selector
+    config = base_config
+    config["proxy-groups"].reject! { |group| group["name"] == "AI" }
+    name = ClashPatch::AI_GROUP_BASE
+    config["proxy-groups"] << { "name" => name, "type" => "select", "proxies" => ["台湾家宽 01"] }
+    config["rules"] = ClashPatch.render_ai_rules(@policy, name) + config.fetch("rules")
+
+    group = ClashPatch.find_managed_select_group(config, ClashPatch::AI_GROUP_BASE, :ai, @policy)
+
+    assert_equal name, group.fetch("name")
+  end
+
+  def test_legacy_ai_dns_patterns_include_exact_domain_rules
+    policy = Marshal.load(Marshal.dump(@policy))
+    policy["legacy_ai_rules"] << "DOMAIN,legacy-ai.example,AI"
+
+    assert_includes ClashPatch.legacy_ai_dns_patterns(policy), "legacy-ai.example"
+  end
+
+  def test_yaml_scalar_scanner_falls_back_to_text_when_numeric_conversion_rejects_input
+    loader = Psych::ClassLoader::Restricted.new([], [])
+    scanner = ClashPatch::YAML12ScalarScanner.new(loader)
+
+    scanner.stub(:Integer, ->(_value) { raise ArgumentError, "conversion failed" }) do
+      assert_equal "123", scanner.tokenize("123")
+    end
+  end
+
+  def test_patch_rules_removes_the_owned_legacy_quic_guard
+    config = base_config
+    user_rule = "AND,((NETWORK,UDP),(DST-PORT,3478)),REJECT"
+    config["rules"].unshift(user_rule, ClashPatch::LEGACY_QUIC_REJECT_RULE)
+
+    patched = ClashPatch.patch(config, @policy).fetch(:config)
+
+    assert_includes patched.fetch("rules"), user_rule
+    refute_includes patched.fetch("rules"), ClashPatch::LEGACY_QUIC_REJECT_RULE
+  end
+
+  def test_mihomo_status_classifies_command_failures_without_running_a_real_core
+    status = Object.new
+    status.define_singleton_method(:success?) { false }
+
+    ClashPatch.stub(:run_process_with_timeout, ["bad executable", status, false]) do
+      assert_equal :unreadable, ClashPatch.mihomo_core_status(RbConfig.ruby)
+    end
+    ClashPatch.stub(:run_process_with_timeout, ["", nil, true]) do
+      assert_equal :timeout, ClashPatch.mihomo_core_status(RbConfig.ruby)
+    end
+  end
+
+  def test_controller_request_returns_safe_empty_response_when_curl_fails
+    failure = Object.new
+    failure.define_singleton_method(:success?) { false }
+
+    Open3.stub(:capture2e, ["curl failed", failure]) do
+      assert_equal [0, ""], ClashPatch.controller_request("/tmp/missing.sock", "GET", "/configs")
+    end
+  end
+
+  def test_controller_request_parses_a_successful_controller_response
+    success = Object.new
+    success.define_singleton_method(:success?) { true }
+
+    Open3.stub(:capture2e, ["{\"tun\":true}\n200", success]) do
+      assert_equal [200, "{\"tun\":true}"], ClashPatch.controller_request("/tmp/controller.sock", "GET", "/configs")
+    end
+  end
+
+  def test_mihomo_validation_uses_the_profile_directory_and_fails_closed
+    success = Object.new
+    success.define_singleton_method(:success?) { true }
+    calls = []
+    ClashPatch.stub(:mihomo_core_status, :supported) do
+      ClashPatch.stub(:run_process_with_timeout, ->(*args, **kwargs) { calls << [args, kwargs]; ["ok", success, false] }) do
+        assert ClashPatch.validate_with_mihomo("/tmp/profile/config.yaml", core_path: "/tmp/mihomo")
+      end
+    end
+    assert_equal ["/tmp/mihomo", "-d", "/tmp/profile", "-t", "-f", "/tmp/profile/config.yaml"], calls.fetch(0).fetch(0)
+
+    ClashPatch.stub(:mihomo_core_status, :timeout) do
+      assert_equal :timeout, ClashPatch.validate_with_mihomo("/tmp/profile/config.yaml", core_path: "/tmp/mihomo")
+    end
+  end
+
+  def test_default_connectivity_retries_transient_errors_and_returns_false
+    failed = Object.new
+    failed.define_singleton_method(:success?) { false }
+    attempts = 0
+    Open3.stub(:capture2e, ->(*_args) { attempts += 1; ["", failed] }) do
+      refute ClashPatch.default_connectivity_healthy?
+    end
+    assert_equal 3, attempts
+
+    successful = Object.new
+    successful.define_singleton_method(:success?) { true }
+    Open3.stub(:capture2e, ["", successful]) do
+      assert ClashPatch.default_connectivity_healthy?
+    end
+  end
+
+  def test_runtime_helpers_fail_closed_on_invalid_json
+    requester = ->(*_args) { [200, "not json"] }
+
+    assert_equal :unknown, ClashPatch.tun_state(requester: requester)
+    assert_nil ClashPatch.runtime_selections(requester)
+    refute ClashPatch.dns_runtime_healthy?(requester, "example.invalid")
+  end
+
+  def test_cli_help_exposes_every_supported_operation_without_touching_profiles
+    output, error = capture_io { assert_equal 0, ClashPatch.cli(["--help"]) }
+
+    assert_includes output, "--safe-update-all"
+    assert_empty error
+  end
+
+  def test_cli_reports_missing_profile_directories
+    ClashPatch.stub(:default_profile_directories, []) do
+      _output, error = capture_io { assert_equal 2, ClashPatch.cli([]) }
+      assert_includes error, "没有找到"
+    end
+  end
+
+  def test_cli_read_only_runtime_operations_use_their_authoritative_helpers
+    ClashPatch.stub(:mihomo_core_status, :supported) do
+      output, = capture_io { assert_equal 0, ClashPatch.cli(["--print-core-status"]) }
+      assert_includes output, "supported"
+    end
+    ClashPatch.stub(:tun_state, :enabled) do
+      output, = capture_io { assert_equal 0, ClashPatch.cli(["--print-tun-state"]) }
+      assert_includes output, "enabled"
+    end
+    ClashPatch.stub(:subscription_auto_update_state, :disabled) do
+      output, = capture_io { assert_equal 0, ClashPatch.cli(["--print-subscription-auto-update-state"]) }
+      assert_includes output, "disabled"
+    end
+  end
+
+  def test_cli_rejects_unknown_options_and_safe_updates_without_a_usage_profile
+    _output, error = capture_io { assert_equal 64, ClashPatch.cli(["--unknown-option"]) }
+    assert_includes error, "参数错误"
+
+    Dir.mktmpdir do |directory|
+      _output, error = capture_io do
+        assert_equal 64, ClashPatch.cli(["--profile-dir", directory, "--safe-update-all"])
+      end
+      assert_includes error, "必须指定用途档位"
+    end
+  end
+
+  def test_cli_dry_run_reports_each_profile_without_calling_the_mihomo_validator
+    Dir.mktmpdir do |directory|
+      File.write(File.join(directory, "friend.yaml"), YAML.dump(base_config))
+      output, error = capture_io do
+        assert_equal 0, ClashPatch.cli(["--profile-dir", directory, "--policy", POLICY_PATH, "--dry-run"])
+      end
+      assert_includes output, "friend.yaml"
+      assert_empty error
+    end
+  end
+
+  def test_cli_backup_commands_delegate_without_exposing_backup_contents
+    Dir.mktmpdir do |directory|
+      ClashPatch.stub(:list_backups, ["backup-id"]) do
+        output, = capture_io { assert_equal 0, ClashPatch.cli(["--profile-dir", directory, "--list-backups"]) }
+        assert_includes output, "backup-id"
+      end
+      ClashPatch.stub(:compare_backup, { status: :changed }) do
+        output, = capture_io do
+          assert_equal 0, ClashPatch.cli(["--profile-dir", directory, "--compare-backup", "backup-id"])
+        end
+        assert_includes output, "changed"
+      end
+    end
+  end
+
+  def test_route_verifier_json_and_profile_discovery_fail_closed
+    ClashPatch.stub(:controller_request, [503, "unavailable"]) do
+      assert_nil ClashRouteVerifier.get_json("socket", "/proxies")
+    end
+    ClashPatch.stub(:controller_request, [200, "not json"]) do
+      assert_nil ClashRouteVerifier.get_json("socket", "/proxies")
+    end
+    ClashPatch.stub(:selected_profile_name, "friend") do
+      ClashPatch.stub(:default_profile_directories, ["one", "two"]) do
+        ClashPatch.stub(:profile_paths, ->(directory) { directory == "two" ? ["/tmp/friend.yaml"] : [] }) do
+          ClashPatch.stub(:active_profile?, ->(path, selected) { path == "/tmp/friend.yaml" && selected == "friend" }) do
+            assert_equal "/tmp/friend.yaml", ClashRouteVerifier.active_profile
+          end
+        end
+      end
+    end
+  end
+
+  def test_route_verifier_observes_a_new_matching_connection_and_reaps_curl
+    calls = 0
+    connections = [
+      { "connections" => [{ "id" => "old", "metadata" => { "host" => "www.google.com" } }] },
+      { "connections" => [{ "id" => "old" }, { "id" => "new", "metadata" => { "host" => "www.google.com" }, "chains" => ["Main"] }] }
+    ]
+
+    ClashRouteVerifier.stub(:get_json, ->(*_args) { entry = connections[calls]; calls += 1; entry || { "connections" => [] } }) do
+      Process.stub(:spawn, 42) do
+        Process.stub(:kill, true) do
+          Process.stub(:wait, true) do
+            observed = ClashRouteVerifier.observe_connection("socket", "https://www.google.com", /google/i)
+            assert_equal "new", observed.fetch("id")
+          end
+        end
+      end
+    end
+  end
+
+  def test_route_verifier_ignores_missing_curl_process_during_cleanup
+    responses = [
+      { "connections" => [] },
+      { "connections" => [{ "id" => "new", "metadata" => { "host" => "www.google.com" } }] }
+    ]
+    ClashRouteVerifier.stub(:get_json, ->(*_args) { responses.shift || { "connections" => [] } }) do
+      Process.stub(:spawn, 42) do
+        Process.stub(:kill, ->(*_args) { raise Errno::ESRCH }) do
+          Process.stub(:wait, ->(*_args) { raise Errno::ECHILD }) do
+            assert_equal "new", ClashRouteVerifier.observe_connection("socket", "https://www.google.com", /google/i).fetch("id")
+          end
+        end
+      end
+    end
+  end
+
+  def test_route_verifier_returns_false_when_profile_loading_raises
+    ClashPatch.stub(:controller_socket, "socket") do
+      ClashRouteVerifier.stub(:active_profile, -> { raise IOError, "profile disappeared" }) do
+        refute ClashRouteVerifier.run(output: StringIO.new)
+      end
+    end
+  end
+
+  def test_route_verifier_reports_a_full_healthy_route_check
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
+      proxies = { "proxies" => {
+        "Main" => { "now" => "Taiwan" }, "AI" => { "now" => "Japan" }
+      } }
+      observations = [
+        { "chains" => ["Taiwan", "Main"] },
+        { "chains" => ["Japan", "AI"] },
+        { "chains" => ["Japan", "AI"] },
+        { "chains" => ["Japan", "AI"] }
+      ]
+      ClashPatch.stub(:controller_socket, "socket") do
+        ClashRouteVerifier.stub(:active_profile, profile) do
+          ClashRouteVerifier.stub(:get_json, proxies) do
+            ClashRouteVerifier.stub(:observe_connection, ->(*_args) { observations.shift }) do
+              output = StringIO.new
+              assert ClashRouteVerifier.run(output: output)
+              assert_includes output.string, "Google：通过"
+              assert_includes output.string, "Claude：通过"
+            end
+          end
+        end
+      end
+    end
   end
 
   private

@@ -7,6 +7,8 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $installer = Join-Path (Join-Path $root "clash-patch/scripts") "install_windows.ps1"
 $uninstaller = Join-Path (Join-Path $root "clash-patch/scripts") "uninstall_windows.ps1"
+$installWrapper = Join-Path (Join-Path $root "clash-patch/scripts") "install_windows.cmd"
+$uninstallWrapper = Join-Path (Join-Path $root "clash-patch/scripts") "uninstall_windows.cmd"
 $routeVerifier = Join-Path (Join-Path $root "clash-patch/scripts/windows") "verify_routes.ps1"
 $sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("clash-patch-windows-test-" + [System.Guid]::NewGuid().ToString("N"))
 $onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
@@ -95,6 +97,24 @@ try {
         $hangingCoreText = "@echo off`r`nping 127.0.0.1 -n 6 >nul`r`nexit /b 0`r`n"
     } else {
         $hangingCoreText = "#!/bin/sh`nsleep 5`nexit 0`n"
+    }
+
+    if ($onWindows) {
+        $wrapperCase = Join-Path $sandbox "cmd-wrapper-case"
+        New-Item -ItemType Directory -Path $wrapperCase -Force | Out-Null
+        $wrapperOutput = & $installWrapper -ShowUsageProfile -AppHome $wrapperCase 2>&1 | Out-String
+        Assert-True ($LASTEXITCODE -eq 0) "install_windows.cmd did not propagate a successful exit: $wrapperOutput"
+        Assert-True ($wrapperOutput.Contains("unset")) "install_windows.cmd did not forward PowerShell output"
+
+        $invalidWrapperOutput = & $installWrapper -NotARealParameter -AppHome $wrapperCase 2>&1 | Out-String
+        Assert-True ($LASTEXITCODE -ne 0) "install_windows.cmd swallowed a PowerShell parameter failure: $invalidWrapperOutput"
+
+        $wrapperBackup = Join-Path (Join-Path $wrapperCase "clash-patch-backups") "keep.backup"
+        New-Item -ItemType Directory -Path (Split-Path -Parent $wrapperBackup) -Force | Out-Null
+        [System.IO.File]::WriteAllText($wrapperBackup, "keep")
+        $uninstallWrapperOutput = & $uninstallWrapper -AppHome $wrapperCase 2>&1 | Out-String
+        Assert-True ($LASTEXITCODE -eq 0) "uninstall_windows.cmd did not propagate a successful exit: $uninstallWrapperOutput"
+        Assert-True (Test-Path -LiteralPath $wrapperBackup -PathType Leaf) "uninstall_windows.cmd deleted configuration history"
     }
     [System.IO.File]::WriteAllText($hangingCore, $hangingCoreText, [System.Text.Encoding]::ASCII)
     if (-not $onWindows) { & /bin/chmod 700 $hangingCore }
@@ -188,6 +208,16 @@ items:
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), $firstSafeOriginal)
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), $secondSafeOriginal)
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "L-local.yaml"), "local: true`n")
+    $remoteTargets = @(Get-RemoteSubscriptionTargets $profilesIndexInput $safeUpdateProfiles)
+    Assert-True ($remoteTargets.Count -eq 2) "two distinct remote subscriptions were not mapped independently"
+    Assert-True ((@($remoteTargets | ForEach-Object { $_.Path } | Sort-Object -Unique)).Count -eq 2) "distinct remote subscriptions were mapped to one file"
+    if ($onWindows) {
+        $caseAliasIndex = "items:`n- uid: Case-Alias`n  type: remote`n- uid: case-alias`n  type: remote`n"
+        [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "case-alias.yaml"), "proxies: []`n")
+        $caseAliasRejected = $false
+        try { Get-RemoteSubscriptionTargets $caseAliasIndex $safeUpdateProfiles | Out-Null } catch { $caseAliasRejected = $_.Exception.Message.Contains("多个远程订阅") }
+        Assert-True $caseAliasRejected "case-alias remote subscriptions were allowed to share one file"
+    }
     $snapshotResult = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
     Assert-True ($snapshotResult.ExitCode -eq 0) "safe update snapshot failed: $($snapshotResult.Output)"
     $safeBackups = @(Get-ChildItem -LiteralPath (Join-Path $safeUpdateCase "clash-patch-backups") -File | Where-Object { $_.Name -like "*--pre-update--*" })
@@ -199,6 +229,18 @@ items:
     Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-first.yaml") -Raw) -eq $firstSafeOriginal) "failed safe update did not restore first remote subscription"
     Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-second.yml") -Raw) -eq $secondSafeOriginal) "failed safe update did not restore second remote subscription"
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json"))) "completed rollback left a reusable stale safe-update manifest"
+
+    $successSnapshot = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
+    Assert-True ($successSnapshot.ExitCode -eq 0) "second safe update snapshot failed: $($successSnapshot.Output)"
+    $firstSafeUpdated = "mode: rule`nproxies: []`n"
+    $secondSafeUpdated = "mode: global`nproxy-groups: []`n"
+    [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), $firstSafeUpdated)
+    [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), $secondSafeUpdated)
+    $successVerify = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-VerifySafeUpdate", "-MihomoPath", $fakeCore)
+    Assert-True ($successVerify.ExitCode -eq 0) "valid safe update was rejected: $($successVerify.Output)"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-first.yaml") -Raw) -eq $firstSafeUpdated) "valid safe update incorrectly restored first remote subscription"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-second.yml") -Raw) -eq $secondSafeUpdated) "valid safe update incorrectly restored second remote subscription"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json"))) "accepted safe update left a stale manifest"
 
     $concurrentTarget = Join-Path $safeUpdateProfiles "concurrent.yaml"
     $concurrentBackup = Join-Path $safeUpdateProfiles "concurrent.backup"
@@ -330,6 +372,33 @@ items:
     Assert-True ($nullProfilesIndex -match '(?m)^\s+allow_auto_update:\s+false\s*$') "profile 3 did not disable subscription auto-update"
     $profilesBackups = @(Get-ChildItem -LiteralPath (Join-Path $nullCase "clash-patch-backups") -File | Where-Object { $_.Name -like "*--profiles.yaml.backup" })
     Assert-True ($profilesBackups.Count -ge 1) "profiles.yaml was changed without a dated backup"
+
+    if ($onWindows) {
+        $runningCase = Join-Path $sandbox "running-client-case"
+        $runningProfiles = Join-Path $runningCase "profiles"
+        New-Item -ItemType Directory -Path $runningProfiles -Force | Out-Null
+        $runningConfig = "ipv6: true`ntun: null`n"
+        $runningVerge = "enable_tun_mode: false`n"
+        [System.IO.File]::WriteAllText((Join-Path $runningCase "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
+        [System.IO.File]::WriteAllText((Join-Path $runningProfiles "R-test.yaml"), "proxies: []`n")
+        [System.IO.File]::WriteAllText((Join-Path $runningCase "config.yaml"), $runningConfig)
+        [System.IO.File]::WriteAllText((Join-Path $runningCase "verge.yaml"), $runningVerge)
+        $runningClientPath = Join-Path $sandbox "clash-verge.exe"
+        Copy-Item -LiteralPath (Join-Path (Join-Path $env:SystemRoot "System32") "ping.exe") -Destination $runningClientPath
+        $runningClient = Start-Process -FilePath $runningClientPath -ArgumentList @("-n", "20", "127.0.0.1") -PassThru
+        try {
+            Start-Sleep -Milliseconds 100
+            $runningResult = Invoke-TestPowerShell $installer @("-AppHome", $runningCase, "-MihomoPath", $fakeCore)
+            Assert-True ($runningResult.ExitCode -eq 0) "installer did not use the running-client boundary: $($runningResult.Output)"
+            Assert-True (Test-Path -LiteralPath (Join-Path $runningProfiles "Script.js") -PathType Leaf) "running client did not receive the global script"
+            Assert-True ((Get-Content -LiteralPath (Join-Path $runningCase "profiles.yaml") -Raw) -match '(?m)^\s+allow_auto_update:\s+false\s*$') "running client did not disable remote auto-update"
+            Assert-True ((Get-Content -LiteralPath (Join-Path $runningCase "config.yaml") -Raw) -eq $runningConfig) "running client changed config.yaml"
+            Assert-True ((Get-Content -LiteralPath (Join-Path $runningCase "verge.yaml") -Raw) -eq $runningVerge) "running client changed verge.yaml"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $runningCase "clash-patch-install-state.json"))) "running client created an offline install state"
+        } finally {
+            if (-not $runningClient.HasExited) { Stop-Process -Id $runningClient.Id -Force }
+        }
+    }
 
     $blockCase = Join-Path $sandbox "block-case"
     New-Item -ItemType Directory -Path $blockCase -Force | Out-Null
