@@ -62,8 +62,8 @@ class SkillContractTest < Minitest::Test
     readme = File.read(File.join(ROOT, "README.md"))
     skill = File.read(File.join(SKILL, "SKILL.md"))
 
-    assert_operator readme.lines.length, :<=, 110
-    assert_operator skill.lines.length, :<=, 80
+    assert_operator readme.lines.length, :<=, 125
+    assert_operator skill.lines.length, :<=, 100
     assert_includes skill, "详细产品规则和全部状态以"
   end
 
@@ -78,6 +78,84 @@ class SkillContractTest < Minitest::Test
     assert_includes skill, "Diagnostics 模块"
     assert_includes skill, "不能因为用户提到 Clash 就先运行补丁"
     assert_includes skill, "Diagnostics 默认只读"
+  end
+
+  def test_patch_module_selects_and_remembers_the_minimum_usage_profile
+    readme = File.read(File.join(ROOT, "README.md"))
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+    mac_installer = File.read(File.join(SKILL, "scripts/install_macos.sh"))
+    windows_installer = File.read(File.join(SKILL, "scripts/install_windows.ps1"))
+
+    [readme, skill, policy, design].each do |document|
+      %w[普通浏览 海外\ AI Claude/Claude\ Code].each do |profile|
+        assert_includes document, profile.gsub("\\ ", " ")
+      end
+      assert_includes document, "首次"
+      assert_includes document, "保存"
+      assert_includes document, "修改"
+    end
+
+    assert_includes skill, "你使用网络代理主要用于哪些用途"
+    assert_includes skill, "没有已保存档位"
+    assert_includes skill, "明确表达 Claude 或 Claude Code"
+    assert_includes skill, "语音输入中的 `cloud`"
+    assert_includes skill, "不得把普通云盘、云服务器或 cloud storage"
+    assert_includes policy, "只应用满足已选用途所需的最少改动"
+
+    assert_includes mac_installer, "CLASH_PATCH_USAGE_PROFILE"
+    assert_includes mac_installer, "usage-profile.plist"
+    assert_includes mac_installer, "--profile"
+    assert_includes windows_installer, "CLASH_PATCH_USAGE_PROFILE"
+    assert_includes windows_installer, "clash-patch-usage-profile.json"
+    assert_includes windows_installer, "UsageProfile"
+  end
+
+  def test_each_usage_profile_has_distinct_actions_and_acceptance_tests
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+
+    [skill, policy].each do |document|
+      assert_includes document, "档位 1"
+      assert_includes document, "档位 2"
+      assert_includes document, "档位 3"
+      assert_includes document, "Google"
+      assert_includes document, "Twitter"
+      assert_includes document, "ChatGPT"
+      assert_includes document, "Gemini"
+      assert_includes document, "Claude"
+    end
+
+    assert_includes policy, "档位 1 不修改 TUN"
+    assert_includes policy, "不修改订阅"
+    assert_includes policy, "档位 2 不应用 DNS、WebRTC 或 AI 分组补丁"
+    assert_includes policy, "只关闭 Clash 客户端自己的系统代理开关"
+    assert_includes policy, "不得清除或覆盖 AdGuard"
+    assert_includes policy, "不是为了隐藏代理"
+    assert_includes policy, "台湾家宽优先，其次日本家宽"
+    assert_includes policy, "不得自动切换节点"
+  end
+
+  def test_profile_changes_are_safe_and_lower_profiles_do_not_run_the_full_patch
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    mac_installer = File.read(File.join(SKILL, "scripts/install_macos.sh"))
+    windows_installer = File.read(File.join(SKILL, "scripts/install_windows.ps1"))
+
+    assert_includes skill, "用户可以随时改档"
+    assert_includes policy, "升档"
+    assert_includes policy, "降档"
+    assert_includes policy, "不能为了降档覆盖后来产生的用户改动"
+    assert_includes skill, "从档位 3 降到档位 1 或 2"
+    assert_includes skill, "uninstall_macos.sh"
+    assert_includes skill, "uninstall_windows.cmd"
+    assert_includes policy, "旧订阅增强仍可能保留"
+    assert_includes policy, "只有档位 3"
+    assert_includes mac_installer, 'if [ "$USAGE_PROFILE" -ne 3 ]'
+    assert_includes mac_installer, "检测到从档位 3 改为轻量档位"
+    assert_includes windows_installer, 'if ($resolvedUsageProfile -ne 3)'
+    assert_includes windows_installer, "检测到从档位 3 改为轻量档位"
   end
 
   def test_diagnostics_uses_a_universal_evidence_loop
@@ -496,8 +574,8 @@ class SkillContractTest < Minitest::Test
     windows_tests = File.binread(File.join(ROOT, "tests/test_windows_installer.ps1"))
     patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
 
-    assert_operator mac_install.index('id -u'), :<, mac_install.index('/bin/mkdir -p')
-    assert_operator mac_install.index('--print-core-status'), :<, mac_install.index('/bin/mkdir -p')
+    assert_operator mac_install.index('id -u'), :<, mac_install.index("\n  save_profile\n")
+    assert_operator mac_install.index('if [ "$USAGE_PROFILE" -ne 3 ]'), :<, mac_install.index('core_status=')
     assert_operator mac_install.index('plutil -extract Label'), :<, mac_install.index('launchctl bootout')
     assert_operator mac_install.index('ProgramArguments.0'), :<, mac_install.index('launchctl bootout')
     assert_operator mac_install.index('ProgramArguments.1'), :<, mac_install.index('launchctl bootout')

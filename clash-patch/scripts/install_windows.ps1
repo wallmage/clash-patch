@@ -1,6 +1,8 @@
 ﻿param(
     [string]$AppHome = "",
-    [string]$MihomoPath = ""
+    [string]$MihomoPath = "",
+    [int]$UsageProfile = 0,
+    [switch]$ShowUsageProfile
 )
 
 $ErrorActionPreference = "Stop"
@@ -154,6 +156,28 @@ function ConvertTo-Utf8Bytes([string]$Content) {
 
 function Write-Utf8Atomic([string]$Path, [string]$Content) {
     Write-BytesAtomic $Path (ConvertTo-Utf8Bytes $Content)
+}
+
+function Get-SavedUsageProfile([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 0 }
+    try {
+        $state = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        throw "用途档位文件无效，无法确认之前的选择。"
+    }
+    $version = $state.Version
+    $profile = $state.Profile
+    $numericVersion = $version -is [int] -or $version -is [long]
+    $numericProfile = $profile -is [int] -or $profile -is [long]
+    if (-not $numericVersion -or [long]$version -ne 1 -or -not $numericProfile -or [long]$profile -notin @(1, 2, 3)) {
+        throw "用途档位文件无效，无法确认之前的选择。"
+    }
+    return [int]$profile
+}
+
+function Save-UsageProfile([string]$Path, [int]$Profile) {
+    $state = [ordered]@{ Version = 1; Profile = $Profile }
+    Write-Utf8Atomic $Path (($state | ConvertTo-Json -Compress) + "`r`n")
 }
 
 function Get-BytesSha256([byte[]]$Bytes) {
@@ -683,8 +707,68 @@ $profilesDirectory = Join-Path $AppHome "profiles"
 $vergePath = Join-Path $AppHome "verge.yaml"
 $configPath = Join-Path $AppHome "config.yaml"
 $statePath = Join-Path $AppHome "clash-patch-install-state.json"
+$usageStatePath = Join-Path $AppHome "clash-patch-usage-profile.json"
 $targetScript = Join-Path $profilesDirectory "Script.js"
 $enginePath = Join-Path (Join-Path $PSScriptRoot "windows") "clash_verge_global.js"
+
+try {
+    $savedUsageProfile = Get-SavedUsageProfile $usageStatePath
+} catch {
+    [Console]::Error.WriteLine("[Clash 补丁] $($_.Exception.Message)")
+    exit 1
+}
+
+if ($ShowUsageProfile) {
+    if ($savedUsageProfile -eq 0) { Write-Output "unset" } else { Write-Output $savedUsageProfile }
+    exit 0
+}
+
+$profileSource = "saved"
+$resolvedUsageProfile = $UsageProfile
+if ($resolvedUsageProfile -eq 0 -and -not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_USAGE_PROFILE)) {
+    $parsedUsageProfile = 0
+    if (-not [int]::TryParse($env:CLASH_PATCH_USAGE_PROFILE, [ref]$parsedUsageProfile)) {
+        [Console]::Error.WriteLine("[Clash 补丁] 用途档位无效，只能是 1、2 或 3。")
+        exit 64
+    }
+    $resolvedUsageProfile = $parsedUsageProfile
+    $profileSource = "environment"
+} elseif ($resolvedUsageProfile -ne 0) {
+    $profileSource = "argument"
+}
+if ($resolvedUsageProfile -eq 0) {
+    $resolvedUsageProfile = $savedUsageProfile
+}
+if ($resolvedUsageProfile -eq 0) {
+    [Console]::Error.WriteLine("[Clash 补丁] 还没有选择用途档位。请先在 skill 中选择：1 普通浏览、2 海外 AI、3 Claude/Claude Code。")
+    exit 10
+}
+if ($resolvedUsageProfile -notin @(1, 2, 3)) {
+    [Console]::Error.WriteLine("[Clash 补丁] 用途档位无效，只能是 1、2 或 3。")
+    exit 64
+}
+if ($profileSource -ne "saved") {
+    try {
+        Save-UsageProfile $usageStatePath $resolvedUsageProfile
+        Write-Info "已保存用途档位 $resolvedUsageProfile。"
+    } catch {
+        [Console]::Error.WriteLine("[Clash 补丁] 无法保存用途档位：$($_.Exception.Message)")
+        exit 1
+    }
+}
+
+if ($resolvedUsageProfile -ne 3) {
+    if ($savedUsageProfile -eq 3 -and $profileSource -ne "saved") {
+        Write-Info "检测到从档位 3 改为轻量档位。安装程序不会覆盖后来产生的用户改动；请由本 skill 先运行安全卸载流程，并说明无法自动恢复的旧增强。"
+    }
+    if ($resolvedUsageProfile -eq 1) {
+        Write-Info "档位 1 只需要确认 Clash Verge Rev 的“设置为系统代理”已开启；未修改 TUN 或订阅。"
+    } else {
+        Write-Info "档位 2 只需要开启 TUN 并关闭 Clash Verge Rev 自己的系统代理开关；未修改订阅、DNS、WebRTC 或 AI 分组。"
+    }
+    Write-Info "请由本 skill 使用 Computer Use 完成客户端开关和对应网站复测。"
+    exit 0
+}
 
 if (-not (Test-Path -LiteralPath $enginePath -PathType Leaf)) {
     [Console]::Error.WriteLine("[Clash 补丁] 安装包不完整：缺少 Windows 全局扩展脚本。")

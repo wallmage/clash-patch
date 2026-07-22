@@ -9,6 +9,8 @@ $installer = Join-Path (Join-Path $root "clash-patch/scripts") "install_windows.
 $uninstaller = Join-Path (Join-Path $root "clash-patch/scripts") "uninstall_windows.ps1"
 $sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("clash-patch-windows-test-" + [System.Guid]::NewGuid().ToString("N"))
 $onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+$previousUsageProfile = $env:CLASH_PATCH_USAGE_PROFILE
+$env:CLASH_PATCH_USAGE_PROFILE = "3"
 $fakeCore = Join-Path $sandbox $(if ($onWindows) { "mihomo-test.cmd" } else { "mihomo-test.sh" })
 $hangingCore = Join-Path $sandbox $(if ($onWindows) { "mihomo-hang.cmd" } else { "mihomo-hang.sh" })
 
@@ -86,6 +88,26 @@ try {
     }
     [System.IO.File]::WriteAllText($hangingCore, $hangingCoreText, [System.Text.Encoding]::ASCII)
     if (-not $onWindows) { & /bin/chmod 700 $hangingCore }
+
+    $lightCase = Join-Path $sandbox "light-profile-case"
+    New-Item -ItemType Directory -Path $lightCase -Force | Out-Null
+    $lightConfig = "ipv6: true`ntun:`n  enable: false`n"
+    $lightVerge = "enable_tun_mode: false`n"
+    [System.IO.File]::WriteAllText((Join-Path $lightCase "config.yaml"), $lightConfig)
+    [System.IO.File]::WriteAllText((Join-Path $lightCase "verge.yaml"), $lightVerge)
+    $profileOne = Invoke-TestPowerShell $installer @("-AppHome", $lightCase, "-UsageProfile", "1")
+    Assert-True ($profileOne.ExitCode -eq 0) "profile 1 installer failed: $($profileOne.Output)"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $lightCase "config.yaml") -Raw) -eq $lightConfig) "profile 1 modified config.yaml"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $lightCase "verge.yaml") -Raw) -eq $lightVerge) "profile 1 modified verge.yaml"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path (Join-Path $lightCase "profiles") "Script.js"))) "profile 1 installed the full patch"
+    $savedProfileOne = Get-Content -LiteralPath (Join-Path $lightCase "clash-patch-usage-profile.json") -Raw | ConvertFrom-Json
+    Assert-True ([int]$savedProfileOne.Profile -eq 1) "profile 1 was not saved"
+    $profileTwo = Invoke-TestPowerShell $installer @("-AppHome", $lightCase, "-UsageProfile", "2")
+    Assert-True ($profileTwo.ExitCode -eq 0) "profile 2 installer failed: $($profileTwo.Output)"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $lightCase "config.yaml") -Raw) -eq $lightConfig) "profile 2 modified config.yaml"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path (Join-Path $lightCase "profiles") "Script.js"))) "profile 2 installed the full patch"
+    $savedProfileTwo = Get-Content -LiteralPath (Join-Path $lightCase "clash-patch-usage-profile.json") -Raw | ConvertFrom-Json
+    Assert-True ([int]$savedProfileTwo.Profile -eq 2) "profile 2 was not saved"
 
     $unitStage = Set-YamlTopLevelScalar "ipv6 : true`ntun: null`n" "ipv6" "false"
     Assert-True ($unitStage -match '(?m)^tun:') "scalar transform lost tun node: $($unitStage | ConvertTo-Json -Compress)"
@@ -305,6 +327,7 @@ friend payload
 
     Write-Host "Windows installer behavioral cases passed"
 } finally {
+    $env:CLASH_PATCH_USAGE_PROFILE = $previousUsageProfile
     if (Test-Path -LiteralPath $sandbox) { Remove-Item -LiteralPath $sandbox -Recurse -Force }
 }
 

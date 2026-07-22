@@ -11,7 +11,7 @@
 ## 项目边界
 
 - 只支持 macOS 的 ClashX Meta 和 Windows 的 Clash Verge Rev；要求受支持版本的 Mihomo。
-- 绝不退出、停止或重启 Clash，也不擅自切换 TUN、订阅、代理组或节点。
+- 绝不退出、停止或重启 Clash。只有用户已选用途档位明确要求时，才通过客户端界面切换 TUN 或 Clash 自己的系统代理；绝不覆盖 AdGuard 等第三方代理，也不切换订阅、代理组或节点。
 - 不泄露订阅地址、密码、UUID、私钥、控制器密钥或完整节点地址。
 - 不加入 Apple、iCloud、Speedtest 等个人规则。
 - 文档、代码和测试必须描述同一套现行行为，不保留已经取消的方案。

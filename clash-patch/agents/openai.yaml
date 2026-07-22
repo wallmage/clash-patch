@@ -1,4 +1,4 @@
 interface:
   display_name: "Clash 补丁与诊断"
-  short_description: "诊断网络问题并安全修复 Clash 的 DNS、WebRTC 与 AI 分流"
-  default_prompt: "使用 $clash-patch 主动诊断、解释并修复网络问题，或检查并增强 Clash 当前存储位置中的订阅；绝对不要退出、停止或重启 Clash 客户端。"
+  short_description: "按用途配置 Clash，或取证诊断并修复网络问题"
+  default_prompt: "使用 $clash-patch 读取或询问我的代理用途档位，按最少改动配置 Clash 当前存储位置，或主动诊断并修复网络问题；绝对不要退出、停止或重启 Clash 客户端。"

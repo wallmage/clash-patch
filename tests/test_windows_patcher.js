@@ -462,7 +462,7 @@ test('PowerShell installer keeps exit codes by avoiding Write-Error', () => {
   const missingEngine = source.indexOf('安装包不完整');
   assert.ok(missingEngine !== -1 && source.indexOf('exit 3') > missingEngine, 'missing engine must exit 3');
   const failure = source.indexOf('安装失败');
-  assert.ok(failure !== -1 && source.indexOf('exit 1') > failure, 'install failure must exit 1');
+  assert.ok(failure !== -1 && source.lastIndexOf('exit 1') > failure, 'install failure must exit 1');
 });
 
 test('DNS fragments must resolve to a non-direct proxy or group', { skip: !available }, () => {

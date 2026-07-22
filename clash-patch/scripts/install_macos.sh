@@ -5,6 +5,7 @@ set -f
 CUSTOM_PROFILE_DIR="${CLASH_PATCH_PROFILE_DIR:-}"
 INSTALL_DIR="$HOME/Library/Application Support/ClashPatch"
 BACKUP_DIR="$INSTALL_DIR/backups"
+USAGE_STATE_PATH="${CLASH_PATCH_USAGE_STATE_PATH:-$INSTALL_DIR/usage-profile.plist}"
 CURRENT_LABEL="com.clashpatch.profiles"
 CURRENT_PLIST="$HOME/Library/LaunchAgents/$CURRENT_LABEL.plist"
 CURRENT_PATCHER="$INSTALL_DIR/patch_profiles.rb"
@@ -14,10 +15,96 @@ LEGACY_PATCHER="$HOME/Library/Application Support/ClashProfilePatcher/patch_prof
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PATCHER_SOURCE="$SCRIPT_DIR/macos/patch_profiles.rb"
 POLICY_SOURCE="$SCRIPT_DIR/../references/policy.json"
+USAGE_PROFILE=""
+PROFILE_SOURCE=""
+SHOW_PROFILE=0
 
 say() {
   /usr/bin/printf '%s\n' "[Clash 补丁] $1"
 }
+
+usage() {
+  /usr/bin/printf '%s\n' "用法：install_macos.sh [--profile 1|2|3] [--show-profile]"
+}
+
+read_saved_profile() {
+  [ -f "$USAGE_STATE_PATH" ] && [ ! -L "$USAGE_STATE_PATH" ] || return 1
+  saved_version=$(/usr/bin/plutil -extract Version raw "$USAGE_STATE_PATH" 2>/dev/null || true)
+  saved_profile=$(/usr/bin/plutil -extract Profile raw "$USAGE_STATE_PATH" 2>/dev/null || true)
+  [ "$saved_version" = "1" ] || return 1
+  case "$saved_profile" in
+    1|2|3) /usr/bin/printf '%s\n' "$saved_profile" ;;
+    *) return 1 ;;
+  esac
+}
+
+save_profile() {
+  state_dir=$(/usr/bin/dirname "$USAGE_STATE_PATH")
+  if [ -L "$state_dir" ] || { [ -e "$USAGE_STATE_PATH" ] && { [ ! -f "$USAGE_STATE_PATH" ] || [ -L "$USAGE_STATE_PATH" ]; }; }; then
+    say "档位保存位置不安全，未写入任何设置。"
+    exit 7
+  fi
+  /bin/mkdir -p "$state_dir"
+  /bin/chmod 700 "$state_dir"
+  temporary=$(/usr/bin/mktemp "$state_dir/.usage-profile.XXXXXX")
+  trap '/bin/rm -f "$temporary"' EXIT HUP INT TERM
+  /usr/bin/plutil -create xml1 "$temporary"
+  /usr/bin/plutil -insert Version -integer 1 "$temporary"
+  /usr/bin/plutil -insert Profile -integer "$USAGE_PROFILE" "$temporary"
+  /bin/chmod 600 "$temporary"
+  /bin/mv -f "$temporary" "$USAGE_STATE_PATH"
+  trap - EXIT HUP INT TERM
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --profile)
+      [ "$#" -ge 2 ] || { usage; exit 64; }
+      USAGE_PROFILE=$2
+      PROFILE_SOURCE="argument"
+      shift 2
+      ;;
+    --show-profile)
+      SHOW_PROFILE=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 64
+      ;;
+  esac
+done
+
+if [ "$SHOW_PROFILE" -eq 1 ]; then
+  read_saved_profile || /usr/bin/printf '%s\n' "unset"
+  exit 0
+fi
+
+if [ -z "$USAGE_PROFILE" ] && [ -n "${CLASH_PATCH_USAGE_PROFILE:-}" ]; then
+  USAGE_PROFILE=$CLASH_PATCH_USAGE_PROFILE
+  PROFILE_SOURCE="environment"
+fi
+if [ -z "$USAGE_PROFILE" ]; then
+  USAGE_PROFILE=$(read_saved_profile || true)
+  PROFILE_SOURCE="saved"
+fi
+case "$USAGE_PROFILE" in
+  1|2|3) ;;
+  "")
+    say "还没有选择用途档位。请先在 skill 中选择：1 普通浏览、2 海外 AI、3 Claude/Claude Code。"
+    exit 10
+    ;;
+  *)
+    say "用途档位无效，只能是 1、2 或 3。"
+    exit 64
+    ;;
+esac
+
+PREVIOUS_PROFILE=$(read_saved_profile || true)
 
 legacy_agent_owned() {
   candidate=$1
@@ -65,6 +152,11 @@ if [ ! -d "/Applications/ClashX Meta.app" ] && [ ! -d "$HOME/Applications/ClashX
   exit 4
 fi
 
+if [ "$PROFILE_SOURCE" != "saved" ]; then
+  save_profile
+  say "已保存用途档位 ${USAGE_PROFILE}。"
+fi
+
 if [ -n "$CUSTOM_PROFILE_DIR" ] && [ ! -d "$CUSTOM_PROFILE_DIR" ]; then
   say "没有找到指定的 ClashX Meta 配置目录。"
   exit 5
@@ -78,6 +170,19 @@ fi
 # 旧版目录监听会被补丁自己的写入再次触发。只移除能核对所有权的旧服务。
 remove_legacy_agent "$CURRENT_PLIST" "$CURRENT_LABEL" "$CURRENT_PATCHER"
 remove_legacy_agent "$LEGACY_PLIST" "$LEGACY_LABEL" "$LEGACY_PATCHER"
+
+if [ "$USAGE_PROFILE" -ne 3 ]; then
+  if [ "$PREVIOUS_PROFILE" = "3" ] && [ "$PROFILE_SOURCE" != "saved" ]; then
+    say "检测到从档位 3 改为轻量档位。安装程序不会覆盖后来产生的用户改动；请由本 skill 先运行安全卸载流程，并说明无法自动恢复的旧订阅增强。"
+  fi
+  if [ "$USAGE_PROFILE" -eq 1 ]; then
+    say "档位 1 只需要确认 ClashX Meta 的“设置为系统代理”已开启；未修改 TUN 或订阅。"
+  else
+    say "档位 2 只需要开启 TUN 并关闭 ClashX Meta 自己的系统代理开关；未修改订阅、DNS、WebRTC 或 AI 分组。"
+  fi
+  say "请由本 skill 使用 Computer Use 完成客户端开关和对应网站复测。"
+  exit 0
+fi
 
 core_status=$(/usr/bin/ruby "$PATCHER_SOURCE" --print-core-status 2>/dev/null || true)
 if [ "$core_status" != "supported" ]; then
@@ -105,5 +210,5 @@ fi
 
 say "本次为单次运行，只处理 ClashX Meta 当前存储位置中的订阅。"
 say "当前订阅需要修改时，会通过本地控制器自动刷新并检查；失败时补丁程序会恢复原配置。"
-say "脚本没有退出、停止或重启 ClashX Meta，也没有切换 TUN、订阅、代理组或节点。"
+say "脚本没有退出、停止或重启 ClashX Meta，也没有切换订阅、代理组或节点。"
 say "订阅以后刷新时，请再次运行本 skill。"
