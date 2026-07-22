@@ -1034,10 +1034,14 @@ module ClashPatch
   end
 
   def tun_state(socket: nil, requester: nil)
-    socket ||= controller_socket
-    return :unknown unless socket
+    if requester.nil?
+      socket ||= controller_socket
+      return :unknown unless socket
 
-    request = requester || ->(method, endpoint, body) { controller_request(socket, method, endpoint, body) }
+      requester = ->(method, endpoint, body) { controller_request(socket, method, endpoint, body) }
+    end
+
+    request = requester
     status, body = request.call("GET", "/configs", nil)
     return :unknown unless status == 200
 

@@ -1,12 +1,19 @@
 # Clash Patch
 
-Clash Patch 是给 AI 助手使用的 Clash 配置补丁，支持 macOS 的 ClashX Meta 和 Windows 的 Clash Verge Rev。它增强当前存储位置中的订阅，不处理废弃目录或另一套未启用的存储。
+Clash Patch 是给 AI 助手使用的网络补丁与诊断 Skill，支持 macOS 的 ClashX Meta 和 Windows 的 Clash Verge Rev。它包含 Patch 和 Diagnostics 两个模块。
 
 ## 安全原则
 
 **绝对不要退出、停止或重启 Clash 客户端。** 中国用户通常依靠 Clash 连接 Codex；客户端退出后，修复可能中断。
 
 补丁不会退出或重启 Clash，也不会切换 TUN、订阅、代理组或节点。macOS 修改当前订阅后会通过本地控制器自动刷新并检查；失败时恢复修改前的文件和运行配置。补丁不加入 Apple、iCloud、Speedtest 等个人规则。
+
+## 两个模块
+
+- **Patch**：首次使用时安全增强当前订阅，处理 DNS、TUN、AI 分流和 WebRTC 泄漏。
+- **Diagnostics**：用户只要描述网络哪里不对，AI 助手就从本机复现、读取系统与应用证据、验证不同解释、完成修复并针对原问题复测。
+
+Diagnostics 不要求用户会看日志，也不会因为提到 Clash 就先改配置。它按现场选择需要检查的浏览器、应用、DNS、连接、分流、传输质量、系统记录和日志；证据不足时建立一段有时间范围的观察。能安全自动修复的由 AI 助手完成，本机解决不了的会先确定问题类别，再查找当前的官方方案。
 
 ## 补丁内容
 
@@ -31,7 +38,7 @@ git clone https://github.com/wallmage/clash-patch.git
 把仓库中的 `clash-patch` 文件夹复制到 `~/.codex/skills/clash-patch`，然后告诉 Codex：
 
 ```text
-请使用 $clash-patch 检查并增强 Clash 当前存储位置中的订阅。不要退出、停止或重启 Clash。
+请使用 $clash-patch 诊断当前网络问题，或检查并增强 Clash 当前存储位置中的订阅。不要退出、停止或重启 Clash。
 ```
 
 也可以手动运行：
@@ -60,7 +67,7 @@ Clash Verge Rev 的全局扩展脚本 `profiles/Script.js` 会在订阅加载或
 
 客户端运行时只更新全局脚本；客户端原本没有运行时，安装程序才事务式更新应用级 TUN 设置。脚本不会结束 Clash 进程。
 
-## 验证
+## Patch 验证
 
 先检查实时分流：国内网站应获得大陆 CDN 并经过 `DIRECT`；Google 应经过主代理组当前节点；OpenAI、Anthropic 和 Claude 应经过 AI 分组当前节点。然后测试：
 

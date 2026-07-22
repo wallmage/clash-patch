@@ -1423,6 +1423,14 @@ class MacosPatcherTest < Minitest::Test
     assert_equal :unknown, ClashPatch.tun_state(socket: "/tmp/fake.sock", requester: wrong_shape)
   end
 
+  def test_tun_state_does_not_require_a_local_socket_when_a_requester_is_supplied
+    enabled = ->(*_args) { [200, JSON.generate("tun" => { "enable" => true })] }
+
+    ClashPatch.stub(:controller_socket, nil) do
+      assert_equal :enabled, ClashPatch.tun_state(requester: enabled)
+    end
+  end
+
   def test_profile_discovery_uses_only_the_active_storage_root
     Dir.mktmpdir do |home|
       local = File.join(home, ".config", "clash.meta")

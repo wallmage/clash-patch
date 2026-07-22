@@ -63,6 +63,152 @@ class SkillContractTest < Minitest::Test
     assert_includes skill, "详细产品规则和全部状态以"
   end
 
+  def test_skill_exposes_patch_and_diagnostics_as_separate_modules
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    metadata = YAML.safe_load(skill.match(/\A---\n(.*?)\n---/m)[1])
+
+    assert_includes metadata.fetch("description"), "diagnose"
+    assert_includes metadata.fetch("description"), "slow"
+    assert_includes metadata.fetch("description"), "intermittent"
+    assert_includes skill, "Patch 模块"
+    assert_includes skill, "Diagnostics 模块"
+    assert_includes skill, "不能因为用户提到 Clash 就先运行补丁"
+    assert_includes skill, "Diagnostics 默认只读"
+  end
+
+  def test_diagnostics_uses_a_universal_evidence_loop
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+
+    assert_includes policy, "## Diagnostics 模块"
+    %w[复现 影响范围 对照 时间线 假设 证据 排除 最小改动 复测 观察窗口].each do |term|
+      assert_includes policy, term
+    end
+    assert_includes policy, "不要求用户先知道该查什么"
+    assert_includes policy, "任何外部记录都不是诊断前提"
+    assert_includes policy, "没有证据不能下结论"
+    assert_includes policy, "按现象选择必要层级，不是每次全部执行"
+    assert_includes policy, "始终记录时间、操作系统、活动网络和原始症状"
+    assert_includes policy, "只有影响范围或证据指向共同网络路径时"
+    assert_includes policy, "保留所有尚未证实的解释"
+    assert_includes policy, "只有充分反证"
+  end
+
+  def test_diagnostics_separates_clues_from_conclusions
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+
+    %w[已确认 有力支持 尚未证实 已排除].each { |state| assert_includes policy, state }
+    assert_includes policy, "单个现象或相关性只能算线索"
+    assert_includes policy, "第二种独立证据"
+    assert_includes policy, "反证"
+    assert_includes policy, "解释全部已知现象"
+  end
+
+  def test_diagnostics_selects_tools_by_the_observed_symptom
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+
+    %w[浏览器 DNS 分流 TCP TLS 首字节 丢包 进程 系统记录 应用日志].each do |term|
+      assert_includes policy, term
+    end
+    assert_includes policy, "一个应用异常而其他应用正常"
+    assert_includes policy, "不得直接执行 Patch 模块"
+    assert_includes policy, "不得把完整补丁验收当成每次诊断的固定步骤"
+  end
+
+  def test_diagnostics_finishes_with_repair_explanation_and_verification
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+
+    assert_includes policy, "能在本机安全修复"
+    assert_includes policy, "由代理自动完成"
+    assert_includes policy, "本机无法修复"
+    assert_includes policy, "在线搜索"
+    assert_includes policy, "官方或第一方资料"
+    assert_includes policy, "一次只改变一个变量"
+    assert_includes policy, "修复前的状态"
+    assert_includes policy, "原始症状"
+    assert_includes policy, "发生了什么"
+    assert_includes policy, "为什么会这样"
+  end
+
+  def test_diagnostics_does_not_hide_a_full_patch_behind_a_targeted_repair
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+
+    assert_includes policy, "Patch 模块会应用完整安全策略，不是单项修复器"
+    assert_includes policy, "包含与已确认问题无关的改动"
+    assert_includes policy, "不得把完整 Patch 伪装成单项修复"
+    assert_includes skill, "Patch 专用验收"
+    assert_includes skill, "Diagnostics 不固定执行"
+    assert_includes skill, "单项 Clash 配置修复仍留在 Diagnostics"
+    assert_includes policy, "只有用户明确要求完整安全增强时才进入 Patch"
+    assert_includes policy, "macOS 单项配置事务"
+    assert_includes policy, "依次清除 Fake-IP 和 DNS 缓存"
+    assert_includes policy, "Windows 当前没有安全的即时单项配置写入路径"
+    assert_includes policy, "## Patch 验证标准"
+  end
+
+  def test_diagnostics_defines_observation_by_the_original_failure_pattern
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+
+    assert_includes policy, "可以立即重复的问题"
+    assert_includes policy, "修复前后各连续测试三次"
+    assert_includes policy, "最近记录中的典型复发间隔"
+    assert_includes policy, "同样长的时间窗"
+    assert_includes policy, "curl.exe"
+    assert_includes policy, "Test-NetConnection"
+    assert_includes policy, "Test-Connection"
+    assert_includes policy, "采集工具或会话"
+    assert_includes policy, "停止与清理方法"
+    assert_includes policy, "未建立监测"
+    assert_includes policy, "只有已经确认采集器正在运行时"
+  end
+
+  def test_diagnostics_protects_application_state_and_log_secrets
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+
+    %w[访问令牌 refresh\ token ID\ token Authorization Cookie 账号标识 会话内容].each do |term|
+      assert_includes policy, term.gsub("\\ ", " ")
+    end
+    assert_includes policy, "只读取必要时间窗"
+    assert_includes policy, "未保存工作"
+    assert_includes policy, "关闭应用、注销账号、删除或隔离缓存、Repair、重装或降级"
+    assert_includes policy, "明确授权"
+    assert_includes policy, "相同服务不等于相同账号、接口或认证方式"
+    assert_includes policy, "登录、支付、发消息"
+    assert_includes policy, "停止重复提交"
+    assert_includes policy, "密码、验证码、MFA 或硬件确认"
+  end
+
+  def test_windows_diagnostics_does_not_claim_an_instant_runtime_patch
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+
+    assert_includes policy, "Windows 客户端运行时不得修改当前配置"
+    assert_includes policy, "不能写成已立即生效"
+    assert_includes policy, "不得为了复测而触发订阅切换、节点切换"
+    assert_includes policy, "代理组切换或 TUN 切换"
+    assert_includes policy, "更不得重启客户端"
+    assert_includes policy, "已更新，尚未生效"
+  end
+
+  def test_diagnostics_does_not_bake_in_the_reference_incident
+    public_source = Dir.glob(File.join(ROOT, "{README.md,clash-patch/**/*}"), File::FNM_EXTGLOB)
+                       .select { |path| File.file?(path) }
+                       .map { |path| File.binread(path).force_encoding("UTF-8").scrub }
+                       .join("\n")
+
+    %w[MESL 5.86GB 702.9MB MAO-5G].each { |term| refute_includes public_source, term }
+    refute_match(/7\s*月\s*19\s*日/, public_source)
+  end
+
+  def test_readme_and_metadata_describe_diagnostics
+    readme = File.read(File.join(ROOT, "README.md"))
+    metadata = YAML.safe_load(File.read(File.join(SKILL, "agents/openai.yaml")))
+
+    assert_includes readme, "Patch"
+    assert_includes readme, "Diagnostics"
+    assert_includes metadata.dig("interface", "short_description"), "诊断"
+    assert_includes metadata.dig("interface", "default_prompt"), "诊断"
+  end
+
   def test_documentation_distinguishes_written_tun_settings_from_runtime_state
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
     skill = File.read(File.join(SKILL, "SKILL.md"))
