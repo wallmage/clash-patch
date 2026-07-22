@@ -99,9 +99,11 @@ class SkillContractTest < Minitest::Test
 
     assert_includes skill, "你使用网络代理主要用于哪些用途"
     assert_includes skill, "没有已保存档位"
-    assert_includes skill, "明确表达 Claude 或 Claude Code"
-    assert_includes skill, "语音输入中的 `cloud`"
-    assert_includes skill, "不得把普通云盘、云服务器或 cloud storage"
+    assert_includes skill, "明确表达 `Claude` 或 `Claude Code`"
+    refute_includes skill, "语音输入中的 `cloud`"
+    refute_includes readme, "语音输入中的 `cloud`"
+    refute_includes policy, "语音输入把 Claude 识别为 `cloud`"
+    refute_includes design, "语音输入 `cloud`"
     assert_includes policy, "只应用满足已选用途所需的最少改动"
 
     assert_includes mac_installer, "CLASH_PATCH_USAGE_PROFILE"
@@ -294,6 +296,7 @@ class SkillContractTest < Minitest::Test
     assert_includes policy, "不输出配置值"
     assert_includes policy, "失败时恢复回滚前版本"
     assert_includes mac_patcher, "--snapshot-initial"
+    assert_includes mac_patcher, "--list-backups"
     assert_includes mac_patcher, "--compare-backup"
     assert_includes mac_patcher, "--restore-backup"
     assert_includes mac_installer, "--snapshot-initial"
@@ -302,6 +305,12 @@ class SkillContractTest < Minitest::Test
     assert_includes windows_installer, "RestoreBackup"
     assert_includes windows_installer, "clash-patch-backups"
     assert_includes windows_installer, "yyyy-MM-dd_HH-mm-ss"
+    assert_includes windows_installer, "ChangedFields"
+    assert_includes skill, "先列出备份"
+    assert_includes skill, "先比较"
+    assert_includes skill, "症状出现前"
+    assert_includes skill, "--expected-current-sha256"
+    assert_includes skill, "-ExpectedCurrentSha256"
   end
 
   def test_safe_update_replaces_all_subscriptions_as_one_transaction

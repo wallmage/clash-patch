@@ -738,6 +738,9 @@ test('PowerShell installer structurally edits YAML and rolls back failed transac
   assert.match(source, /function Set-YamlTunMapping/);
   assert.match(source, /function Test-GeneratedYaml/);
   assert.match(source, /function Restore-Transaction/);
+  assert.match(source, /function Get-RedactedYamlChangedPaths/);
+  assert.match(source, /ChangedFields/);
+  assert.match(source, /Assert-RemoteSubscriptionAutoUpdateDisabled \$output \| Out-Null/);
   assert.doesNotMatch(source, /function Set-TunBlock/);
 });
 

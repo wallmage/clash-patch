@@ -46,7 +46,7 @@ Clash Patch 有两个独立模块：
 
 首次在一台电脑上进入 Patch 时，先读取本机档位。macOS 保存于 `~/Library/Application Support/ClashPatch/usage-profile.plist`，Windows 保存于 Clash Verge Rev 应用目录中的 `clash-patch-usage-profile.json`；两个文件都只记录版本和数字档位。没有已保存档位时，必须先问“你使用网络代理主要用于哪些用途？”，展示以下三项及改动差异，得到选择后才保存和修改。
 
-用户明确说要配置 Claude 或 Claude Code 时，该表达本身就是档位 3 的选择；明确说要配置 ChatGPT、Codex、Gemini、Perplexity 等其他海外 AI，且排除 Claude 时，就是档位 2。语音输入把 Claude 识别为 `cloud` 时，只有同一句或上下文明显在谈代理、AI 工具或 Claude Code，才能按 Claude 处理。普通云盘、云服务器、cloud storage 或泛指云计算不能触发档位 3。
+用户明确说要配置 Claude 或 Claude Code 时，该表达本身就是档位 3 的选择；明确说要配置 ChatGPT、Codex、Gemini、Perplexity 等其他海外 AI，且排除 Claude 时，就是档位 2。
 
 用户可以随时改档。升档只增加新档位所需能力。从档位 3 降到档位 1 或 2 时，先读取并记录旧档位，再运行对应平台的安全卸载程序，最后保存和执行新档位。只撤销能确认由本工具写入、且之后没有被用户或客户端继续修改的部分；不能为了降档覆盖后来产生的用户改动。macOS 已写入当前订阅的内容不能凭猜测还原；Windows 客户端运行时也不会改写应用设置。因此旧订阅增强仍可能保留，必须明确告诉用户“新档位已保存，但这部分旧增强仍保留”，不能伪装成已经恢复。
 
@@ -318,7 +318,7 @@ AI 网页流量、AI 域名 DNS 和所有 UDP 使用同一 AI 分组。多个结
 7. Windows 先只读枚举并备份全部远程订阅，再通过 Clash Verge Rev 界面的“全部更新”触发；没有该入口时逐份处理清单中的每一份。档位 3 的全局脚本在每份加载时重打补丁。不得把只更新当前一份报告成完成。
 8. 安全更新结束后，档位 3 继续保持自动更新关闭。档位 1、2不改自动更新设置。
 
-配置历史用于诊断与回滚：当用户说某次改动后变慢或断网，先把当前配置与改动前备份做配置差异比较，只输出字段路径，不输出配置值。时间接近只能帮助选备份，不能仅凭时间接近就判定某项变化造成故障。恢复前验证备份 YAML 与 Mihomo、核对目标文件和预期 SHA-256，并为当前版本再建备份；恢复或运行检查失败时恢复回滚前版本。
+配置历史用于诊断与回滚：当用户说某次改动后变慢或断网，先列出备份，选择症状出现前最近的一份作为候选，再把当前配置与候选做配置差异比较；只输出字段路径、文件名与 SHA-256，不输出配置值。时间接近只能帮助选备份，不能仅凭时间接近就判定某项变化造成故障。macOS 使用 `--list-backups`、`--compare-backup ID`、`--restore-backup ID --expected-current-sha256 SHA256`；Windows 使用 `-ListBackups`、`-CompareBackup ID`、`-RestoreBackup ID -ExpectedCurrentSha256 SHA256`。恢复前验证备份 YAML 与 Mihomo、核对目标文件和预期 SHA-256，并为当前版本再建备份；恢复后复测原始症状，恢复或运行检查失败时恢复回滚前版本。Windows 客户端运行时不得为了恢复而停止客户端，只能完成比较并报告当前无法安全自动恢复。
 
 ### macOS
 

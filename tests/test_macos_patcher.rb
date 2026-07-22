@@ -499,6 +499,23 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_list_backups_returns_only_safe_dated_backup_ids_newest_first
+    Dir.mktmpdir do |directory|
+      backup_root = File.join(directory, "backups")
+      profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
+      older = ClashPatch.create_versioned_backup(profile, backup_root, reason: "initial")
+      newer = ClashPatch.create_versioned_backup(profile, backup_root, reason: "prewrite")
+      File.write(File.join(backup_root, "not-a-backup.txt"), "ignore")
+      File.symlink(older, File.join(backup_root, "2099-01-01_00-00-00.000000000+0000--prewrite--fake--friend.yaml.backup"))
+
+      listed = ClashPatch.list_backups(backup_root)
+
+      assert_equal [File.basename(newer), File.basename(older)].sort.reverse, listed
+      assert listed.all? { |name| name.match?(/\A\d{4}-\d{2}-\d{2}_/) }
+    end
+  end
+
   def test_backup_compare_and_restore_are_redacted_reversible_and_hash_guarded
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")

@@ -253,6 +253,49 @@ function Get-YamlMappingEntry([string]$Line) {
     return [pscustomobject]@{ Key = $key; Value = $Matches[4] }
 }
 
+function Get-YamlTopLevelSectionFingerprints([string]$Text) {
+    $lines = @(Split-YamlLines $Text)
+    $sections = @{}
+    $currentKey = $null
+    $currentLines = New-Object System.Collections.Generic.List[string]
+
+    function Save-CurrentSection {
+        if ($null -eq $currentKey) { return }
+        if ($sections.ContainsKey($currentKey)) { throw "YAML 中存在重复键：$currentKey。无法安全比较。" }
+        $sectionText = Join-YamlLines $currentLines.ToArray()
+        $sections[$currentKey] = Get-BytesSha256 (ConvertTo-Utf8Bytes $sectionText)
+        $currentLines.Clear()
+    }
+
+    foreach ($line in $lines) {
+        $entry = $null
+        if (-not [string]::IsNullOrWhiteSpace($line) -and -not $line.TrimStart().StartsWith("#") -and (Get-YamlIndent $line) -eq 0) {
+            $entry = Get-YamlMappingEntry $line
+        }
+        if ($null -ne $entry) {
+            Save-CurrentSection
+            $currentKey = [string]$entry.Key
+        }
+        if ($null -ne $currentKey) { $currentLines.Add($line) }
+    }
+    Save-CurrentSection
+    return $sections
+}
+
+function Get-RedactedYamlChangedPaths([string]$Before, [string]$After) {
+    if ($Before -ceq $After) { return @() }
+    $beforeSections = Get-YamlTopLevelSectionFingerprints $Before
+    $afterSections = Get-YamlTopLevelSectionFingerprints $After
+    $keys = @($beforeSections.Keys) + @($afterSections.Keys) | Sort-Object -Unique
+    $changes = @($keys | Where-Object {
+        -not $beforeSections.ContainsKey($_) -or
+        -not $afterSections.ContainsKey($_) -or
+        $beforeSections[$_] -ne $afterSections[$_]
+    })
+    if ($changes.Count -eq 0) { return @("无法安全识别的配置区域") }
+    return $changes
+}
+
 function Find-YamlMappingNode(
     [string[]]$Lines,
     [string]$Key,
@@ -560,7 +603,7 @@ function Set-RemoteSubscriptionAutoUpdateDisabled([string]$Text) {
         }
     }
     $output = Join-YamlLines -Lines $lines
-    Assert-RemoteSubscriptionAutoUpdateDisabled $output
+    Assert-RemoteSubscriptionAutoUpdateDisabled $output | Out-Null
     return $output
 }
 
@@ -948,13 +991,25 @@ if (-not [string]::IsNullOrWhiteSpace($CompareBackup)) {
     $resolved = Get-BackupTarget $CompareBackup
     $backupHash = (Get-FileHash -LiteralPath $resolved.BackupPath -Algorithm SHA256).Hash.ToLowerInvariant()
     $currentHash = (Get-FileHash -LiteralPath $resolved.TargetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    $same = ($backupHash -eq $currentHash)
+    $changedFields = @()
+    if (-not $same) {
+        if ([System.IO.Path]::GetExtension($resolved.TargetPath) -match '^\.ya?ml$') {
+            $backupText = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($resolved.BackupPath))
+            $currentText = [System.Text.Encoding]::UTF8.GetString([System.IO.File]::ReadAllBytes($resolved.TargetPath))
+            $changedFields = @(Get-RedactedYamlChangedPaths $backupText $currentText)
+        } else {
+            $changedFields = @("文件内容")
+        }
+    }
     [pscustomobject]@{
         Backup = $CompareBackup
         Profile = (Split-Path -Leaf $resolved.TargetPath)
-        Same = ($backupHash -eq $currentHash)
+        Same = $same
         BackupSha256 = $backupHash
         CurrentSha256 = $currentHash
-        ConfigurationDifference = $(if ($backupHash -eq $currentHash) { "无配置差异" } else { "存在配置差异；为保护隐私不输出配置值" })
+        ChangedFields = $changedFields
+        ConfigurationDifference = $(if ($same) { "无配置差异" } else { "存在配置差异；为保护隐私只输出发生变化的字段名" })
     } | ConvertTo-Json
     exit 0
 }

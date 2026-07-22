@@ -768,6 +768,17 @@ module ClashPatch
     end
   end
 
+  def list_backups(backup_root)
+    root = File.expand_path(backup_root)
+    return [] unless File.directory?(root) && !File.symlink?(root)
+
+    Dir.children(root).select do |name|
+      path = File.join(root, name)
+      name.match?(/\A\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d{9}[+-]\d{4}--[a-z][a-z0-9-]{0,31}--[0-9a-f]{16}--.+\.backup\z/) &&
+        File.file?(path) && !File.symlink?(path)
+    end.sort.reverse
+  end
+
   def resolve_backup_id(backup_id, backup_root)
     raise InvalidConfigError, "备份编号无效" unless backup_id == File.basename(backup_id.to_s) && backup_id.end_with?(".backup")
 
@@ -1706,6 +1717,7 @@ module ClashPatch
       print_subscription_auto_update_state: false,
       disable_subscription_auto_update: false,
       snapshot_initial: false,
+      list_backups: false,
       compare_backup: nil,
       restore_backup: nil,
       expected_current_sha256: nil,
@@ -1724,6 +1736,7 @@ module ClashPatch
       opts.on("--print-subscription-auto-update-state", "输出订阅自动更新状态") { options[:print_subscription_auto_update_state] = true }
       opts.on("--disable-subscription-auto-update", "关闭订阅自动更新并回读确认") { options[:disable_subscription_auto_update] = true }
       opts.on("--snapshot-initial", "为当前存储位置创建一次初始快照") { options[:snapshot_initial] = true }
+      opts.on("--list-backups", "按时间倒序列出可用备份") { options[:list_backups] = true }
       opts.on("--compare-backup ID", "比较指定备份与当前配置") { |value| options[:compare_backup] = value }
       opts.on("--restore-backup ID", "恢复指定备份") { |value| options[:restore_backup] = value }
       opts.on("--expected-current-sha256 SHA256", "恢复前要求当前配置哈希匹配") { |value| options[:expected_current_sha256] = value }
@@ -1761,6 +1774,11 @@ module ClashPatch
         warn error.message
         return 1
       end
+    end
+
+    if options[:list_backups]
+      puts list_backups(options[:backup_root])
+      return 0
     end
 
     directories = options[:profile_dirs].empty? ? default_profile_directories : options[:profile_dirs]

@@ -170,6 +170,15 @@ items:
     try { Set-RemoteSubscriptionAutoUpdateDisabled "items: [{ type: remote }]`n" | Out-Null } catch { $flowProfilesRejected = $true }
     Assert-True $flowProfilesRejected "inline profiles list was modified instead of rejected"
 
+    $beforeComparison = "dns:`n  nameserver:`n    - https://old-secret.invalid/dns-query`nrules:`n  - MATCH,OldSecret`nipv6: true`n"
+    $afterComparison = "dns:`n  nameserver:`n    - https://new-secret.invalid/dns-query`nrules:`n  - MATCH,NewSecret`n  - GEOSITE,CN,DIRECT`ninvalid-key: kept`n"
+    $changedFields = @(Get-RedactedYamlChangedPaths $beforeComparison $afterComparison)
+    Assert-True ($changedFields -contains "dns") "Windows comparison did not identify the dns section"
+    Assert-True ($changedFields -contains "rules") "Windows comparison did not identify the rules section"
+    Assert-True ($changedFields -contains "ipv6") "Windows comparison did not identify a removed field"
+    Assert-True ($changedFields -contains "invalid-key") "Windows comparison did not identify an added field"
+    Assert-True (-not (($changedFields -join " ").Contains("Secret"))) "Windows comparison exposed a configuration value"
+
     Assert-True (Test-MihomoVersionText "Mihomo Meta v1.19.27") "minimum Mihomo version was rejected"
     Assert-True (-not (Test-MihomoVersionText "Mihomo Meta v1.19.26")) "old Mihomo version was accepted"
     $timeoutCore = $hangingCore
