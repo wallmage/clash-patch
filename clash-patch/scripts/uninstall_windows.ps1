@@ -1,11 +1,42 @@
 ﻿param(
-    [string]$AppHome = ""
+    [string]$AppHome = "",
+    [switch]$Json
 )
 
 $ErrorActionPreference = "Stop"
+$resultContractPath = Join-Path (Join-Path $PSScriptRoot "windows") "result_contract.ps1"
+if (-not (Test-Path -LiteralPath $resultContractPath -PathType Leaf)) {
+    if ($Json) {
+        [Console]::Out.WriteLine('{"schema":"clash-patch.result","version":1,"command":"uninstall","platform":"windows","client":"clash-verge-rev","operation":"load","ok":false,"status":"failed","code":"incomplete_package","exit_code":6,"summary_zh":"安装包不完整。","profile":null,"changes":[],"checks":[],"items":[],"messages":[],"warnings":[]}')
+    } else {
+        [Console]::Error.WriteLine("[Clash 补丁] 安装包不完整。")
+    }
+    exit 6
+}
+. $resultContractPath
+$script:ClashPatchMessages = New-Object System.Collections.ArrayList
 
 function Write-Info([string]$Message) {
+    if ($Json) {
+        [void]$script:ClashPatchMessages.Add((Protect-ClashPatchResultText $Message))
+        return
+    }
     Write-Host "[Clash 补丁] $Message"
+}
+
+function Complete-UninstallResult(
+    [int]$ExitCode,
+    [string]$Status,
+    [string]$Code,
+    [string]$SummaryZh,
+    [object[]]$Changes = @(),
+    [object[]]$Warnings = @()
+) {
+    if ($Json) {
+        $result = New-ClashPatchResult -Command "uninstall" -Operation "uninstall" -Ok ($ExitCode -eq 0) -Status $Status -Code $Code -ExitCode $ExitCode -SummaryZh $SummaryZh -Changes $Changes -Messages @($script:ClashPatchMessages) -Warnings $Warnings
+        Write-ClashPatchResult $result
+    }
+    exit $ExitCode
 }
 
 function Protect-BackupAcl([string]$Path) {
@@ -233,8 +264,8 @@ if ([string]::IsNullOrWhiteSpace($AppHome)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($AppHome)) {
-    [Console]::Error.WriteLine("[Clash 补丁] 没有找到 Clash Verge Rev 配置目录。")
-    exit 2
+    if (-not $Json) { [Console]::Error.WriteLine("[Clash 补丁] 没有找到 Clash Verge Rev 配置目录。") }
+    Complete-UninstallResult 2 "unsupported" "client_not_found" "没有找到 Clash Verge Rev 配置目录。"
 }
 
 $target = Join-Path (Join-Path $AppHome "profiles") "Script.js"
@@ -307,7 +338,7 @@ try {
 
     if (-not $scriptChanged -and $null -eq $state) {
         Write-Info "没有发现已安装的自动补丁，无需移除。"
-        exit 0
+        Complete-UninstallResult 0 "no_change" "not_installed" "没有发现已安装的自动补丁，无需移除。"
     }
     if (-not $settingsRestored -and -not $clientRunning) { throw "部分设置在安装后有新改动，未自动覆盖；请根据保留的安装状态文件手动处理。" }
 
@@ -316,8 +347,8 @@ try {
     } else {
         Write-Info "全局自动补丁已移除，config.yaml 与 verge.yaml 已恢复到安装前状态。现有备份没有删除。"
     }
-    exit 0
+    Complete-UninstallResult 0 "ok" "uninstalled" "Clash 补丁已安全移除。" @("global_script", "application_settings")
 } catch {
-    [Console]::Error.WriteLine("[Clash 补丁] 卸载失败：$($_.Exception.Message)")
-    exit 1
+    if (-not $Json) { [Console]::Error.WriteLine("[Clash 补丁] 卸载失败：$($_.Exception.Message)") }
+    Complete-UninstallResult 1 "failed" "uninstall_failed" ("卸载失败：" + $_.Exception.Message)
 }

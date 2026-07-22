@@ -1,4 +1,5 @@
 require "fileutils"
+require "json"
 require "minitest/autorun"
 require "open3"
 require "tmpdir"
@@ -6,8 +7,14 @@ require "tmpdir"
 ROOT = File.expand_path("..", __dir__) unless defined?(ROOT)
 INSTALLER = File.join(ROOT, "clash-patch/scripts/install_macos.sh")
 UNINSTALLER = File.join(ROOT, "clash-patch/scripts/uninstall_macos.sh")
+RESULT_CONTRACT = File.join(ROOT, "clash-patch/scripts/macos/result_contract.rb")
 
 class MacosWrapperTest < Minitest::Test
+  REQUIRED_RESULT_FIELDS = %w[
+    schema version command platform client operation ok status code exit_code summary_zh
+    profile changes checks items messages warnings
+  ].freeze
+
   def run_script(path, *arguments, home:, extra_env: {})
     state = File.join(home, "usage-profile.plist")
     env = {
@@ -31,12 +38,66 @@ class MacosWrapperTest < Minitest::Test
       FileUtils.mkdir_p(File.join(scripts, "macos"))
       FileUtils.mkdir_p(File.join(package, "references"))
       FileUtils.cp(INSTALLER, File.join(scripts, "install_macos.sh"))
+      FileUtils.cp(RESULT_CONTRACT, File.join(scripts, "macos", "result_contract.rb")) if File.file?(RESULT_CONTRACT)
       File.write(
         File.join(scripts, "macos", "patch_profiles.rb"),
         "puts 'missing' if ARGV.include?('--print-core-status')\n"
       )
       File.write(File.join(package, "references", "policy.json"), "{}\n")
       yield File.join(scripts, "install_macos.sh")
+    end
+  end
+
+  def assert_json_result(stdout, status, command:)
+    result = JSON.parse(stdout)
+    assert_equal REQUIRED_RESULT_FIELDS.sort, result.keys.sort
+    assert_equal "clash-patch.result", result.fetch("schema")
+    assert_equal 1, result.fetch("version")
+    assert_equal command, result.fetch("command")
+    assert_equal "macos", result.fetch("platform")
+    assert_equal "clashx-meta", result.fetch("client")
+    assert_equal status.exitstatus, result.fetch("exit_code")
+    assert_equal stdout.bytes, stdout.encode("UTF-8").bytes
+    result
+  end
+
+  def test_installer_json_mode_returns_one_contract_object_for_help_and_errors
+    Dir.mktmpdir do |home|
+      stdout, stderr, status = run_script(INSTALLER, "--help", "--json", home: home)
+      assert status.success?
+      assert_empty stderr
+      assert_json_result(stdout, status, command: "install")
+
+      stdout, stderr, status = run_script(INSTALLER, "--unknown", "--json", home: home)
+      assert_equal 64, status.exitstatus
+      assert_empty stderr
+      result = assert_json_result(stdout, status, command: "install")
+      assert_equal "invalid_request", result.fetch("status")
+    end
+  end
+
+  def test_installer_json_mode_reports_saved_profile_without_extra_output
+    Dir.mktmpdir do |home|
+      with_supported_app(home) do
+        _stdout, _stderr, status = run_script(INSTALLER, "--profile", "1", home: home)
+        assert status.success?
+
+        stdout, stderr, status = run_script(INSTALLER, "--show-profile", "--json", home: home)
+        assert status.success?
+        assert_empty stderr
+        result = assert_json_result(stdout, status, command: "install")
+        assert_equal 1, result.fetch("profile")
+      end
+    end
+  end
+
+  def test_uninstaller_json_mode_returns_one_contract_object
+    Dir.mktmpdir do |home|
+      stdout, stderr, status = run_script(UNINSTALLER, "--json", home: home)
+      assert status.success?, stdout
+      assert_empty stderr
+      result = assert_json_result(stdout, status, command: "uninstall")
+      refute_includes JSON.generate(result), home
     end
   end
 

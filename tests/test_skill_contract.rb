@@ -12,6 +12,7 @@ class SkillContractTest < Minitest::Test
     clash-patch/agents/openai.yaml
     clash-patch/references/patch-policy.md
     clash-patch/references/policy.json
+    clash-patch/references/result-contract.json
     clash-patch/scripts/install_macos.sh
     clash-patch/scripts/install_windows.ps1
     clash-patch/scripts/install_windows.cmd
@@ -19,9 +20,25 @@ class SkillContractTest < Minitest::Test
     clash-patch/scripts/uninstall_windows.ps1
     clash-patch/scripts/uninstall_windows.cmd
     clash-patch/scripts/macos/patch_profiles.rb
+    clash-patch/scripts/macos/patch_profiles/transform.rb
+    clash-patch/scripts/macos/patch_profiles/backups.rb
+    clash-patch/scripts/macos/patch_profiles/mihomo.rb
+    clash-patch/scripts/macos/patch_profiles/profile_writer.rb
+    clash-patch/scripts/macos/patch_profiles/subscriptions.rb
+    clash-patch/scripts/macos/patch_profiles/runtime.rb
+    clash-patch/scripts/macos/patch_profiles/cli.rb
+    clash-patch/scripts/macos/result_contract.rb
     clash-patch/scripts/macos/verify_routes.rb
     clash-patch/scripts/windows/verify_routes.ps1
     clash-patch/scripts/windows/clash_verge_global.js
+    clash-patch/scripts/windows/result_contract.ps1
+    clash-patch/scripts/windows/install_windows/common.ps1
+    clash-patch/scripts/windows/install_windows/yaml.ps1
+    clash-patch/scripts/windows/install_windows/profiles.ps1
+    clash-patch/scripts/windows/install_windows/mihomo.ps1
+    clash-patch/scripts/windows/install_windows/transaction.ps1
+    clash-patch/scripts/windows/install_windows/script_js.ps1
+    clash-patch/scripts/windows/install_windows/safe_update.ps1
     .github/workflows/test.yml
     tests/fixtures/main_group_cases.json
     tests/baseline.md
@@ -35,6 +52,18 @@ class SkillContractTest < Minitest::Test
     docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md
     LICENSE
   ].freeze
+
+  def windows_installer_source
+    paths = [File.join(SKILL, "scripts/install_windows.ps1")] +
+      Dir[File.join(SKILL, "scripts/windows/install_windows/*.ps1")].sort
+    paths.map { |path| File.binread(path).force_encoding("UTF-8") }.join("\n")
+  end
+
+  def mac_patcher_source
+    paths = [File.join(SKILL, "scripts/macos/patch_profiles.rb")] +
+      Dir[File.join(SKILL, "scripts/macos/patch_profiles/*.rb")].sort
+    paths.map { |path| File.read(path) }.join("\n")
+  end
 
   def test_all_distribution_files_exist
     missing = REQUIRED_PUBLIC_FILES.reject { |path| File.file?(File.join(ROOT, path)) }
@@ -90,7 +119,7 @@ class SkillContractTest < Minitest::Test
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
     design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
     mac_installer = File.read(File.join(SKILL, "scripts/install_macos.sh"))
-    windows_installer = File.read(File.join(SKILL, "scripts/install_windows.ps1"))
+    windows_installer = windows_installer_source
 
     [readme, skill, policy, design].each do |document|
       %w[普通浏览 海外\ AI Claude/Claude\ Code].each do |profile|
@@ -334,9 +363,9 @@ class SkillContractTest < Minitest::Test
     skill = File.read(File.join(SKILL, "SKILL.md"))
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
     design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
-    mac_patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
+    mac_patcher = mac_patcher_source
     mac_installer = File.read(File.join(SKILL, "scripts/install_macos.sh"))
-    windows_installer = File.read(File.join(SKILL, "scripts/install_windows.ps1"))
+    windows_installer = windows_installer_source
 
     [readme, skill, policy, design].each do |document|
       assert_includes document, "每次写入"
@@ -376,7 +405,7 @@ class SkillContractTest < Minitest::Test
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
     design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
     installer = File.read(File.join(SKILL, "scripts/install_macos.sh"))
-    patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
+    patcher = mac_patcher_source
 
     [readme, skill, policy, design].each do |document|
       assert_includes document, "安全更新"
@@ -390,8 +419,8 @@ class SkillContractTest < Minitest::Test
     assert_includes patcher, "--print-subscription-auto-update-state"
     assert_includes patcher, "--disable-subscription-auto-update"
     assert_includes installer, "--disable-subscription-auto-update"
-    assert_includes File.read(File.join(SKILL, "scripts/install_windows.ps1")), "allow_auto_update"
-    assert_includes File.read(File.join(SKILL, "scripts/install_windows.ps1")), "VerifySafeUpdate"
+    assert_includes windows_installer_source, "allow_auto_update"
+    assert_includes windows_installer_source, "VerifySafeUpdate"
     [readme, skill, policy, design].each do |document|
       assert_includes document, "不依赖 Computer Use"
     end
@@ -585,7 +614,7 @@ class SkillContractTest < Minitest::Test
   def test_skill_reuses_user_ai_groups_and_creates_independent_node_selectors
     skill = File.read(File.join(SKILL, "SKILL.md"))
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
-    ruby_patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
+    ruby_patcher = mac_patcher_source
     windows_patcher = File.read(File.join(SKILL, "scripts/windows/clash_verge_global.js"))
 
     assert_includes skill, "已有可选 AI 分组时，直接复用"
@@ -734,7 +763,7 @@ class SkillContractTest < Minitest::Test
     refute_includes source, "RunAtLoad"
     refute_includes source, "WatchPaths"
     refute_includes source, "KeepAlive"
-    patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
+    patcher = mac_patcher_source
     assert_includes patcher, 'File.join(home, ".config", "clash.meta")'
     assert_includes source, "launchctl bootout"
     assert_match(/[\p{Han}]/, source)
@@ -749,10 +778,11 @@ class SkillContractTest < Minitest::Test
   def test_installers_preflight_and_uninstallers_restore_owned_settings
     mac_install = File.read(File.join(SKILL, "scripts/install_macos.sh"))
     mac_uninstall = File.read(File.join(SKILL, "scripts/uninstall_macos.sh"))
-    windows_install = File.binread(File.join(SKILL, "scripts/install_windows.ps1"))
+    windows_install_entry = File.binread(File.join(SKILL, "scripts/install_windows.ps1"))
+    windows_install = windows_installer_source
     windows_uninstall = File.binread(File.join(SKILL, "scripts/uninstall_windows.ps1"))
     windows_tests = File.binread(File.join(ROOT, "tests/test_windows_installer.ps1"))
-    patcher = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
+    patcher = mac_patcher_source
 
     assert_operator mac_install.index('id -u'), :<, mac_install.index("\n  save_profile\n")
     assert_operator mac_install.index('if [ "$SAFE_UPDATE" -eq 0 ] && [ "$USAGE_PROFILE" -ne 3 ]'), :<, mac_install.index('core_status=')
@@ -773,7 +803,7 @@ class SkillContractTest < Minitest::Test
     assert_operator mac_uninstall.index('ProgramArguments.1'), :<, mac_uninstall.index('launchctl bootout')
     assert_includes patcher, "File::EXCL"
 
-    assert_equal "\xEF\xBB\xBF".b, windows_install.byteslice(0, 3)
+    assert_equal "\xEF\xBB\xBF".b, windows_install_entry.byteslice(0, 3)
     assert_equal "\xEF\xBB\xBF".b, windows_uninstall.byteslice(0, 3)
     assert_equal "\xEF\xBB\xBF".b, windows_tests.byteslice(0, 3)
     assert_includes windows_install.force_encoding("UTF-8"), "MihomoPath"
@@ -792,7 +822,7 @@ class SkillContractTest < Minitest::Test
     readme = File.read(File.join(ROOT, "README.md"))
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
     mac_install = File.read(File.join(SKILL, "scripts/install_macos.sh"))
-    windows_install = File.binread(File.join(SKILL, "scripts/install_windows.ps1")).force_encoding("UTF-8")
+    windows_install = windows_installer_source
     windows_uninstall = File.binread(File.join(SKILL, "scripts/uninstall_windows.ps1")).force_encoding("UTF-8")
 
     [skill, readme, policy].each do |source|
@@ -811,8 +841,8 @@ class SkillContractTest < Minitest::Test
   def test_validation_timeout_and_idempotence_guards_are_documented
     skill = File.read(File.join(SKILL, "SKILL.md"))
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
-    mac = File.read(File.join(SKILL, "scripts/macos/patch_profiles.rb"))
-    windows = File.binread(File.join(SKILL, "scripts/install_windows.ps1")).force_encoding("UTF-8")
+    mac = mac_patcher_source
+    windows = windows_installer_source
 
     [skill, policy].each do |source|
       assert_includes source, "30 秒"
@@ -848,6 +878,43 @@ class SkillContractTest < Minitest::Test
     assert_includes workflow, "--test-coverage-branches=80"
     assert_includes workflow, "shell: powershell"
     assert_includes workflow, "Get-Command powershell.exe"
+  end
+
+  def test_all_public_commands_expose_the_versioned_result_contract
+    contract = JSON.parse(File.read(File.join(SKILL, "references/result-contract.json")))
+    assert_equal "clash-patch.result", contract.fetch("schema")
+    assert_equal 1, contract.fetch("version")
+    assert_equal %w[
+      schema version command platform client operation ok status code exit_code summary_zh
+      profile changes checks items messages warnings
+    ], contract.fetch("required_fields")
+    assert_equal %w[install uninstall patch verify_routes], contract.fetch("commands")
+    assert_equal ["integer", "null"], contract.fetch("field_types").fetch("profile")
+    %w[changes checks items messages warnings].each do |field|
+      assert_equal "array", contract.fetch("field_types").fetch(field)
+    end
+
+    mac_paths = %w[
+      scripts/install_macos.sh scripts/uninstall_macos.sh
+      scripts/macos/patch_profiles.rb scripts/macos/verify_routes.rb
+    ]
+    windows_paths = %w[
+      scripts/install_windows.ps1 scripts/uninstall_windows.ps1 scripts/windows/verify_routes.ps1
+    ]
+    mac_paths.each do |path|
+      source = path == "scripts/macos/patch_profiles.rb" ? mac_patcher_source : File.read(File.join(SKILL, path))
+      assert_includes source, "--json", path
+    end
+    windows_paths.each { |path| assert_includes File.read(File.join(SKILL, path)), "Json", path }
+
+    ruby_contract = File.read(File.join(SKILL, "scripts/macos/result_contract.rb"))
+    powershell_contract = File.read(File.join(SKILL, "scripts/windows/result_contract.ps1"))
+    assert_includes ruby_contract, 'SCHEMA = "clash-patch.result"'
+    assert_includes ruby_contract, "VERSION = 1"
+    assert_includes ruby_contract, "COMMANDS = %w[install uninstall patch verify_routes]"
+    assert_includes powershell_contract, '$script:ClashPatchResultSchema = "clash-patch.result"'
+    assert_includes powershell_contract, '$script:ClashPatchResultVersion = 1'
+    assert_includes powershell_contract, '$script:ClashPatchResultCommands = @("install", "uninstall", "patch", "verify_routes")'
   end
 
   def test_production_coverage_cannot_be_inflated_with_ignore_markers

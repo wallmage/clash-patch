@@ -69,13 +69,13 @@ bash clash-patch/scripts/install_macos.sh --profile N
 .\clash-patch\scripts\install_windows.cmd -UsageProfile N
 ```
 
-两个平台都必须让 Clash 保持运行。
+两个平台都必须让 Clash 保持运行。所有公开命令都支持 JSON v1：macOS 加 `--json`，Windows 加 `-Json`。不加参数时仍输出原来的中文说明；开启后，标准输出只有一个 JSON 对象，`exit_code` 与进程退出码一致，`code` 和 `operation` 是稳定的机器标识。`command` 只会是 `install`、`uninstall`、`patch` 或 `verify_routes`，字段及类型以 [`clash-patch/references/result-contract.json`](clash-patch/references/result-contract.json) 为准。机器输出不会包含订阅 URL、密钥、完整本机路径或节点名称；AI 助手调用脚本时优先读取 JSON，不从中文句子猜状态。
 
 ## 平台机制
 
 ### macOS
 
-第一、二档只保存选择，不改订阅。第三档由安装程序直接关闭自动更新：把 ClashX Meta 的 `kAutoUpdateEnable` 设为 `0`，回读确认后才继续；不依赖 Computer Use。原值为开启时，修改前状态会保存为带日期的私密备份；已经关闭时不重复写。安装程序单次运行，只处理当前使用的本地目录或 iCloud 容器。每份顶层 YAML 都经过 YAML 1.2 读取、二次转换和 Mihomo 校验，最长等待 30 秒。第一次运行保存初始快照；以后每次写入前都创建带日期时间的版本化备份。当前订阅写入后通过本地控制器自动刷新，清除旧 Fake-IP 与 DNS 缓存，再检查运行状态；任一步失败都会恢复修改前的内容。
+公开入口和参数保持兼容，内部实现按配置转换、备份与事务、Mihomo 校验、订阅识别、安全更新、运行状态和命令行输出拆开。第一、二档只保存选择，不改订阅。第三档由安装程序直接关闭自动更新：把 ClashX Meta 的 `kAutoUpdateEnable` 设为 `0`，回读确认后才继续；不依赖 Computer Use。原值为开启时，修改前状态会保存为带日期的私密备份；已经关闭时不重复写。安装程序单次运行，只处理当前使用的本地目录或 iCloud 容器。每份顶层 YAML 都经过 YAML 1.2 读取、二次转换和 Mihomo 校验，最长等待 30 秒。第一次运行保存初始快照；以后每次写入前都创建带日期时间的版本化备份。当前订阅写入后通过本地控制器自动刷新，清除旧 Fake-IP 与 DNS 缓存，再检查运行状态；任一步失败都会恢复修改前的内容。
 
 macOS 不安装永久监听、LaunchAgent、`WatchPaths` 或计划任务。安装程序只会删除能确认属于旧版 Clash Patch 的遗留监听。
 

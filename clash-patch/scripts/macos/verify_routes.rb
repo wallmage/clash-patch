@@ -1,7 +1,32 @@
 #!/usr/bin/env ruby
 
 require "json"
-require_relative "patch_profiles"
+require "stringio"
+
+module ClashRouteBootstrap
+  module_function
+
+  def load_dependencies(loader:, argv:, output:)
+    %w[patch_profiles result_contract].each { |path| loader.call(path) }
+    true
+  rescue LoadError
+    raise unless argv.include?("--json")
+
+    output.write(JSON.generate(
+      "schema" => "clash-patch.result", "version" => 1, "command" => "verify_routes",
+      "platform" => "macos", "client" => "clashx-meta", "operation" => "load",
+      "ok" => false, "status" => "failed", "code" => "incomplete_package", "exit_code" => 1,
+      "summary_zh" => "安装包不完整。", "profile" => nil, "changes" => [], "checks" => [],
+      "items" => [], "messages" => [], "warnings" => []
+    ) + "\n")
+    false
+  end
+end
+
+dependencies_loaded = ClashRouteBootstrap.load_dependencies(
+  loader: ->(path) { require_relative path }, argv: ARGV, output: $stdout
+)
+exit 1 unless dependencies_loaded
 
 module ClashRouteVerifier
   module_function
@@ -61,7 +86,7 @@ module ClashRouteVerifier
     end
   end
 
-  def run(output: $stdout)
+  def run(output: $stdout, details: nil)
     socket = ClashPatch.controller_socket
     path = active_profile
     return false unless socket && path
@@ -92,12 +117,29 @@ module ClashRouteVerifier
       ok = !chains.include?("DIRECT") && chains.include?(expected.fetch(kind)) && chains.include?(selections.fetch(kind))
       selected = chains.first
       output.puts "#{label}：#{ok ? '通过' : '失败'}（#{ClashPatch.safe_label(selected)}）"
+      details[:checks] << { "name" => label.downcase, "ok" => ok } if details
       ok
     end
     checks.all?
   rescue StandardError
     false
   end
+
+  def cli(argv = ARGV, output: $stdout)
+    json_mode = argv.include?("--json")
+    details = { checks: [] }
+    ok = run(output: json_mode ? StringIO.new : output, details: details)
+    exit_code = ok ? 0 : 1
+    if json_mode
+      ClashPatchResult.write(
+        output: output, command: "verify_routes", operation: "verify_routes", ok: ok,
+        status: ok ? "ok" : "failed", code: ok ? "routes_verified" : "route_verification_failed",
+        exit_code: exit_code, summary_zh: ok ? "实时分流验证通过。" : "实时分流验证未通过。",
+        profile: nil, changes: [], checks: details.fetch(:checks), items: [], messages: [], warnings: []
+      )
+    end
+    exit_code
+  end
 end
 
-exit(ClashRouteVerifier.run ? 0 : 1) if $PROGRAM_NAME == __FILE__
+exit ClashRouteVerifier.cli if $PROGRAM_NAME == __FILE__

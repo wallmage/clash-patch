@@ -3,14 +3,14 @@
 require "coverage"
 
 COVERAGE_ROOT = File.expand_path("..", __dir__)
-TARGETS = [
-  File.join(COVERAGE_ROOT, "clash-patch/scripts/macos/patch_profiles.rb"),
-  File.join(COVERAGE_ROOT, "clash-patch/scripts/macos/verify_routes.rb")
-].freeze
-MINIMUM_LINE_COVERAGE = {
-  File.join(COVERAGE_ROOT, "clash-patch/scripts/macos/patch_profiles.rb") => 90.0,
-  File.join(COVERAGE_ROOT, "clash-patch/scripts/macos/verify_routes.rb") => 100.0
-}.freeze
+MACOS_RUBY_ROOT = File.join(COVERAGE_ROOT, "clash-patch/scripts/macos")
+TARGETS = Dir.glob(File.join(MACOS_RUBY_ROOT, "**", "*.rb")).sort.freeze
+VERIFY_ROUTES_PATH = File.join(MACOS_RUBY_ROOT, "verify_routes.rb")
+PRODUCTION_AGGREGATE_TARGETS = TARGETS.select do |path|
+  path != VERIFY_ROUTES_PATH
+end.freeze
+MINIMUM_PATCHER_LINE_COVERAGE = 90.0
+MINIMUM_VERIFY_LINE_COVERAGE = 100.0
 TRANSFORM_CORE_METHODS = %i[
   deep_copy base_result usable_config? selectable_groups managed_name? managed_group_name?
   detect_main_group ai_name? existing_ai_group unique_group_name managed_ai_group_fingerprint?
@@ -28,33 +28,46 @@ load File.join(__dir__, "test_macos_patcher.rb")
 
 Minitest.after_run do
   result = Coverage.result
-  failures = TARGETS.each_with_object([]) do |path, failed|
+  failures = []
+  TARGETS.each do |path|
     lines = result.fetch(path).fetch(:lines)
     relevant = lines.compact
     covered = relevant.count(&:positive?)
     percentage = covered * 100.0 / relevant.length
-    minimum = MINIMUM_LINE_COVERAGE.fetch(path)
-    puts format("%s: %.2f%% (%d/%d), required %.2f%%", path.sub("#{COVERAGE_ROOT}/", ""), percentage, covered, relevant.length, minimum)
-    next if percentage >= minimum
+    puts format("%s: %.2f%% (%d/%d)", path.sub("#{COVERAGE_ROOT}/", ""), percentage, covered, relevant.length)
+    next unless path == VERIFY_ROUTES_PATH && percentage < MINIMUM_VERIFY_LINE_COVERAGE
 
-    missing = lines.each_index.each_with_object([]) { |index, items| items << index + 1 if lines[index] == 0 }
-    warn format("%s: %.2f%% below %.2f%% (%d/%d), uncovered lines: %s", path, percentage, minimum, covered, relevant.length, missing.join(", "))
-    failed << path
+    failures << path
   end
 
+  production_relevant = PRODUCTION_AGGREGATE_TARGETS.sum { |path| result.fetch(path).fetch(:lines).compact.length }
+  production_covered = PRODUCTION_AGGREGATE_TARGETS.sum { |path| result.fetch(path).fetch(:lines).compact.count(&:positive?) }
+  production_percentage = production_covered * 100.0 / production_relevant
+  puts format(
+    "macOS Ruby production aggregate: %.2f%% (%d/%d), required %.2f%%",
+    production_percentage, production_covered, production_relevant, MINIMUM_PATCHER_LINE_COVERAGE
+  )
+  failures << "macOS Ruby production aggregate" if production_percentage < MINIMUM_PATCHER_LINE_COVERAGE
 
-  patcher_path = TARGETS.first
-  patcher_lines = result.fetch(patcher_path).fetch(:lines)
   core_methods = TRANSFORM_CORE_METHODS.map { |name| ClashPatch.method(name) }
   core_methods << ClashPatch::YAML12ScalarScanner.instance_method(:tokenize)
-  core_line_numbers = core_methods.flat_map do |method|
+  core_line_references = core_methods.flat_map do |method|
+    path = method.source_location.fetch(0)
     ast = RubyVM::AbstractSyntaxTree.of(method)
-    (ast.first_lineno..ast.last_lineno).select { |line_number| !patcher_lines[line_number - 1].nil? }
+    unless ast
+      failures << "macOS transform core AST: #{method.name}"
+      next []
+    end
+    (ast.first_lineno..ast.last_lineno).each_with_object([]) do |line_number, references|
+      references << [path, line_number] unless result.fetch(path).fetch(:lines)[line_number - 1].nil?
+    end
   end.uniq
-  covered_core = core_line_numbers.count { |line_number| patcher_lines[line_number - 1].positive? }
-  core_percentage = covered_core * 100.0 / core_line_numbers.length
-  puts format("macOS transform core: %.2f%% (%d/%d), required 100.00%%", core_percentage, covered_core, core_line_numbers.length)
-  failures << "macOS transform core" unless covered_core == core_line_numbers.length
+  covered_core = core_line_references.count do |path, line_number|
+    result.fetch(path).fetch(:lines)[line_number - 1].positive?
+  end
+  core_percentage = covered_core * 100.0 / core_line_references.length
+  puts format("macOS transform core: %.2f%% (%d/%d), required 100.00%%", core_percentage, covered_core, core_line_references.length)
+  failures << "macOS transform core" unless covered_core == core_line_references.length
 
   abort "Ruby production coverage is below its required threshold" unless failures.empty?
 end

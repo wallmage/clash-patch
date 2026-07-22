@@ -1,5 +1,6 @@
 require "json"
 require "minitest/autorun"
+require "open3"
 require "socket"
 require "stringio"
 require "tmpdir"
@@ -8,6 +9,7 @@ require "yaml"
 ROOT = File.expand_path("..", __dir__)
 PATCHER_PATH = File.join(ROOT, "clash-patch/scripts/macos/patch_profiles.rb")
 ROUTE_VERIFIER_PATH = File.join(ROOT, "clash-patch/scripts/macos/verify_routes.rb")
+RESULT_CONTRACT_PATH = File.join(ROOT, "clash-patch/scripts/macos/result_contract.rb")
 POLICY_PATH = File.join(ROOT, "clash-patch/references/policy.json")
 MAIN_GROUP_FIXTURES = File.join(ROOT, "tests/fixtures/main_group_cases.json")
 PATCHER_AVAILABLE = File.file?(PATCHER_PATH) && File.file?(POLICY_PATH)
@@ -23,7 +25,175 @@ class MacosPatcherTest < Minitest::Test
 
   def test_patcher_files_exist
     assert File.file?(PATCHER_PATH), "macOS patcher is missing"
+    assert File.file?(RESULT_CONTRACT_PATH), "macOS result contract is missing"
     assert File.file?(POLICY_PATH), "canonical policy is missing"
+  end
+
+  def test_result_contract_rejects_unstable_command_names
+    assert_raises(ArgumentError) do
+      ClashPatchResult.build(
+        command: "patch_profiles.rb", operation: "test", ok: true, status: "ok",
+        code: "ok", exit_code: 0, summary_zh: "完成"
+      )
+    end
+  end
+
+  def test_result_contract_cli_emits_valid_json_and_rejects_bad_arguments
+    output, error = capture_io do
+      assert_equal 0, ClashPatchResult.cli(%w[
+        --command patch --operation test --ok true --status ok --code completed
+        --exit-code 0 --summary 完成 --profile 3 --message done --warning check
+      ])
+    end
+    assert_empty error
+    result = JSON.parse(output)
+    assert_equal "patch", result.fetch("command")
+    assert_equal 3, result.fetch("profile")
+    assert_equal ["done"], result.fetch("messages")
+    assert_equal ["check"], result.fetch("warnings")
+
+    output, error = capture_io do
+      assert_equal 64, ClashPatchResult.cli(%w[--command unknown])
+    end
+    assert_empty error
+    result = JSON.parse(output)
+    assert_equal "patch", result.fetch("command")
+    assert_equal "invalid_request", result.fetch("status")
+  end
+
+  def test_result_contract_normalizes_unknown_status_and_value_types
+    result = ClashPatchResult.build(
+      command: :install, operation: :test, ok: false, status: :unknown, code: :failed,
+      exit_code: "1", summary_zh: "完成", changes: [nil, true, 3, :symbol]
+    )
+    assert_equal "failed", result.fetch("status")
+    assert_equal 1, result.fetch("exit_code")
+    assert_equal [nil, true, 3, "symbol"], result.fetch("changes")
+  end
+
+  def test_result_contract_has_required_fields_and_recursively_redacts_sensitive_text
+    output = StringIO.new
+    ClashPatchResult.write(
+      output: output, command: "patch", operation: "test", ok: true, status: "ok", code: "ok",
+      exit_code: 0, summary_zh: "password=private https://secret.invalid /Users/private/config.yaml",
+      checks: [{ "detail" => "uuid=11111111-2222-3333-4444-555555555555" }]
+    )
+
+    result = JSON.parse(output.string)
+    assert_equal %w[
+      schema version command platform client operation ok status code exit_code summary_zh
+      profile changes checks items messages warnings
+    ].sort, result.keys.sort
+    refute_includes output.string, "private"
+    refute_includes output.string, "secret.invalid"
+    refute_includes output.string, "11111111-2222-3333-4444-555555555555"
+  end
+
+  def test_patcher_json_mode_emits_one_redacted_contract_object
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      config = base_config
+      config["proxies"].first["name"] = "PRIVATE-NODE-NAME"
+      File.write(profile, YAML.dump(config))
+
+      output, error, status = Open3.capture3(
+        RbConfig.ruby, PATCHER_PATH, "--json", "--profile-dir", directory, "--dry-run"
+      )
+
+      assert status.success?, error
+      assert_empty error
+      result = JSON.parse(output)
+      assert_equal "clash-patch.result", result.fetch("schema")
+      assert_equal status.exitstatus, result.fetch("exit_code")
+      assert_equal "patch", result.fetch("command")
+      assert_equal "macos", result.fetch("platform")
+      assert_equal "clashx-meta", result.fetch("client")
+      refute_includes output, directory
+      refute_includes output, "PRIVATE-NODE-NAME"
+      refute_includes output, "fixture-secret"
+    end
+  end
+
+  def test_patcher_json_mode_structures_argument_errors_regardless_of_argument_order
+    output, error, status = Open3.capture3(RbConfig.ruby, PATCHER_PATH, "--unknown", "--json")
+
+    assert_equal 64, status.exitstatus
+    assert_empty error
+    result = JSON.parse(output)
+    assert_equal "invalid_request", result.fetch("status")
+    assert_equal 64, result.fetch("exit_code")
+  end
+
+  def test_json_mode_reports_an_incomplete_ruby_package_as_one_object
+    Dir.mktmpdir do |directory|
+      patcher_dir = File.join(directory, "patcher")
+      verifier_dir = File.join(directory, "verifier")
+      FileUtils.mkdir_p([patcher_dir, verifier_dir])
+      patcher = File.join(patcher_dir, "patch_profiles.rb")
+      verifier = File.join(verifier_dir, "verify_routes.rb")
+      FileUtils.cp(PATCHER_PATH, patcher)
+      FileUtils.cp(ROUTE_VERIFIER_PATH, verifier)
+
+      [[patcher, "patch"], [verifier, "verify_routes"]].each do |path, command|
+        output, error, status = Open3.capture3(RbConfig.ruby, path, "--json")
+        assert_equal 1, status.exitstatus
+        assert_empty error
+        result = JSON.parse(output)
+        assert_equal command, result.fetch("command")
+        assert_equal "incomplete_package", result.fetch("code")
+        assert_equal status.exitstatus, result.fetch("exit_code")
+      end
+    end
+  end
+
+  def test_ruby_bootstrap_fails_closed_in_json_and_text_modes
+    [[ClashPatchBootstrap, "patch"], [ClashRouteBootstrap, "verify_routes"]].each do |bootstrap, command|
+      output = StringIO.new
+      loaded = bootstrap.load_dependencies(
+        loader: ->(_path) { raise LoadError, "fixture" }, argv: ["--json"], output: output
+      )
+      refute loaded
+      result = JSON.parse(output.string)
+      assert_equal command, result.fetch("command")
+      assert_equal "incomplete_package", result.fetch("code")
+      assert_raises(LoadError) do
+        bootstrap.load_dependencies(
+          loader: ->(_path) { raise LoadError, "fixture" }, argv: [], output: StringIO.new
+        )
+      end
+    end
+  end
+
+  def test_route_verifier_json_mode_emits_one_contract_object_on_business_failure
+    output, error, status = Open3.capture3(RbConfig.ruby, ROUTE_VERIFIER_PATH, "--json")
+
+    assert_equal 1, status.exitstatus
+    assert_empty error
+    result = JSON.parse(output)
+    assert_equal "verify_routes", result.fetch("command")
+    assert_equal "failed", result.fetch("status")
+    assert_equal status.exitstatus, result.fetch("exit_code")
+    refute_includes output, Dir.home
+  end
+
+  def test_route_verifier_cli_json_does_not_forward_human_output
+    output = StringIO.new
+    ClashRouteVerifier.stub(:run, ->(output:, details:) { output.puts("PRIVATE-NODE"); details[:checks] << { "name" => "google", "ok" => true }; true }) do
+      assert_equal 0, ClashRouteVerifier.cli(["--json"], output: output)
+    end
+
+    result = JSON.parse(output.string)
+    assert_equal "ok", result.fetch("status")
+    assert_equal [{ "name" => "google", "ok" => true }], result.fetch("checks")
+    refute_includes output.string, "PRIVATE-NODE"
+  end
+
+  def test_route_verifier_cli_keeps_default_human_output
+    output = StringIO.new
+    ClashRouteVerifier.stub(:run, ->(output:, details:) { output.puts("中文结果"); false }) do
+      assert_equal 1, ClashRouteVerifier.cli([], output: output)
+    end
+    assert_equal "中文结果\n", output.string
   end
 
   def test_unknown_policy_version_is_rejected_without_mutating_config
@@ -967,7 +1137,9 @@ class MacosPatcherTest < Minitest::Test
   end
 
   def test_shared_main_group_fixtures
-    fixtures = JSON.parse(File.read(MAIN_GROUP_FIXTURES)).fetch("cases")
+    shared = JSON.parse(File.read(MAIN_GROUP_FIXTURES))
+    assert_equal 1, shared.fetch("schema_version")
+    fixtures = shared.fetch("cases")
     fixtures.each do |fixture|
       config = fixture.fetch("config")
       snapshot = JSON.parse(JSON.generate(config))
@@ -985,6 +1157,61 @@ class MacosPatcherTest < Minitest::Test
       refute result.fetch(:changed), fixture.fetch("name")
       assert_equal :no_main_group, result.fetch(:status), fixture.fetch("name")
       assert_equal snapshot, config, fixture.fetch("name")
+    end
+  end
+
+  def test_shared_full_transform_fixtures
+    fixtures = JSON.parse(File.read(MAIN_GROUP_FIXTURES)).fetch("transform_cases")
+    fixtures.each do |fixture|
+      input = fixture.fetch("input")
+      snapshot = JSON.parse(JSON.generate(input))
+      result = ClashPatch.patch(input, @policy)
+
+      assert_equal fixture.fetch("expected_changed"), result.fetch(:changed), fixture.fetch("name")
+      expected_main = fixture.fetch("expected_main_group")
+      expected_ai = fixture.fetch("expected_ai_group")
+      expected_main.nil? ? assert_nil(result.fetch(:main_group), fixture.fetch("name")) :
+        assert_equal(expected_main, result.fetch(:main_group), fixture.fetch("name"))
+      expected_ai.nil? ? assert_nil(result.fetch(:ai_group), fixture.fetch("name")) :
+        assert_equal(expected_ai, result.fetch(:ai_group), fixture.fetch("name"))
+      assert_equal fixture.fetch("expected_status").to_sym, result.fetch(:status), fixture.fetch("name")
+      assert_equal snapshot, input, "#{fixture.fetch('name')}: input mutated"
+      serialized = JSON.generate(result.fetch(:config))
+      assert_equal fixture.fetch("expected_config_sha256"), Digest::SHA256.hexdigest(serialized), "#{fixture.fetch('name')}: output drift"
+      Array(fixture["expected_absent_strings"]).each do |value|
+        refute_includes serialized, value, "#{fixture.fetch('name')}: retained #{value}"
+      end
+      Array(fixture["expected_present_strings"]).each do |value|
+        assert_includes serialized, value, "#{fixture.fetch('name')}: missing #{value}"
+      end
+
+      next unless fixture.fetch("expected_changed")
+
+      second = ClashPatch.patch(result.fetch(:config), @policy)
+      assert_equal result.fetch(:config), second.fetch(:config), "#{fixture.fetch('name')}: second pass"
+      refute second.fetch(:changed), "#{fixture.fetch('name')}: second pass changed"
+      assert_equal :unchanged, second.fetch(:status), "#{fixture.fetch('name')}: second pass status"
+    end
+  end
+
+  def test_shared_full_transform_fixtures_match_windows_exactly
+    fixtures = JSON.parse(File.read(MAIN_GROUP_FIXTURES)).fetch("transform_cases")
+    inputs = fixtures.map { |fixture| fixture.fetch("input") }
+    engine_path = File.join(ROOT, "clash-patch/scripts/windows/clash_verge_global.js")
+    javascript = <<~'JS'
+      const fs = require('node:fs');
+      const engine = require(process.argv[1]);
+      const inputs = JSON.parse(fs.readFileSync(0, 'utf8'));
+      process.stdout.write(JSON.stringify(inputs.map((input) => engine.clashPatchTransform(input, 'fixture'))));
+    JS
+    stdout, stderr, status = Open3.capture3("node", "-e", javascript, engine_path, stdin_data: JSON.generate(inputs))
+    assert status.success?, stderr
+    windows = JSON.parse(stdout)
+
+    fixtures.each_with_index do |fixture, index|
+      ruby = ClashPatch.patch(fixture.fetch("input"), @policy).fetch(:config)
+      assert_equal ruby, windows.fetch(index), fixture.fetch("name")
+      assert_equal fixture.fetch("expected_config_sha256"), Digest::SHA256.hexdigest(JSON.generate(windows.fetch(index))), "#{fixture.fetch('name')}: Windows output drift"
     end
   end
 
@@ -2213,6 +2440,113 @@ class MacosPatcherTest < Minitest::Test
       output, = capture_io { assert_equal 0, ClashPatch.cli(["--print-subscription-auto-update-state"]) }
       assert_includes output, "disabled"
     end
+  end
+
+  def test_cli_json_covers_read_only_and_help_operations
+    output, error = capture_io { assert_equal 0, ClashPatch.cli(["--json", "--help"]) }
+    assert_empty error
+    assert_equal "help", JSON.parse(output).fetch("operation")
+
+    ClashPatch.stub(:mihomo_core_status, :supported) do
+      output, error = capture_io { assert_equal 0, ClashPatch.cli(["--json", "--print-core-status"]) }
+      assert_empty error
+      assert_equal "ok", JSON.parse(output).fetch("status")
+    end
+    ClashPatch.stub(:mihomo_core_status, :missing) do
+      output, error = capture_io { assert_equal 1, ClashPatch.cli(["--json", "--print-core-status"]) }
+      assert_empty error
+      assert_equal "unsupported", JSON.parse(output).fetch("status")
+    end
+    ClashPatch.stub(:tun_state, :enabled) do
+      output, = capture_io { assert_equal 0, ClashPatch.cli(["--json", "--print-tun-state"]) }
+      assert_equal "tun_state", JSON.parse(output).fetch("operation")
+    end
+    ClashPatch.stub(:subscription_auto_update_state, :disabled) do
+      output, = capture_io do
+        assert_equal 0, ClashPatch.cli(["--json", "--print-subscription-auto-update-state"])
+      end
+      assert_equal "subscription_auto_update_state", JSON.parse(output).fetch("operation")
+    end
+  end
+
+  def test_cli_json_covers_backup_and_auto_update_operations
+    Dir.mktmpdir do |directory|
+      ClashPatch.stub(:list_backups, ["private.backup"]) do
+        output, = capture_io do
+          assert_equal 0, ClashPatch.cli(["--json", "--profile-dir", directory, "--list-backups"])
+        end
+        assert_equal "backups_listed", JSON.parse(output).fetch("code")
+      end
+      ClashPatch.stub(:snapshot_initial_profiles, ["/private/friend.yaml.backup"]) do
+        output, = capture_io do
+          assert_equal 0, ClashPatch.cli(["--json", "--profile-dir", directory, "--snapshot-initial"])
+        end
+        assert_equal ["initial_snapshot"], JSON.parse(output).fetch("changes")
+      end
+      comparison = { same: false, changes: ["dns.nameserver"] }
+      ClashPatch.stub(:compare_backup, comparison) do
+        output, = capture_io do
+          assert_equal 0, ClashPatch.cli(["--json", "--profile-dir", directory, "--compare-backup", "id"])
+        end
+        assert_equal ["dns.nameserver"], JSON.parse(output).fetch("changes")
+      end
+      ClashPatch.stub(:restore_backup, { status: :updated }) do
+        output, = capture_io do
+          assert_equal 0, ClashPatch.cli(["--json", "--profile-dir", directory, "--restore-backup", "id"])
+        end
+        assert_equal "updated", JSON.parse(output).fetch("code")
+      end
+      ClashPatch.stub(:disable_subscription_auto_update, { status: :already_disabled }) do
+        output, = capture_io do
+          assert_equal 0, ClashPatch.cli(["--json", "--disable-subscription-auto-update"])
+        end
+        assert_equal "no_change", JSON.parse(output).fetch("status")
+      end
+      ClashPatch.stub(:disable_subscription_auto_update, ->(**_args) { raise ClashPatch::InvalidConfigError }) do
+        output, error = capture_io do
+          assert_equal 1, ClashPatch.cli(["--json", "--disable-subscription-auto-update"])
+        end
+        assert_empty error
+        assert_equal "auto_update_failed", JSON.parse(output).fetch("code")
+      end
+    end
+  end
+
+  def test_json_item_and_batch_statuses_cover_success_failure_and_rollback
+    assert_equal "updated", ClashPatch.result_item(path: "/private/a.yaml", status: :updated).fetch("status")
+    assert_equal "unchanged", ClashPatch.result_item(path: "/private/a.yaml", status: :unchanged).fetch("status")
+    assert_equal "rolled_back", ClashPatch.result_item(path: "/private/a.yaml", status: :reload_failed_rolled_back).fetch("status")
+    assert_equal "skipped", ClashPatch.result_item(path: "/private/a.yaml", status: :invalid).fetch("status")
+    assert_equal "failed", ClashPatch.result_item(path: "/private/a.yaml", status: :unknown).fetch("status")
+
+    assert_equal "no_change", ClashPatch.batch_json_status([{ status: :unchanged }]).first
+    assert_equal "ok", ClashPatch.batch_json_status([{ status: :updated }]).first
+    assert_equal "partial", ClashPatch.batch_json_status([{ status: :updated }, { status: :invalid }]).first
+    assert_equal "failed", ClashPatch.batch_json_status([{ status: :invalid }]).first
+  end
+
+  def test_patcher_is_split_into_explicit_modules_and_coverage_tracks_them
+    expected = {
+      "transform.rb" => :patch,
+      "backups.rb" => :create_versioned_backup,
+      "mihomo.rb" => :validate_with_mihomo,
+      "profile_writer.rb" => :patch_path,
+      "subscriptions.rb" => :safe_update_all,
+      "runtime.rb" => :activate_updated_profile,
+      "cli.rb" => :cli
+    }
+    module_root = File.join(ROOT, "clash-patch/scripts/macos/patch_profiles")
+    expected.each do |filename, method_name|
+      path = File.join(module_root, filename)
+      assert File.file?(path), filename
+      source = File.read(path)
+      assert_match(/^module ClashPatch$/, source, filename)
+      assert_match(/^  module_function$/, source, filename)
+      assert_equal path, ClashPatch.method(method_name).source_location.first, method_name
+    end
+
+    coverage_source = File.read(File.join(ROOT, "tests/coverage_ruby.rb"))
+    assert_includes coverage_source, 'Dir.glob(File.join(MACOS_RUBY_ROOT, "**", "*.rb"))'
   end
 
   def test_cli_rejects_unknown_options_and_safe_updates_without_a_usage_profile

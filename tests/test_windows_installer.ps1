@@ -10,6 +10,12 @@ $uninstaller = Join-Path (Join-Path $root "clash-patch/scripts") "uninstall_wind
 $installWrapper = Join-Path (Join-Path $root "clash-patch/scripts") "install_windows.cmd"
 $uninstallWrapper = Join-Path (Join-Path $root "clash-patch/scripts") "uninstall_windows.cmd"
 $routeVerifier = Join-Path (Join-Path $root "clash-patch/scripts/windows") "verify_routes.ps1"
+$resultContract = Join-Path (Join-Path $root "clash-patch/scripts/windows") "result_contract.ps1"
+$installerModuleRoot = Join-Path (Join-Path $root "clash-patch/scripts/windows") "install_windows"
+$installerModules = @(
+    "common.ps1", "yaml.ps1", "profiles.ps1", "mihomo.ps1",
+    "transaction.ps1", "script_js.ps1", "safe_update.ps1"
+) | ForEach-Object { Join-Path $installerModuleRoot $_ }
 $sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("clash-patch-windows-test-" + [System.Guid]::NewGuid().ToString("N"))
 $onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 $previousUsageProfile = $env:CLASH_PATCH_USAGE_PROFILE
@@ -21,6 +27,26 @@ $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($installer, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+$entryFunctions = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+if ($entryFunctions.Count -ne 0) { throw "install_windows.ps1 still contains library functions" }
+$loadedFunctions = @{}
+foreach ($modulePath in $installerModules) {
+    if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) { throw "missing installer module: $modulePath" }
+    $moduleTokens = $null
+    $moduleParseErrors = $null
+    $moduleAst = [System.Management.Automation.Language.Parser]::ParseFile($modulePath, [ref]$moduleTokens, [ref]$moduleParseErrors)
+    if ($moduleParseErrors.Count -gt 0) { throw ($moduleParseErrors | Out-String) }
+    foreach ($statement in @($moduleAst.EndBlock.Statements)) {
+        if (-not ($statement -is [System.Management.Automation.Language.FunctionDefinitionAst])) {
+            throw "installer module has a load-time side effect: $modulePath"
+        }
+    }
+    foreach ($functionAst in @($moduleAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))) {
+        if ($loadedFunctions.ContainsKey($functionAst.Name)) { throw "duplicate installer function: $($functionAst.Name)" }
+        $loadedFunctions[$functionAst.Name] = $true
+    }
+    . $modulePath
+}
 $routeTokens = $null
 $routeParseErrors = $null
 $routeAst = [System.Management.Automation.Language.Parser]::ParseFile($routeVerifier, [ref]$routeTokens, [ref]$routeParseErrors)
@@ -29,9 +55,6 @@ $routeAst.FindAll({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Find-Group"
 }, $true) | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
-$ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object {
-    . ([scriptblock]::Create($_.Extent.Text))
-}
 $uninstallTokens = $null
 $uninstallParseErrors = $null
 $uninstallAst = [System.Management.Automation.Language.Parser]::ParseFile($uninstaller, [ref]$uninstallTokens, [ref]$uninstallParseErrors)
@@ -45,6 +68,24 @@ $uninstallAst.FindAll({
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
+}
+
+function Assert-JsonResult([object]$Invocation, [string]$Command, [int]$ExitCode) {
+    $text = $Invocation.Output.Trim()
+    Assert-True ($text.StartsWith("{") -and $text.EndsWith("}")) "JSON mode did not emit exactly one object: $text"
+    try { $result = $text | ConvertFrom-Json } catch { throw "JSON mode emitted invalid JSON: $text" }
+    foreach ($field in @("schema", "version", "command", "platform", "client", "operation", "ok", "status", "code", "exit_code", "summary_zh", "profile", "changes", "checks", "items", "messages", "warnings")) {
+        Assert-True ($null -ne $result.PSObject.Properties[$field]) "JSON result omitted $field"
+    }
+    Assert-True ($result.schema -eq "clash-patch.result") "JSON result schema mismatch"
+    Assert-True ([int]$result.version -eq 1) "JSON result version mismatch"
+    Assert-True ($result.command -eq $Command) "JSON result command mismatch"
+    Assert-True ($result.platform -eq "windows") "JSON result platform mismatch"
+    Assert-True ($result.client -eq "clash-verge-rev") "JSON result client mismatch"
+    Assert-True ([int]$result.exit_code -eq $ExitCode) "JSON result exit_code disagrees with process exit"
+    Assert-True ($Invocation.ExitCode -eq $ExitCode) "process exit mismatch"
+    Assert-True ($text -notmatch '(?i)https?://|Bearer\s+|password\s*[:=]|secret\s*[:=]') "JSON result leaked a secret or URL"
+    return $result
 }
 
 function Invoke-TestPowerShell([string]$ScriptPath, [string[]]$ScriptArguments) {
@@ -106,8 +147,16 @@ try {
         Assert-True ($LASTEXITCODE -eq 0) "install_windows.cmd did not propagate a successful exit: $wrapperOutput"
         Assert-True ($wrapperOutput.Contains("unset")) "install_windows.cmd did not forward PowerShell output"
 
-        $invalidWrapperOutput = & $installWrapper -NotARealParameter -AppHome $wrapperCase 2>&1 | Out-String
-        Assert-True ($LASTEXITCODE -ne 0) "install_windows.cmd swallowed a PowerShell parameter failure: $invalidWrapperOutput"
+        $wrapperJsonOutput = & $installWrapper -ShowUsageProfile -AppHome $wrapperCase -Json 2>&1 | Out-String
+        Assert-True ($LASTEXITCODE -eq 0) "install_windows.cmd did not propagate JSON-mode success: $wrapperJsonOutput"
+        $wrapperJson = $wrapperJsonOutput.Trim() | ConvertFrom-Json
+        Assert-True ($wrapperJson.schema -eq "clash-patch.result") "install_windows.cmd did not pass -Json through"
+
+        $invalidWrapperOutput = & $installWrapper -UsageProfile 9 -AppHome $wrapperCase -Json 2>&1 | Out-String
+        $invalidWrapperExit = $LASTEXITCODE
+        Assert-True ($invalidWrapperExit -eq 64) "install_windows.cmd swallowed an installer failure: $invalidWrapperOutput"
+        $invalidWrapperJson = $invalidWrapperOutput.Trim() | ConvertFrom-Json
+        Assert-True ([int]$invalidWrapperJson.exit_code -eq $invalidWrapperExit) "install_windows.cmd changed the JSON failure exit code"
 
         $wrapperBackup = Join-Path (Join-Path $wrapperCase "clash-patch-backups") "keep.backup"
         New-Item -ItemType Directory -Path (Split-Path -Parent $wrapperBackup) -Force | Out-Null
@@ -118,6 +167,61 @@ try {
     }
     [System.IO.File]::WriteAllText($hangingCore, $hangingCoreText, [System.Text.Encoding]::ASCII)
     if (-not $onWindows) { & /bin/chmod 700 $hangingCore }
+
+    . $resultContract
+    $contractResult = New-ClashPatchResult -Command "install" -Operation "test" -Ok $true -Status "ok" -Code "ok" -ExitCode 0 -SummaryZh "完成"
+    foreach ($field in @("schema", "version", "command", "platform", "client", "operation", "ok", "status", "code", "exit_code", "summary_zh", "profile", "changes", "checks", "items", "messages", "warnings")) {
+        Assert-True ($null -ne $contractResult.PSObject.Properties[$field]) "result contract omitted $field"
+    }
+    $invalidContractCommandRejected = $false
+    try { New-ClashPatchResult -Command "contract-test" -Operation "test" -Ok $true -Status "ok" -Code "ok" -ExitCode 0 -SummaryZh "完成" | Out-Null } catch { $invalidContractCommandRejected = $true }
+    Assert-True $invalidContractCommandRejected "result contract accepted an unstable command name"
+    $nestedSecretResult = New-ClashPatchResult -Command "install" -Operation "test" -Ok $true -Status "ok" -Code "ok" -ExitCode 0 -SummaryZh "完成" -Checks @([pscustomobject]@{ nested = [ordered]@{ url = "https://secret.invalid/path"; path = "C:\Users\friend\secret.yaml"; token = "token=private"; uuid = "11111111-2222-3333-4444-555555555555" } })
+    $nestedSecretJson = $nestedSecretResult | ConvertTo-Json -Depth 8 -Compress
+    Assert-True ($nestedSecretJson -notmatch 'secret\.invalid|C:\\Users\\friend|token=private|11111111-2222-3333-4444-555555555555') "result contract leaked nested sensitive text"
+
+    $jsonShowCase = Join-Path $sandbox "json-show-case"
+    New-Item -ItemType Directory -Path $jsonShowCase -Force | Out-Null
+    $jsonShow = Invoke-TestPowerShell $installer @("-AppHome", $jsonShowCase, "-ShowUsageProfile", "-Json")
+    $jsonShowResult = Assert-JsonResult $jsonShow "install" 0
+    Assert-True ($jsonShowResult.operation -eq "show_usage_profile") "show-profile operation mismatch"
+    Assert-True ($jsonShowResult.profile -eq $null) "unset profile was not represented as null"
+
+    $jsonInvalid = Invoke-TestPowerShell $installer @("-AppHome", $jsonShowCase, "-UsageProfile", "9", "-Json")
+    $jsonInvalidResult = Assert-JsonResult $jsonInvalid "install" 64
+    Assert-True (-not [bool]$jsonInvalidResult.ok) "invalid request was reported as successful"
+    Assert-True ($jsonInvalidResult.status -eq "invalid_request") "invalid request status mismatch"
+
+    $jsonUninstall = Invoke-TestPowerShell $uninstaller @("-AppHome", $jsonShowCase, "-Json")
+    $jsonUninstallResult = Assert-JsonResult $jsonUninstall "uninstall" 0
+    Assert-True ($jsonUninstallResult.status -eq "no_change") "empty uninstall was not no_change"
+
+    $jsonRouteFailure = Invoke-TestPowerShell $routeVerifier @("-ObservationSeconds", "0", "-Secret", "fixture-secret", "-Json")
+    $jsonRouteFailureResult = Assert-JsonResult $jsonRouteFailure "verify_routes" 1
+    Assert-True ($jsonRouteFailureResult.code -eq "verification_failed") "route verifier did not structure its parameter failure"
+
+    $brokenPackageRoot = Join-Path $sandbox "broken-package"
+    New-Item -ItemType Directory -Path $brokenPackageRoot -Force | Out-Null
+    $brokenInstaller = Join-Path $brokenPackageRoot "install_windows.ps1"
+    Copy-Item -LiteralPath $installer -Destination $brokenInstaller
+    $missingContract = Invoke-TestPowerShell $brokenInstaller @("-AppHome", $jsonShowCase, "-Json")
+    $missingContractResult = Assert-JsonResult $missingContract "install" 6
+    Assert-True ($missingContractResult.code -eq "incomplete_package") "missing result contract was not structured"
+
+    $brokenWindows = Join-Path $brokenPackageRoot "windows"
+    New-Item -ItemType Directory -Path $brokenWindows -Force | Out-Null
+    Copy-Item -LiteralPath $resultContract -Destination (Join-Path $brokenWindows "result_contract.ps1")
+    $missingModules = Invoke-TestPowerShell $brokenInstaller @("-AppHome", $jsonShowCase, "-Json")
+    $missingModulesResult = Assert-JsonResult $missingModules "install" 6
+    Assert-True ($missingModulesResult.code -eq "incomplete_package") "missing installer modules were not structured"
+
+    $brokenUninstaller = Join-Path $brokenPackageRoot "uninstall_windows.ps1"
+    $brokenVerifier = Join-Path $brokenPackageRoot "verify_routes.ps1"
+    Copy-Item -LiteralPath $uninstaller -Destination $brokenUninstaller
+    Copy-Item -LiteralPath $routeVerifier -Destination $brokenVerifier
+    Remove-Item -LiteralPath (Join-Path $brokenWindows "result_contract.ps1") -Force
+    Assert-JsonResult (Invoke-TestPowerShell $brokenUninstaller @("-AppHome", $jsonShowCase, "-Json")) "uninstall" 6 | Out-Null
+    Assert-JsonResult (Invoke-TestPowerShell $brokenVerifier @("-ObservationSeconds", "0", "-Json")) "verify_routes" 6 | Out-Null
 
     $lightCase = Join-Path $sandbox "light-profile-case"
     New-Item -ItemType Directory -Path $lightCase -Force | Out-Null

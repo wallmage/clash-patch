@@ -523,6 +523,12 @@ function clashPatchManagedRuleKey(rule) {
   return info.type + "\u0000" + info.payload.toLowerCase();
 }
 
+function clashPatchManagedRuleIdentity(rule) {
+  const info = clashPatchRuleInfo(rule);
+  const key = clashPatchManagedRuleKey(rule);
+  return key && info.target ? key + "\u0000" + info.target : null;
+}
+
 function clashPatchBroadRule(rule) {
   return ["MATCH", "GEOSITE", "GEOIP", "RULE-SET"].indexOf(clashPatchRuleInfo(rule).type) !== -1;
 }
@@ -536,6 +542,7 @@ function clashPatchRenderAiRules(aiGroup) {
 function clashPatchRules(config, aiGroup, routeGroup, ownedAiNames, ownedSafeNames) {
   const managed = clashPatchRenderAiRules(aiGroup);
   const managedKeys = managed.map(clashPatchManagedRuleKey);
+  const managedIdentities = managed.map(clashPatchManagedRuleIdentity);
   const legacyKeys = (CLASH_PATCH_POLICY.legacyAiRules || []).map(clashPatchManagedRuleKey);
   ownedAiNames = ownedAiNames || [];
   ownedSafeNames = ownedSafeNames || [];
@@ -567,7 +574,7 @@ function clashPatchRules(config, aiGroup, routeGroup, ownedAiNames, ownedSafeNam
     const info = clashPatchRuleInfo(rule);
     const key = clashPatchManagedRuleKey(rule);
     const patchOwnedAi = managedKeys.indexOf(key) !== -1 && ownedAiNames.indexOf(info.target) !== -1;
-    const exactCurrentAi = managed.indexOf(rule) !== -1;
+    const exactCurrentAi = managedIdentities.indexOf(clashPatchManagedRuleIdentity(rule)) !== -1;
     const legacyOwnedAi = legacyKeys.indexOf(key) !== -1 && ownedAiNames.indexOf(info.target) !== -1;
     const forbiddenAi = (info.type === "DOMAIN" || info.type === "DOMAIN-SUFFIX") &&
       CLASH_PATCH_POLICY.forbiddenAiDomains.some(function (domain) { return domain.toLowerCase() === info.payload.toLowerCase(); }) &&

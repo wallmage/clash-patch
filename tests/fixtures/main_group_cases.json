@@ -1,5 +1,6 @@
 {
-  "comment": "Cross-engine main-group detection cases, consumed by tests/test_macos_patcher.rb and tests/test_windows_patcher.js. expected_main_group null means no valid main group exists and the configuration must remain unchanged.",
+  "schema_version": 1,
+  "comment": "Shared macOS/Windows conformance cases. transform_cases lock the reviewed full output with expected_config_sha256, then require both engines to produce the same configuration without mutating the input; expected_main_group null means no valid main group exists.",
   "cases": [
     {
       "name": "match-target-wins",
@@ -219,6 +220,154 @@
         "rules": ["MATCH,Missing"]
       },
       "expected_main_group": "Proxy"
+    }
+  ],
+  "transform_cases": [
+    {
+      "name": "reuse-existing-ai-group",
+      "expected_config_sha256": "7218fe4b0f93956248bd00bd49e297c23b4a3cd348fe07409e0e731f69102261",
+      "input": {
+        "proxies": [{ "name": "node-a", "type": "ss", "server": "node-a.example" }],
+        "proxy-groups": [
+          { "name": "Main", "type": "select", "proxies": ["node-a"] },
+          { "name": "AI", "type": "select", "proxies": ["node-a"], "icon": "keep-me" }
+        ],
+        "rules": ["MATCH,Main"]
+      },
+      "expected_changed": true,
+      "expected_main_group": "Main",
+      "expected_ai_group": "AI",
+      "expected_status": "updated"
+    },
+    {
+      "name": "create-independent-ai-from-provider",
+      "expected_config_sha256": "6c1060d1ad689b37ef5fda2bfd5fb5a7499f1ef93e598533c10cf33869df260e",
+      "input": {
+        "proxy-providers": {
+          "provider-a": { "type": "http", "url": "https://fixture.invalid/sub", "interval": 3600 }
+        },
+        "proxy-groups": [
+          { "name": "Main", "type": "select", "use": ["provider-a"] }
+        ],
+        "rules": ["MATCH,Main"]
+      },
+      "expected_changed": true,
+      "expected_main_group": "Main",
+      "expected_ai_group": "🤖 AI · Clash Patch",
+      "expected_status": "updated"
+    },
+    {
+      "name": "normalize-dns-and-managed-rule-whitespace",
+      "expected_config_sha256": "64bafaaebd1a99435b6695c915e28795fcc4aeec68d0ca4de244ab92318113b7",
+      "input": {
+        "proxies": [{ "name": "node-a", "type": "ss", "server": "node-a.example" }],
+        "proxy-groups": [
+          { "name": "Main", "type": "select", "proxies": ["node-a"] },
+          { "name": "AI", "type": "select", "proxies": ["node-a"] }
+        ],
+        "dns": {
+          "nameserver": ["8.8.8.8"],
+          "nameserver-policy": {
+            "+.openai.com,+.example.org": ["udp://8.8.8.8#DIRECT"]
+          }
+        },
+        "rules": [
+          "DOMAIN-SUFFIX, openai.com, AI",
+          "RULE-SET,global,Main",
+          "MATCH,Main"
+        ]
+      },
+      "expected_changed": true,
+      "expected_main_group": "Main",
+      "expected_ai_group": "AI",
+      "expected_status": "updated"
+    },
+    {
+      "name": "migrate-owned-legacy-groups",
+      "expected_config_sha256": "e297c891c6928bd70866991288dbd976d89e649749b6e197400f1ac5b0998c89",
+      "input": {
+        "proxies": [{ "name": "node-a", "type": "ss", "server": "node-a.example" }],
+        "proxy-groups": [
+          { "name": "Main", "type": "select", "proxies": ["node-a"] },
+          { "name": "🤖 AI · Clash Patch", "type": "select", "proxies": ["node-a"] },
+          {
+            "name": "🛡 安全代理 · Clash Patch",
+            "type": "select",
+            "proxies": ["node-a"],
+            "include-all": true,
+            "exclude-type": "Direct|Dns|Reject|Pass|Compatible|Rematch",
+            "empty-fallback": "REJECT"
+          }
+        ],
+        "dns": {
+          "nameserver-policy": {
+            "+.ai.com": ["https://dns.google/dns-query#🛡 安全代理 · Clash Patch"]
+          }
+        },
+        "rules": [
+          "NETWORK,UDP,🛡 安全代理 · Clash Patch",
+          "NETWORK,UDP,REJECT",
+          "DOMAIN-SUFFIX,openai.com,🤖 AI · Clash Patch",
+          "IP-CIDR,160.79.104.0/21,🤖 AI · Clash Patch,no-resolve",
+          "DOMAIN-SUFFIX,ai.com,🤖 AI · Clash Patch",
+          "MATCH,Main"
+        ]
+      },
+      "expected_changed": true,
+      "expected_main_group": "Main",
+      "expected_ai_group": "🤖 AI · Clash Patch",
+      "expected_status": "updated",
+      "expected_absent_strings": [
+        "🛡 安全代理 · Clash Patch",
+        "DOMAIN-SUFFIX,ai.com,🤖 AI · Clash Patch",
+        "IP-CIDR,160.79.104.0/21,🤖 AI · Clash Patch,no-resolve",
+        "+.ai.com"
+      ],
+      "expected_present_strings": [
+        "IP-CIDR,160.79.104.0/23,🤖 AI · Clash Patch,no-resolve",
+        "NETWORK,UDP,🤖 AI · Clash Patch"
+      ]
+    },
+    {
+      "name": "no-valid-main-group-stays-unchanged",
+      "expected_config_sha256": "5ac8ffd66a8e932e5674aab3b1d78fd1e444e5aee7c865e5c387849d1befdc13",
+      "input": {
+        "proxies": [{ "name": "node-a", "type": "ss", "server": "node-a.example" }],
+        "proxy-groups": [
+          { "name": "AI", "type": "select", "proxies": ["node-a"] },
+          { "name": "DirectOnly", "type": "select", "proxies": ["DIRECT"] }
+        ],
+        "rules": ["MATCH,DIRECT"]
+      },
+      "expected_changed": false,
+      "expected_main_group": null,
+      "expected_ai_group": null,
+      "expected_status": "no_main_group"
+    },
+    {
+      "name": "no-ai-sources-stays-unchanged",
+      "expected_config_sha256": "38309b94746aef44c537c0a0f0eb05ff40235d725ad63f31b0a6247ae42119e0",
+      "input": {
+        "proxies": [],
+        "proxy-groups": [
+          { "name": "Main", "type": "select", "proxies": ["unresolved-node"] }
+        ],
+        "rules": ["MATCH,Main"]
+      },
+      "expected_changed": false,
+      "expected_main_group": null,
+      "expected_detected_main_group": "Main",
+      "expected_ai_group": null,
+      "expected_status": "no_ai_nodes"
+    },
+    {
+      "name": "invalid-array-input-stays-unchanged",
+      "expected_config_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+      "input": [],
+      "expected_changed": false,
+      "expected_main_group": null,
+      "expected_ai_group": null,
+      "expected_status": "invalid"
     }
   ]
 }

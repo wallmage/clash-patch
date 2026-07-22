@@ -1,0 +1,220 @@
+module ClashPatch
+  module_function
+
+  def excluded_path?(path)
+    basename = File.basename(path)
+    basename.start_with?(".") || basename.match?(/(?:^|[._-])(?:bak|backup|clash-patch)(?:[._-]|\z)/i) ||
+      basename.match?(/(?:\.tmp|\.bak|\.backup)\z/i)
+  end
+
+  def profile_paths(directory)
+    return [] unless Dir.exist?(directory)
+
+    Dir.children(directory).sort.map do |basename|
+      path = File.join(directory, basename)
+      next if excluded_path?(path)
+      next unless basename.match?(/\.ya?ml\z/i) && File.file?(path)
+
+      path
+    end.compact
+  end
+
+  def backup_key(path)
+    Digest::SHA256.hexdigest(File.expand_path(path))[0, 16]
+  end
+
+  def secure_backup_root!(backup_root)
+    root = File.expand_path(backup_root)
+    raise InvalidConfigError, "备份目录不能是符号链接" if File.symlink?(root)
+    raise InvalidConfigError, "备份位置不是目录" if File.exist?(root) && !File.directory?(root)
+
+    FileUtils.mkdir_p(root, mode: 0o700)
+    FileUtils.chmod(0o700, root)
+    Dir.children(root).each do |name|
+      path = File.join(root, name)
+      next unless name.end_with?(".backup") && File.file?(path) && !File.symlink?(path)
+
+      FileUtils.chmod(0o600, path)
+    rescue SystemCallError
+      next
+    end
+    root
+  end
+
+  def backup_entries_for(path, backup_root, reason: nil)
+    root = File.expand_path(backup_root)
+    return [] unless File.directory?(root) && !File.symlink?(root)
+
+    key = backup_key(path)
+    suffix = "--#{key}--#{File.basename(path)}.backup"
+    reason_token = reason && "--#{reason}--#{key}--"
+    Dir.children(root).select do |name|
+      name.end_with?(suffix) && (!reason_token || name.include?(reason_token)) &&
+        File.file?(File.join(root, name)) && !File.symlink?(File.join(root, name))
+    end.sort.map { |name| File.join(root, name) }
+  end
+
+  def create_versioned_backup(path, backup_root, content: nil, reason: "prewrite")
+    raise InvalidConfigError, "备份原因无效" unless reason.match?(/\A[a-z][a-z0-9-]{0,31}\z/)
+
+    root = secure_backup_root!(backup_root)
+    bytes = content.nil? ? File.binread(File.realpath(path)) : content.b
+    key = backup_key(path)
+    destination = nil
+    100.times do
+      timestamp = Time.now.strftime("%Y-%m-%d_%H-%M-%S.%9N%z")
+      candidate = File.join(root, "#{timestamp}--#{reason}--#{key}--#{File.basename(path)}.backup")
+      begin
+        File.open(candidate, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |backup|
+          backup.write(bytes)
+          backup.flush
+          backup.fsync
+        end
+        destination = candidate
+        break
+      rescue Errno::EEXIST
+        Thread.pass
+      end
+    end
+    raise IOError, "无法创建唯一的版本化备份" unless destination
+
+    FileUtils.chmod(0o600, destination)
+    destination
+  rescue StandardError
+    FileUtils.rm_f(destination) if destination && File.exist?(destination)
+    raise
+  end
+
+  def snapshot_initial_profiles(directories, backup_root)
+    directories.each_with_object([]) do |directory, snapshots|
+      profile_paths(directory).each do |path|
+        if backup_entries_for(path, backup_root, reason: "initial").empty?
+          snapshots << create_versioned_backup(path, backup_root, reason: "initial")
+        end
+      end
+    end
+  end
+
+  def list_backups(backup_root)
+    root = File.expand_path(backup_root)
+    return [] unless File.directory?(root) && !File.symlink?(root)
+
+    Dir.children(root).select do |name|
+      path = File.join(root, name)
+      name.match?(/\A\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d{9}[+-]\d{4}--[a-z][a-z0-9-]{0,31}--[0-9a-f]{16}--.+\.backup\z/) &&
+        !name.include?("--preference--") &&
+        File.file?(path) && !File.symlink?(path)
+    end.sort.reverse
+  end
+
+  def resolve_backup_id(backup_id, backup_root)
+    raise InvalidConfigError, "备份编号无效" unless backup_id == File.basename(backup_id.to_s) && backup_id.end_with?(".backup")
+
+    root = File.expand_path(backup_root)
+    path = File.join(root, backup_id)
+    raise InvalidConfigError, "找不到指定备份" unless File.file?(path) && !File.symlink?(path)
+
+    path
+  end
+
+  def find_backup_target(backup_id, directories)
+    matches = directories.flat_map { |directory| profile_paths(directory) }.select do |path|
+      backup_id.include?("--#{backup_key(path)}--") && backup_id.end_with?("--#{File.basename(path)}.backup")
+    end
+    raise InvalidConfigError, "备份无法对应到当前存储位置中的唯一配置" unless matches.length == 1
+
+    matches.first
+  end
+
+  def redacted_changed_paths(before, after, prefix = nil, output = [], limit = 200)
+    return output if output.length >= limit || before == after
+
+    if before.is_a?(Hash) && after.is_a?(Hash)
+      (before.keys | after.keys).map(&:to_s).sort.each do |key|
+        break if output.length >= limit
+        path = prefix ? "#{prefix}.#{key}" : key
+        before_key = before.key?(key) ? key : before.keys.find { |candidate| candidate.to_s == key }
+        after_key = after.key?(key) ? key : after.keys.find { |candidate| candidate.to_s == key }
+        if before_key.nil? || after_key.nil?
+          output << path
+        else
+          redacted_changed_paths(before[before_key], after[after_key], path, output, limit)
+        end
+      end
+    else
+      output << (prefix || "配置")
+    end
+    output
+  end
+
+  def compare_backup(backup_id, directories:, backup_root:)
+    backup_path = resolve_backup_id(backup_id, backup_root)
+    target = find_backup_target(backup_id, directories)
+    backup_bytes = File.binread(backup_path)
+    current_bytes = File.binread(File.realpath(target))
+    backup_config = load_yaml(backup_bytes.dup.force_encoding(Encoding::UTF_8), backup_id)
+    current_config = load_yaml(current_bytes.dup.force_encoding(Encoding::UTF_8), target)
+    {
+      backup_id: backup_id,
+      profile: File.basename(target),
+      same: backup_bytes == current_bytes,
+      backup_sha256: Digest::SHA256.hexdigest(backup_bytes),
+      current_sha256: Digest::SHA256.hexdigest(current_bytes),
+      changes: redacted_changed_paths(backup_config, current_config)
+    }
+  end
+
+  def restore_backup(backup_id, directories:, backup_root:, expected_current_sha256:, validator:)
+    return { status: :restore_conflict } unless expected_current_sha256.to_s.match?(/\A[0-9a-f]{64}\z/i)
+
+    backup_path = resolve_backup_id(backup_id, backup_root)
+    target = find_backup_target(backup_id, directories)
+    write_path = File.realpath(target)
+    backup_bytes = File.binread(backup_path)
+    backup_text = backup_bytes.dup.force_encoding(Encoding::UTF_8)
+    raise InvalidConfigError, "备份不是有效的 UTF-8" unless backup_text.valid_encoding?
+
+    load_yaml(backup_text, backup_id)
+    Tempfile.create([File.basename(write_path), ".restore"], File.dirname(write_path)) do |temporary|
+      temporary.binmode
+      temporary.write(backup_bytes)
+      temporary.flush
+      temporary.fsync
+      validation = validator.call(temporary.path)
+      return { status: :validation_timeout, path: target } if validation == :timeout
+      return { status: :validation_failed, path: target } unless validation == true
+    end
+
+    current_bytes = File.binread(write_path)
+    return { status: :restore_conflict, path: target } unless Digest::SHA256.hexdigest(current_bytes).casecmp(expected_current_sha256).zero?
+    return { status: :no_change, path: target } if current_bytes == backup_bytes
+
+    create_versioned_backup(target, backup_root, content: current_bytes, reason: "pre-restore")
+    File.open(write_path, "r+b") do |source|
+      source.flock(File::LOCK_EX)
+      locked_bytes = source.read
+      unless locked_source_current?(source, target, write_path) &&
+             Digest::SHA256.hexdigest(locked_bytes).casecmp(expected_current_sha256).zero?
+        return { status: :restore_conflict, path: target }
+      end
+      source.rewind
+      source.write(backup_bytes)
+      source.truncate(backup_bytes.bytesize)
+      source.flush
+      source.fsync
+    end
+    {
+      status: :updated,
+      path: target,
+      rollback_bytes: current_bytes,
+      patched_digest: Digest::SHA256.hexdigest(backup_bytes),
+      restored_backup: backup_id
+    }
+  rescue Psych::Exception, InvalidConfigError, SystemStackError
+    { status: :invalid_backup }
+  rescue SystemCallError, IOError
+    { status: :io_error }
+  end
+
+end
+

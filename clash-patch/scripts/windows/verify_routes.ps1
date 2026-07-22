@@ -3,10 +3,22 @@
     [string]$Secret = "",
     [string]$MainGroup = "",
     [string]$AiGroup = "",
-    [int]$ObservationSeconds = 15
+    [int]$ObservationSeconds = 15,
+    [switch]$Json
 )
 
 $ErrorActionPreference = "Stop"
+$resultContractPath = Join-Path $PSScriptRoot "result_contract.ps1"
+if (-not (Test-Path -LiteralPath $resultContractPath -PathType Leaf)) {
+    if ($Json) {
+        [Console]::Out.WriteLine('{"schema":"clash-patch.result","version":1,"command":"verify_routes","platform":"windows","client":"clash-verge-rev","operation":"load","ok":false,"status":"failed","code":"incomplete_package","exit_code":6,"summary_zh":"安装包不完整。","profile":null,"changes":[],"checks":[],"items":[],"messages":[],"warnings":[]}')
+    } else {
+        [Console]::Error.WriteLine("[Clash 补丁] 安装包不完整。")
+    }
+    exit 6
+}
+. $resultContractPath
+$script:ClashPatchChecks = New-Object System.Collections.ArrayList
 
 function Invoke-ControllerJson([string]$Endpoint) {
     $headers = @{}
@@ -87,11 +99,13 @@ function Observe-Route([string]$Label, [string]$Url, [string]$HostPattern, [stri
                     ($chains -contains $ExpectedGroup) -and
                     ($chains -contains $ExpectedSelection) -and
                     ($ExpectedSelection -ne "DIRECT")
-                Write-Host ("{0}：{1}" -f $Label, $(if ($passed) { "通过" } else { "失败" }))
+                [void]$script:ClashPatchChecks.Add([ordered]@{ name = $Label.ToLowerInvariant(); ok = $passed; status = $(if ($passed) { "passed" } else { "failed" }) })
+                if (-not $Json) { Write-Host ("{0}：{1}" -f $Label, $(if ($passed) { "通过" } else { "失败" })) }
                 return $passed
             }
         }
-        Write-Host "$Label：失败（没有观察到对应连接）"
+        [void]$script:ClashPatchChecks.Add([ordered]@{ name = $Label.ToLowerInvariant(); ok = $false; status = "not_observed" })
+        if (-not $Json) { Write-Host "$Label：失败（没有观察到对应连接）" }
         return $false
     } finally {
         if ($null -ne $process -and -not $process.HasExited) {
@@ -115,17 +129,27 @@ try {
     if ([string]::IsNullOrWhiteSpace($mainSelection) -or $mainSelection -eq "DIRECT") { throw "主代理组当前没有选择有效代理节点。" }
     if ([string]::IsNullOrWhiteSpace($aiSelection) -or $aiSelection -eq "DIRECT") { throw "AI 分组当前没有选择有效代理节点。" }
 
-    Write-Output "主代理组：已识别；当前选择已隐藏"
-    Write-Output "AI 分组：已识别；当前选择已隐藏"
+    if (-not $Json) {
+        Write-Output "主代理组：已识别；当前选择已隐藏"
+        Write-Output "AI 分组：已识别；当前选择已隐藏"
+    }
     $checks = @(
         (Observe-Route "Google" "https://www.google.com/search?q=clash-route-verification" "google" $main $mainSelection),
         (Observe-Route "OpenAI" "https://openai.com/" "openai" $ai $aiSelection),
         (Observe-Route "Anthropic" "https://www.anthropic.com/" "anthropic" $ai $aiSelection),
         (Observe-Route "Claude" "https://claude.ai/" "claude" $ai $aiSelection)
     )
-    if (@($checks | Where-Object { -not $_ }).Count -gt 0) { exit 1 }
+    if (@($checks | Where-Object { -not $_ }).Count -gt 0) {
+        if ($Json) { Write-ClashPatchResult (New-ClashPatchResult -Command "verify_routes" -Operation "verify_routes" -Ok $false -Status "failed" -Code "route_check_failed" -ExitCode 1 -SummaryZh "Windows 分流验证未通过。" -Checks @($script:ClashPatchChecks)) }
+        exit 1
+    }
+    if ($Json) { Write-ClashPatchResult (New-ClashPatchResult -Command "verify_routes" -Operation "verify_routes" -Ok $true -Status "ok" -Code "routes_verified" -ExitCode 0 -SummaryZh "Windows 分流验证通过。" -Checks @($script:ClashPatchChecks)) }
     exit 0
 } catch {
-    [Console]::Error.WriteLine("[Clash 补丁] Windows 分流验证失败：$($_.Exception.Message)")
+    if ($Json) {
+        Write-ClashPatchResult (New-ClashPatchResult -Command "verify_routes" -Operation "verify_routes" -Ok $false -Status "failed" -Code "verification_failed" -ExitCode 1 -SummaryZh ("Windows 分流验证失败：" + $_.Exception.Message) -Checks @($script:ClashPatchChecks))
+    } else {
+        [Console]::Error.WriteLine("[Clash 补丁] Windows 分流验证失败：$($_.Exception.Message)")
+    }
     exit 1
 }

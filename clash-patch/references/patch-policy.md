@@ -8,6 +8,7 @@
 - [Diagnostics 模块](#diagnostics-模块)
 - [Computer Use 与 Sub Agent](#computer-use-与-sub-agent)
 - [Patch 检查顺序](#patch-检查顺序)
+- [脚本接口与内部职责](#脚本接口与内部职责)
 - [DNS 与 TUN](#dns-与-tun)
 - [主代理组](#主代理组)
 - [AI 组](#ai-组)
@@ -199,6 +200,14 @@ Windows 客户端运行时不得修改当前配置；这里的当前配置是 `v
 9. 验证实时分流，再完成浏览器测试。
 
 任何时候都不能输出整份配置。日志只能出现配置显示名称、处理状态、代理组名称和节点显示名称。
+
+## 脚本接口与内部职责
+
+所有公开命令都显式支持 JSON v1：macOS 使用 `--json`，Windows 使用 `-Json`。默认模式继续输出原有中文信息。JSON 模式的标准输出只能有一个对象，不能混入日志；对象中的 `exit_code` 必须与进程退出码一致。`code` 和 `operation` 是稳定的机器标识，`command` 只允许 `install`、`uninstall`、`patch`、`verify_routes`。所有必填字段、状态值和字段类型以 [result-contract.json](result-contract.json) 为准。
+
+JSON 结果必须经过统一脱敏，不得含订阅 URL、密码、UUID、私钥、控制器密钥、完整本机路径或节点名称。Skill 调用脚本时优先使用 JSON 模式，并依据字段判断结果，不解析中文文案。面向用户的默认中文输出不因此改变。
+
+公开脚本的路径、参数和调用方式保持兼容。内部代码按配置转换、备份与事务、Mihomo 校验、订阅处理、安全更新、运行状态和 CLI 组织；入口只负责参数、编排与结果输出。拆分不能改变事务顺序、安全边界或既有退出码。
 
 ## DNS 与 TUN
 

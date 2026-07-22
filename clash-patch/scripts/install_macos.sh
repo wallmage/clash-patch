@@ -14,17 +14,52 @@ LEGACY_PLIST="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
 LEGACY_PATCHER="$HOME/Library/Application Support/ClashProfilePatcher/patch_profiles.rb"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PATCHER_SOURCE="$SCRIPT_DIR/macos/patch_profiles.rb"
+RESULT_CONTRACT_SOURCE="$SCRIPT_DIR/macos/result_contract.rb"
 POLICY_SOURCE="$SCRIPT_DIR/../references/policy.json"
 USAGE_PROFILE=""
 PROFILE_SOURCE=""
 SHOW_PROFILE=0
 SAFE_UPDATE=0
+JSON_OUTPUT=0
+OPERATION="install"
+
+for argument do
+  [ "$argument" = "--json" ] && JSON_OUTPUT=1
+done
+
+finish() {
+  finish_exit=$1
+  finish_status=$2
+  finish_code=$3
+  finish_summary=$4
+  finish_operation=${5:-$OPERATION}
+  finish_profile=${6:-$USAGE_PROFILE}
+  if [ "$JSON_OUTPUT" -eq 1 ]; then
+    if [ -x /usr/bin/ruby ] && [ -f "$RESULT_CONTRACT_SOURCE" ]; then
+      if [ -n "$finish_profile" ]; then
+        /usr/bin/ruby "$RESULT_CONTRACT_SOURCE" \
+          --command install --operation "$finish_operation" --ok "$([ "$finish_exit" -eq 0 ] && /usr/bin/printf true || /usr/bin/printf false)" \
+          --status "$finish_status" --code "$finish_code" --exit-code "$finish_exit" --summary "$finish_summary" \
+          --profile "$finish_profile"
+      else
+        /usr/bin/ruby "$RESULT_CONTRACT_SOURCE" \
+          --command install --operation "$finish_operation" --ok "$([ "$finish_exit" -eq 0 ] && /usr/bin/printf true || /usr/bin/printf false)" \
+          --status "$finish_status" --code "$finish_code" --exit-code "$finish_exit" --summary "$finish_summary"
+      fi
+    else
+      /usr/bin/printf '%s\n' "{\"schema\":\"clash-patch.result\",\"version\":1,\"command\":\"install\",\"platform\":\"macos\",\"client\":\"clashx-meta\",\"operation\":\"$finish_operation\",\"ok\":false,\"status\":\"$finish_status\",\"code\":\"$finish_code\",\"exit_code\":$finish_exit,\"summary_zh\":\"$finish_summary\",\"profile\":null,\"changes\":[],\"checks\":[],\"items\":[],\"messages\":[],\"warnings\":[]}"
+    fi
+  fi
+  exit "$finish_exit"
+}
 
 say() {
+  [ "$JSON_OUTPUT" -eq 0 ] || return 0
   /usr/bin/printf '%s\n' "[Clash 补丁] $1"
 }
 
 usage() {
+  [ "$JSON_OUTPUT" -eq 0 ] || return 0
   /usr/bin/printf '%s\n' "用法：install_macos.sh [--profile 1|2|3] [--show-profile] [--safe-update]"
 }
 
@@ -43,7 +78,7 @@ save_profile() {
   state_dir=$(/usr/bin/dirname "$USAGE_STATE_PATH")
   if [ -L "$state_dir" ] || { [ -e "$USAGE_STATE_PATH" ] && { [ ! -f "$USAGE_STATE_PATH" ] || [ -L "$USAGE_STATE_PATH" ]; }; }; then
     say "档位保存位置不安全，未写入任何设置。"
-    exit 7
+    finish 7 failed unsafe_profile_state "档位保存位置不安全，未写入任何设置。" save_profile
   fi
   /bin/mkdir -p "$state_dir"
   /bin/chmod 700 "$state_dir"
@@ -60,7 +95,7 @@ save_profile() {
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --profile)
-      [ "$#" -ge 2 ] || { usage; exit 64; }
+      [ "$#" -ge 2 ] || { usage; finish 64 invalid_request missing_profile_value "--profile 缺少档位值。" parse_arguments; }
       USAGE_PROFILE=$2
       PROFILE_SOURCE="argument"
       shift 2
@@ -71,21 +106,35 @@ while [ "$#" -gt 0 ]; do
       ;;
     --safe-update)
       SAFE_UPDATE=1
+      OPERATION="safe_update"
+      shift
+      ;;
+    --json)
+      JSON_OUTPUT=1
       shift
       ;;
     -h|--help)
       usage
-      exit 0
+      finish 0 ok help "已显示帮助。" help
       ;;
     *)
       usage
-      exit 64
+      finish 64 invalid_request invalid_arguments "参数错误。" parse_arguments
       ;;
   esac
 done
 
 if [ "$SHOW_PROFILE" -eq 1 ]; then
-  read_saved_profile || /usr/bin/printf '%s\n' "unset"
+  OPERATION="show_profile"
+  saved_profile=$(read_saved_profile || true)
+  if [ "$JSON_OUTPUT" -eq 1 ]; then
+    if [ -n "$saved_profile" ]; then
+      finish 0 ok profile_set "已读取用途档位。" show_profile "$saved_profile"
+    else
+      finish 0 no_change profile_unset "尚未保存用途档位。" show_profile ""
+    fi
+  fi
+  [ -n "$saved_profile" ] && /usr/bin/printf '%s\n' "$saved_profile" || /usr/bin/printf '%s\n' "unset"
   exit 0
 fi
 
@@ -101,11 +150,11 @@ case "$USAGE_PROFILE" in
   1|2|3) ;;
   "")
     say "还没有选择用途档位。请先在 skill 中选择：1 普通浏览、2 海外 AI、3 Claude/Claude Code。"
-    exit 10
+    finish 10 invalid_request profile_required "还没有选择用途档位。" select_profile
     ;;
   *)
     say "用途档位无效，只能是 1、2 或 3。"
-    exit 64
+    finish 64 invalid_request invalid_profile "用途档位无效，只能是 1、2 或 3。" select_profile
     ;;
 esac
 
@@ -142,23 +191,23 @@ remove_legacy_agent() {
 
 if [ "$(uname -s)" != "Darwin" ]; then
   say "当前系统不是 macOS。Windows 请使用 Clash Verge Rev 的 Windows 安装程序。"
-  exit 2
+  finish 2 unsupported unsupported_platform "当前系统不是 macOS。" install
 fi
 
 USER_ID=$(/usr/bin/id -u)
 if [ "$USER_ID" -eq 0 ]; then
   say "请不要使用 sudo 或 root；请用当前登录用户直接运行。"
-  exit 2
+  finish 2 invalid_request root_not_allowed "请用当前登录用户直接运行。" install
 fi
 
 if [ ! -x /usr/bin/ruby ]; then
   say "这台 Mac 没有系统 Ruby，无法运行补丁。"
-  exit 3
+  finish 3 unsupported ruby_missing "这台 Mac 没有系统 Ruby，无法运行补丁。" install
 fi
 
 if [ ! -d "/Applications/ClashX Meta.app" ] && [ ! -d "$HOME/Applications/ClashX Meta.app" ]; then
   say "没有找到受支持的 ClashX Meta。"
-  exit 4
+  finish 4 unsupported client_missing "没有找到受支持的 ClashX Meta。" install
 fi
 
 if [ "$PROFILE_SOURCE" != "saved" ] && [ "$USAGE_PROFILE" -ne 3 ]; then
@@ -168,12 +217,12 @@ fi
 
 if [ -n "$CUSTOM_PROFILE_DIR" ] && [ ! -d "$CUSTOM_PROFILE_DIR" ]; then
   say "没有找到指定的 ClashX Meta 配置目录。"
-  exit 5
+  finish 5 failed profile_directory_missing "没有找到指定的 ClashX Meta 配置目录。" install
 fi
 
-if [ ! -f "$PATCHER_SOURCE" ] || [ ! -f "$POLICY_SOURCE" ]; then
+if [ ! -f "$PATCHER_SOURCE" ] || [ ! -f "$POLICY_SOURCE" ] || [ ! -f "$RESULT_CONTRACT_SOURCE" ]; then
   say "安装包不完整：缺少补丁程序或策略文件。"
-  exit 6
+  finish 6 failed incomplete_package "安装包不完整。" install
 fi
 
 # 旧版目录监听会被补丁自己的写入再次触发。只移除能核对所有权的旧服务。
@@ -190,7 +239,7 @@ if [ "$SAFE_UPDATE" -eq 0 ] && [ "$USAGE_PROFILE" -ne 3 ]; then
     say "档位 2 只需要开启 TUN 并关闭 ClashX Meta 自己的系统代理开关；未修改订阅、DNS、WebRTC 或 AI 分组。"
   fi
   say "请由本 skill 使用 Computer Use 完成客户端开关和对应网站复测。"
-  exit 0
+  finish 0 ok lightweight_profile_saved "用途档位已保存；未修改订阅。" install
 fi
 
 core_status=$(/usr/bin/ruby "$PATCHER_SOURCE" --print-core-status 2>/dev/null || true)
@@ -200,7 +249,7 @@ if [ "$core_status" != "supported" ]; then
     timeout) say "Mihomo 内核检查超过 30 秒，未修改任何订阅。" ;;
     *) say "没有找到可用的 Mihomo 内核，或无法确认版本。" ;;
   esac
-  exit 8
+  finish 8 unsupported mihomo_unavailable "Mihomo 内核不可用或版本不受支持。" core_status
 fi
 
 if [ "$PROFILE_SOURCE" != "saved" ] && [ "$USAGE_PROFILE" -eq 3 ]; then
@@ -211,12 +260,12 @@ fi
 if [ "$USAGE_PROFILE" -eq 3 ]; then
   if ! auto_update_result=$(/usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --disable-subscription-auto-update 2>&1); then
     say "无法自动关闭 ClashX Meta 的订阅自动更新；本次未修改任何订阅。"
-    exit 9
+    finish 9 failed auto_update_failed "无法自动关闭订阅自动更新；未修改任何订阅。" install
   fi
   case "$auto_update_result" in
     disabled) say "已自动关闭订阅更新，并保存修改前状态。" ;;
     already_disabled) say "订阅自动更新已经关闭。" ;;
-    *) say "订阅自动更新回读结果异常；本次未修改任何订阅。"; exit 9 ;;
+    *) say "订阅自动更新回读结果异常；本次未修改任何订阅。"; finish 9 failed auto_update_verify_failed "订阅自动更新回读结果异常；未修改任何订阅。" install ;;
   esac
 fi
 
@@ -224,41 +273,86 @@ fi
 /bin/chmod 700 "$INSTALL_DIR" "$BACKUP_DIR"
 
 if [ -n "$CUSTOM_PROFILE_DIR" ]; then
-  /usr/bin/ruby "$PATCHER_SOURCE" --profile-dir "$CUSTOM_PROFILE_DIR" --backup-dir "$BACKUP_DIR" --snapshot-initial
+  if [ "$JSON_OUTPUT" -eq 1 ]; then
+    /usr/bin/ruby "$PATCHER_SOURCE" --profile-dir "$CUSTOM_PROFILE_DIR" --backup-dir "$BACKUP_DIR" --snapshot-initial --json >/dev/null ||
+      finish 1 failed snapshot_failed "无法创建初始快照。" snapshot_initial
+  else
+    /usr/bin/ruby "$PATCHER_SOURCE" --profile-dir "$CUSTOM_PROFILE_DIR" --backup-dir "$BACKUP_DIR" --snapshot-initial
+  fi
 else
-  /usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --snapshot-initial
+  if [ "$JSON_OUTPUT" -eq 1 ]; then
+    /usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --snapshot-initial --json >/dev/null ||
+      finish 1 failed snapshot_failed "无法创建初始快照。" snapshot_initial
+  else
+    /usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --snapshot-initial
+  fi
 fi
 
 if [ "$SAFE_UPDATE" -eq 1 ]; then
   if [ -n "$CUSTOM_PROFILE_DIR" ]; then
-    /usr/bin/ruby "$PATCHER_SOURCE" \
-      --profile-dir "$CUSTOM_PROFILE_DIR" \
-      --policy "$POLICY_SOURCE" \
-      --backup-dir "$BACKUP_DIR" \
-      --safe-update-all \
-      --usage-profile "$USAGE_PROFILE"
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+      /usr/bin/ruby "$PATCHER_SOURCE" \
+        --profile-dir "$CUSTOM_PROFILE_DIR" \
+        --policy "$POLICY_SOURCE" \
+        --backup-dir "$BACKUP_DIR" \
+        --safe-update-all \
+        --usage-profile "$USAGE_PROFILE" --json >/dev/null ||
+        finish 1 failed safe_update_failed "安全更新失败。" safe_update
+    else
+      /usr/bin/ruby "$PATCHER_SOURCE" \
+        --profile-dir "$CUSTOM_PROFILE_DIR" \
+        --policy "$POLICY_SOURCE" \
+        --backup-dir "$BACKUP_DIR" \
+        --safe-update-all \
+        --usage-profile "$USAGE_PROFILE"
+    fi
   else
-    /usr/bin/ruby "$PATCHER_SOURCE" \
-      --policy "$POLICY_SOURCE" \
-      --backup-dir "$BACKUP_DIR" \
-      --safe-update-all \
-      --usage-profile "$USAGE_PROFILE"
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
+      /usr/bin/ruby "$PATCHER_SOURCE" \
+        --policy "$POLICY_SOURCE" \
+        --backup-dir "$BACKUP_DIR" \
+        --safe-update-all \
+        --usage-profile "$USAGE_PROFILE" --json >/dev/null ||
+        finish 1 failed safe_update_failed "安全更新失败。" safe_update
+    else
+      /usr/bin/ruby "$PATCHER_SOURCE" \
+        --policy "$POLICY_SOURCE" \
+        --backup-dir "$BACKUP_DIR" \
+        --safe-update-all \
+        --usage-profile "$USAGE_PROFILE"
+    fi
   fi
   say "安全更新已完成：当前存储位置中的全部远程订阅已一起更新。"
-  exit 0
+  finish 0 ok safe_update_completed "安全更新已完成。" safe_update
 fi
 
 if [ -n "$CUSTOM_PROFILE_DIR" ]; then
-  /usr/bin/ruby "$PATCHER_SOURCE" \
-    --profile-dir "$CUSTOM_PROFILE_DIR" \
-    --policy "$POLICY_SOURCE" \
-    --backup-dir "$BACKUP_DIR"
+  if [ "$JSON_OUTPUT" -eq 1 ]; then
+    /usr/bin/ruby "$PATCHER_SOURCE" \
+      --profile-dir "$CUSTOM_PROFILE_DIR" \
+      --policy "$POLICY_SOURCE" \
+      --backup-dir "$BACKUP_DIR" --json >/dev/null ||
+      finish 1 failed patch_failed "配置处理失败。" patch_profiles
+  else
+    /usr/bin/ruby "$PATCHER_SOURCE" \
+      --profile-dir "$CUSTOM_PROFILE_DIR" \
+      --policy "$POLICY_SOURCE" \
+      --backup-dir "$BACKUP_DIR"
+  fi
 else
-  /usr/bin/ruby "$PATCHER_SOURCE" \
-    --policy "$POLICY_SOURCE" \
-    --backup-dir "$BACKUP_DIR"
+  if [ "$JSON_OUTPUT" -eq 1 ]; then
+    /usr/bin/ruby "$PATCHER_SOURCE" \
+      --policy "$POLICY_SOURCE" \
+      --backup-dir "$BACKUP_DIR" --json >/dev/null ||
+      finish 1 failed patch_failed "配置处理失败。" patch_profiles
+  else
+    /usr/bin/ruby "$PATCHER_SOURCE" \
+      --policy "$POLICY_SOURCE" \
+      --backup-dir "$BACKUP_DIR"
+  fi
 fi
 
 say "本次为单次运行，只处理 ClashX Meta 当前存储位置中的订阅。"
 say "当前订阅需要修改时，会通过本地控制器自动刷新并检查；失败时补丁程序会恢复原配置。"
 say "脚本没有退出、停止或重启 ClashX Meta，也没有切换订阅、代理组或节点。"
+finish 0 ok install_completed "Clash Patch 处理完成。" install

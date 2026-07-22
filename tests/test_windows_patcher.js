@@ -1,7 +1,9 @@
 const fs = require('node:fs');
+const crypto = require('node:crypto');
 const path = require('node:path');
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { isDeepStrictEqual } = require('node:util');
 
 const root = path.resolve(__dirname, '..');
 const enginePath = path.join(root, 'clash-patch/scripts/windows/clash_verge_global.js');
@@ -9,6 +11,16 @@ const policyPath = path.join(root, 'clash-patch/references/policy.json');
 const installerPath = path.join(root, 'clash-patch/scripts/install_windows.ps1');
 const uninstallerPath = path.join(root, 'clash-patch/scripts/uninstall_windows.ps1');
 const routeVerifierPath = path.join(root, 'clash-patch/scripts/windows/verify_routes.ps1');
+const resultContractPath = path.join(root, 'clash-patch/scripts/windows/result_contract.ps1');
+const installerModuleDir = path.join(root, 'clash-patch/scripts/windows/install_windows');
+const installerModuleNames = [
+  'common.ps1', 'yaml.ps1', 'profiles.ps1', 'mihomo.ps1',
+  'transaction.ps1', 'script_js.ps1', 'safe_update.ps1'
+];
+const installerModulePaths = installerModuleNames.map((name) => path.join(installerModuleDir, name));
+function readInstallerBundle() {
+  return [installerPath, ...installerModulePaths].map((file) => fs.readFileSync(file, 'utf8')).join('\n');
+}
 const installWrapperPath = path.join(root, 'clash-patch/scripts/install_windows.cmd');
 const uninstallWrapperPath = path.join(root, 'clash-patch/scripts/uninstall_windows.cmd');
 const fixturePath = path.join(root, 'tests/fixtures/main_group_cases.json');
@@ -354,13 +366,51 @@ test('unknown policy version is rejected without mutation', { skip: !available }
 });
 
 test('shared main-group fixtures match the Ruby engine', { skip: !fixturesAvailable }, () => {
-  const cases = JSON.parse(fs.readFileSync(fixturePath, 'utf8')).cases;
+  const shared = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+  assert.equal(shared.schema_version, 1);
+  const cases = shared.cases;
   for (const fixture of cases) {
     const snapshot = JSON.parse(JSON.stringify(fixture.config));
     assert.equal(engine.clashPatchDetectMain(fixture.config), fixture.expected_main_group, fixture.name);
     if (fixture.expected_main_group === null) {
       engine.clashPatchTransform(fixture.config, 'fixture');
       assert.deepEqual(fixture.config, snapshot, fixture.name);
+    }
+  }
+});
+
+test('shared full-transform fixtures match the Ruby engine', { skip: !fixturesAvailable }, () => {
+  const fixtures = JSON.parse(fs.readFileSync(fixturePath, 'utf8')).transform_cases;
+  for (const fixture of fixtures) {
+    const input = structuredClone(fixture.input);
+    const snapshot = structuredClone(input);
+    const patched = engine.clashPatchTransform(input, 'fixture');
+    const changed = !isDeepStrictEqual(patched, input);
+    const valid = input && typeof input === 'object' && !Array.isArray(input) &&
+      Array.isArray(input['proxy-groups']) && (input.rules == null || Array.isArray(input.rules)) &&
+      (Array.isArray(input.proxies) ||
+        (input['proxy-providers'] && typeof input['proxy-providers'] === 'object' && !Array.isArray(input['proxy-providers'])));
+    const mainGroup = valid ? engine.clashPatchDetectMain(input) : null;
+    const udp = patched && Array.isArray(patched.rules) ? patched.rules.find((rule) => /^NETWORK\s*,\s*UDP\s*,/i.test(rule)) : null;
+    const aiGroup = udp ? udp.split(',').map((field) => field.trim()).at(-1) : null;
+
+    assert.equal(changed, fixture.expected_changed, fixture.name);
+    const expectedDetectedMain = Object.hasOwn(fixture, 'expected_detected_main_group') ?
+      fixture.expected_detected_main_group : fixture.expected_main_group;
+    assert.equal(mainGroup, expectedDetectedMain, fixture.name);
+    assert.equal(aiGroup, fixture.expected_ai_group, fixture.name);
+    assert.deepEqual(input, snapshot, `${fixture.name}: input mutated`);
+    const serialized = JSON.stringify(patched);
+    assert.equal(crypto.createHash('sha256').update(serialized).digest('hex'), fixture.expected_config_sha256, `${fixture.name}: output drift`);
+    for (const value of fixture.expected_absent_strings || []) {
+      assert.equal(serialized.includes(value), false, `${fixture.name}: retained ${value}`);
+    }
+    for (const value of fixture.expected_present_strings || []) {
+      assert.equal(serialized.includes(value), true, `${fixture.name}: missing ${value}`);
+    }
+
+    if (fixture.expected_changed) {
+      assert.deepEqual(engine.clashPatchTransform(patched, 'fixture'), patched, `${fixture.name}: second pass`);
     }
   }
 });
@@ -434,7 +484,7 @@ test('returns invalid configurations unchanged', { skip: !available }, () => {
 
 test('PowerShell installer uses the documented global script and app settings', () => {
   assert.equal(fs.existsSync(installerPath), true, 'Windows installer is missing');
-  const source = fs.readFileSync(installerPath, 'utf8');
+  const source = readInstallerBundle();
   assert.match(source, /io\.github\.clash-verge-rev\.clash-verge-rev/);
   assert.match(source, /profiles[\\/]Script\.js/);
   assert.match(source, /enable_tun_mode/);
@@ -770,7 +820,7 @@ test('canonical AI policy excludes unrelated ai.com and uses Anthropic inbound r
 });
 
 test('PowerShell installer structurally edits YAML and rolls back failed transactions', () => {
-  const source = fs.readFileSync(installerPath, 'utf8');
+  const source = readInstallerBundle();
   assert.match(source, /function Find-YamlMappingNode/);
   assert.match(source, /function Set-YamlTopLevelScalar/);
   assert.match(source, /function Set-YamlTunMapping/);
@@ -783,7 +833,7 @@ test('PowerShell installer structurally edits YAML and rolls back failed transac
 });
 
 test('Windows installation fails closed and preserves exact restore state', () => {
-  const installer = fs.readFileSync(installerPath, 'utf8');
+  const installer = readInstallerBundle();
   const uninstaller = fs.readFileSync(uninstallerPath, 'utf8');
   assert.match(installer, /\[string\]\$MihomoPath/);
   assert.match(installer, /function Test-MihomoVersion/);
@@ -813,6 +863,56 @@ test('Windows installation fails closed and preserves exact restore state', () =
   assert.match(fs.readFileSync(uninstallWrapperPath, 'utf8'), /-ExecutionPolicy Bypass/);
 });
 
+test('Windows installer is split into side-effect-free modules with stable function ownership', () => {
+  const entry = fs.readFileSync(installerPath, 'utf8');
+  const expected = {
+    'common.ps1': ['Write-Info', 'Complete-InstallResult', 'Get-SavedUsageProfile', 'Save-UsageProfile'],
+    'transaction.ps1': [
+      'Protect-BackupAcl', 'Get-PathKey', 'Backup-Versioned', 'Backup-InitialOnce', 'Write-BytesAtomic',
+      'ConvertTo-Utf8Bytes', 'Write-Utf8Atomic', 'Get-BytesSha256', 'Get-FileSha256', 'Restore-Transaction',
+      'Get-InstallStateEntry', 'Assert-InstallStateEntry', 'Assert-InstallState', 'Assert-StateTargetUnchanged',
+      'New-InstallStateEntry'
+    ],
+    'yaml.ps1': [
+      'Split-YamlLines', 'Join-YamlLines', 'Get-YamlIndent', 'Get-YamlMappingEntry', 'Get-YamlPathFingerprints',
+      'Get-RedactedYamlChangedPaths', 'Find-YamlMappingNode', 'Replace-YamlRange', 'Set-YamlTopLevelScalar',
+      'Get-ManagedTunLines', 'New-ManagedTunBlock', 'Set-YamlTunMapping', 'Test-GeneratedYaml'
+    ],
+    'profiles.ps1': [
+      'Get-RemoteSubscriptionProfileItems', 'Get-RemoteSubscriptionTargets',
+      'Set-RemoteSubscriptionAutoUpdateDisabled', 'Assert-RemoteSubscriptionAutoUpdateDisabled'
+    ],
+    'mihomo.ps1': [
+      'ConvertTo-NativeArgument', 'Invoke-Mihomo', 'Test-ClashVergeRunning', 'Test-MihomoVersionText',
+      'Test-MihomoVersion', 'Find-MihomoCore', 'Test-MihomoCandidate'
+    ],
+    'script_js.ps1': [
+      'Get-JavaScriptAnalysis', 'Rename-JavaScriptMain', 'Assert-JavaScriptReservedIdentifiers',
+      'Assert-JavaScriptCanCompose', 'Build-GlobalScript'
+    ],
+    'safe_update.ps1': ['Get-BackupTarget', 'Test-RestoreCandidate', 'Get-SafeUpdateRecoveryItems', 'Restore-SafeUpdateFiles']
+  };
+
+  assert.doesNotMatch(entry, /^function\s+/m, 'entry point still contains library functions');
+  let previousLoad = -1;
+  const seen = new Set();
+  for (const [index, moduleName] of installerModuleNames.entries()) {
+    const modulePath = installerModulePaths[index];
+    assert.equal(fs.existsSync(modulePath), true, moduleName);
+    const source = fs.readFileSync(modulePath, 'utf8');
+    const names = [...source.matchAll(/^\uFEFF?function\s+([A-Za-z0-9-]+)/gm)].map((match) => match[1]);
+    assert.deepEqual(names, expected[moduleName], moduleName);
+    for (const name of names) {
+      assert.equal(seen.has(name), false, `duplicate function ${name}`);
+      seen.add(name);
+    }
+    const load = entry.indexOf(`"${moduleName}"`);
+    assert.ok(load > previousLoad, `module load order: ${moduleName}`);
+    previousLoad = load;
+  }
+  assert.ok(previousLoad < entry.indexOf('if ([string]::IsNullOrWhiteSpace($AppHome))'), 'modules load after execution began');
+});
+
 test('Windows engine contains no unused rule-identity helper', () => {
   const source = fs.readFileSync(enginePath, 'utf8');
   assert.doesNotMatch(source, /function clashPatchRuleIdentity/);
@@ -822,6 +922,27 @@ test('Windows PowerShell entry scripts have a UTF-8 BOM', () => {
   for (const entry of [installerPath, uninstallerPath, routeVerifierPath]) {
     assert.deepEqual([...fs.readFileSync(entry).subarray(0, 3)], [0xef, 0xbb, 0xbf], entry);
   }
+});
+
+test('Windows public commands share the JSON v1 result contract', () => {
+  const contract = fs.readFileSync(resultContractPath, 'utf8');
+  assert.match(contract, /\$script:ClashPatchResultSchema = "clash-patch\.result"/);
+  assert.match(contract, /\$script:ClashPatchResultVersion = 1/);
+  assert.match(contract, /function New-ClashPatchResult/);
+  assert.match(contract, /function Write-ClashPatchResult/);
+  assert.match(contract, /function Protect-ClashPatchResultValue/);
+  assert.match(contract, /ConvertTo-Json -Depth/);
+
+  for (const entry of [installerPath, uninstallerPath, routeVerifierPath]) {
+    const source = entry === installerPath ? readInstallerBundle() : fs.readFileSync(entry, 'utf8');
+    assert.match(source, /\[switch\]\$Json/, entry);
+    assert.match(source, /result_contract\.ps1/, entry);
+    assert.match(source, /Write-ClashPatchResult/, entry);
+  }
+
+  assert.match(fs.readFileSync(path.join(installerModuleDir, 'common.ps1'), 'utf8'), /-Command "install"/);
+  assert.match(fs.readFileSync(uninstallerPath, 'utf8'), /-Command "uninstall"/);
+  assert.match(fs.readFileSync(routeVerifierPath, 'utf8'), /-Command "verify_routes"/);
 });
 
 function baseConfig() {

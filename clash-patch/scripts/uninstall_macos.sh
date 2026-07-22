@@ -12,8 +12,33 @@ LEGACY_LABEL="com.wallny.clash-profile-patcher"
 LEGACY_PLIST="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
 LEGACY_PATCHER="$HOME/Library/Application Support/ClashProfilePatcher/patch_profiles.rb"
 DEFAULTS_DOMAIN="com.metacubex.ClashX.meta"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+RESULT_CONTRACT_SOURCE="$SCRIPT_DIR/macos/result_contract.rb"
+JSON_OUTPUT=0
+
+for argument do
+  [ "$argument" = "--json" ] && JSON_OUTPUT=1
+done
+
+finish() {
+  finish_exit=$1
+  finish_status=$2
+  finish_code=$3
+  finish_summary=$4
+  if [ "$JSON_OUTPUT" -eq 1 ]; then
+    if [ -x /usr/bin/ruby ] && [ -f "$RESULT_CONTRACT_SOURCE" ]; then
+      /usr/bin/ruby "$RESULT_CONTRACT_SOURCE" \
+        --command uninstall --operation uninstall --ok "$([ "$finish_exit" -eq 0 ] && /usr/bin/printf true || /usr/bin/printf false)" \
+        --status "$finish_status" --code "$finish_code" --exit-code "$finish_exit" --summary "$finish_summary"
+    else
+      /usr/bin/printf '%s\n' "{\"schema\":\"clash-patch.result\",\"version\":1,\"command\":\"uninstall\",\"platform\":\"macos\",\"client\":\"clashx-meta\",\"operation\":\"uninstall\",\"ok\":false,\"status\":\"$finish_status\",\"code\":\"$finish_code\",\"exit_code\":$finish_exit,\"summary_zh\":\"$finish_summary\",\"profile\":null,\"changes\":[],\"checks\":[],\"items\":[],\"messages\":[],\"warnings\":[]}"
+    fi
+  fi
+  exit "$finish_exit"
+}
 
 say() {
+  [ "$JSON_OUTPUT" -eq 0 ] || return 0
   /usr/bin/printf '%s\n' "[Clash 补丁] $1"
 }
 
@@ -51,13 +76,13 @@ remove_owned_agent() {
 
 if [ "$(uname -s)" != "Darwin" ]; then
   say "当前系统不是 macOS。"
-  exit 2
+  finish 2 unsupported unsupported_platform "当前系统不是 macOS。"
 fi
 
 USER_ID=$(/usr/bin/id -u)
 if [ "$USER_ID" -eq 0 ]; then
   say "请不要使用 sudo 或 root 运行卸载程序；请用当前登录用户直接运行。"
-  exit 2
+  finish 2 invalid_request root_not_allowed "请用当前登录用户直接运行。"
 fi
 
 remove_owned_agent "$CURRENT_PLIST" "$CURRENT_LABEL" "$CURRENT_PATCHER"
@@ -72,8 +97,18 @@ if [ -f "$STATE_PATH" ]; then
     if [ "$restore_present" = "true" ] || [ "$restore_present" = "1" ]; then
       restore_value=$(/usr/bin/plutil -extract RestoreTunValue raw "$STATE_PATH" 2>/dev/null || true)
       case "$restore_value" in
-        true|1) /usr/bin/defaults write "$DEFAULTS_DOMAIN" restoreTunProxy -bool true ;;
-        *) /usr/bin/defaults write "$DEFAULTS_DOMAIN" restoreTunProxy -bool false ;;
+        true|1)
+          if ! /usr/bin/defaults write "$DEFAULTS_DOMAIN" restoreTunProxy -bool true >/dev/null 2>&1; then
+            say "无法恢复安装前的 TUN 启动偏好；未删除安装状态。"
+            finish 1 failed restore_tun_preference_failed "无法恢复安装前的 TUN 启动偏好；未删除安装状态。"
+          fi
+          ;;
+        *)
+          if ! /usr/bin/defaults write "$DEFAULTS_DOMAIN" restoreTunProxy -bool false >/dev/null 2>&1; then
+            say "无法恢复安装前的 TUN 启动偏好；未删除安装状态。"
+            finish 1 failed restore_tun_preference_failed "无法恢复安装前的 TUN 启动偏好；未删除安装状态。"
+          fi
+          ;;
       esac
     else
       /usr/bin/defaults delete "$DEFAULTS_DOMAIN" restoreTunProxy >/dev/null 2>&1 || true
@@ -99,3 +134,4 @@ if [ "$TUN_RESTORED" -eq 1 ]; then
 else
   say "旧版安装前的 TUN 偏好无法确认，因此保留当前值。订阅里的 DNS、WebRTC 和 AI 设置不会自动撤销。"
 fi
+finish 0 ok uninstall_completed "Clash Patch 卸载处理完成；备份未删除。"

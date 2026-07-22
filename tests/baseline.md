@@ -5,11 +5,12 @@
 ## 必须通过
 
 - Ruby：macOS 三档用途、转换、备份/比较/恢复、安全更新事务、运行刷新、YAML 1.2、Mihomo 校验和分流验证。
-- 覆盖率门槛：macOS 纯配置转换核心与独立分流验证器必须 100% 行覆盖，包含操作系统适配和 CLI 的单体补丁脚本整体不得低于 90%；Windows JavaScript 转换引擎必须 100% 行、100% 函数且分支不低于 80%。门槛只能上调；不得通过忽略正常生产行、无断言调用或删除防御代码凑数字。
+- 双平台 conformance：`tests/fixtures/main_group_cases.json` 由 macOS Ruby 与 Windows JavaScript 共用；每个案例用人工确认后的 `expected_config_sha256` 锁定完整结果，两端分别匹配后再做完整输出深比较，发生变化的案例再次执行后必须不再变化。
+- 覆盖率门槛：macOS 纯配置转换核心与独立分流验证器必须 100% 行覆盖，包含操作系统适配、文件事务和 CLI 的全部生产模块合计不得低于 90%；Windows JavaScript 转换引擎必须 100% 行、100% 函数且分支不低于 80%。统计必须跟随生产代码拆分后的全部模块，不能因移动代码缩小范围。门槛只能上调；不得通过忽略正常生产行、无断言调用或删除防御代码凑数字。
 - Shell/CMD 包装器：帮助、参数与退出状态、档位保存/复用、能力预检、卸载和备份保留等公开行为；不拿包装器逐行覆盖率冒充安全性。
 - Node.js：Windows 全局扩展脚本与 macOS 策略一致。
 - PowerShell 5.1：Windows 三档用途、安装/卸载、自动更新关闭、远程订阅清单、安全更新前后检查、嵌套配置差异、恢复校验和事务恢复。
-- 合同测试：公开文件、Patch/Diagnostics、AdGuard 兼容路径、配置历史、安全更新、Sub Agent 边界、Windows Computer Use 条件、双平台分流验证、策略生成、平台边界和 CI 配置。
+- 合同测试：公开文件、Patch/Diagnostics、AdGuard 兼容路径、配置历史、安全更新、Sub Agent 边界、Windows Computer Use 条件、双平台分流验证、策略生成、平台边界和 CI 配置；全部公开命令的 JSON v1 必须保持单对象输出、退出码一致、稳定 `code`/`operation`、规定字段类型和脱敏边界，默认中文输出不变。
 - 语法与格式：Ruby、JavaScript、Shell、PowerShell、策略同步和 `git diff --check`。
 
 ## 必须持续防止
