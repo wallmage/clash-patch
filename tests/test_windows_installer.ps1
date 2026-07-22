@@ -7,6 +7,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 $installer = Join-Path (Join-Path $root "clash-patch/scripts") "install_windows.ps1"
 $uninstaller = Join-Path (Join-Path $root "clash-patch/scripts") "uninstall_windows.ps1"
+$routeVerifier = Join-Path (Join-Path $root "clash-patch/scripts/windows") "verify_routes.ps1"
 $sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("clash-patch-windows-test-" + [System.Guid]::NewGuid().ToString("N"))
 $onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 $previousUsageProfile = $env:CLASH_PATCH_USAGE_PROFILE
@@ -18,6 +19,14 @@ $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($installer, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count -gt 0) { throw ($parseErrors | Out-String) }
+$routeTokens = $null
+$routeParseErrors = $null
+$routeAst = [System.Management.Automation.Language.Parser]::ParseFile($routeVerifier, [ref]$routeTokens, [ref]$routeParseErrors)
+if ($routeParseErrors.Count -gt 0) { throw ($routeParseErrors | Out-String) }
+$routeAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Find-Group"
+}, $true) | ForEach-Object { . ([scriptblock]::Create($_.Extent.Text)) }
 $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) | ForEach-Object {
     . ([scriptblock]::Create($_.Extent.Text))
 }
@@ -170,14 +179,61 @@ items:
     try { Set-RemoteSubscriptionAutoUpdateDisabled "items: [{ type: remote }]`n" | Out-Null } catch { $flowProfilesRejected = $true }
     Assert-True $flowProfilesRejected "inline profiles list was modified instead of rejected"
 
+    $safeUpdateCase = Join-Path $sandbox "safe-update-case"
+    $safeUpdateProfiles = Join-Path $safeUpdateCase "profiles"
+    New-Item -ItemType Directory -Path $safeUpdateProfiles -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $safeUpdateCase "profiles.yaml"), $profilesIndexInput)
+    $firstSafeOriginal = "proxies: []`nrules: []`n"
+    $secondSafeOriginal = "proxies: []`nproxy-groups: []`n"
+    [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), $firstSafeOriginal)
+    [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), $secondSafeOriginal)
+    [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "L-local.yaml"), "local: true`n")
+    $snapshotResult = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
+    Assert-True ($snapshotResult.ExitCode -eq 0) "safe update snapshot failed: $($snapshotResult.Output)"
+    $safeBackups = @(Get-ChildItem -LiteralPath (Join-Path $safeUpdateCase "clash-patch-backups") -File | Where-Object { $_.Name -like "*--pre-update--*" })
+    Assert-True ($safeBackups.Count -eq 2) "snapshot did not back up exactly the two remote subscriptions"
+    [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), "changed: true`n")
+    [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), "first: true`n---`nsecond: true`n")
+    $verifyResult = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-VerifySafeUpdate", "-MihomoPath", $fakeCore)
+    Assert-True ($verifyResult.ExitCode -eq 1) "invalid safe update was accepted"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-first.yaml") -Raw) -eq $firstSafeOriginal) "failed safe update did not restore first remote subscription"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-second.yml") -Raw) -eq $secondSafeOriginal) "failed safe update did not restore second remote subscription"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json"))) "completed rollback left a reusable stale safe-update manifest"
+
+    $concurrentTarget = Join-Path $safeUpdateProfiles "concurrent.yaml"
+    $concurrentBackup = Join-Path $safeUpdateProfiles "concurrent.backup"
+    [System.IO.File]::WriteAllText($concurrentTarget, "observed: true`n")
+    [System.IO.File]::WriteAllText($concurrentBackup, "before: true`n")
+    $observedHashes = @{ $concurrentTarget = (Get-FileSha256 $concurrentTarget) }
+    [System.IO.File]::WriteAllText($concurrentTarget, "newer: true`n")
+    $concurrentRecovery = [pscustomobject]@{
+        File = "concurrent.yaml"
+        TargetPath = $concurrentTarget
+        BackupPath = $concurrentBackup
+        BeforeSha256 = (Get-FileSha256 $concurrentBackup)
+    }
+    $concurrentRestore = Restore-SafeUpdateFiles @($concurrentRecovery) $observedHashes
+    Assert-True ($concurrentRestore.Conflicts.Count -eq 1) "safe update rollback did not detect a concurrent subscription change"
+    Assert-True ((Get-Content -LiteralPath $concurrentTarget -Raw) -eq "newer: true`n") "safe update rollback overwrote a concurrent subscription change"
+
     $beforeComparison = "dns:`n  nameserver:`n    - https://old-secret.invalid/dns-query`nrules:`n  - MATCH,OldSecret`nipv6: true`n"
     $afterComparison = "dns:`n  nameserver:`n    - https://new-secret.invalid/dns-query`nrules:`n  - MATCH,NewSecret`n  - GEOSITE,CN,DIRECT`ninvalid-key: kept`n"
     $changedFields = @(Get-RedactedYamlChangedPaths $beforeComparison $afterComparison)
-    Assert-True ($changedFields -contains "dns") "Windows comparison did not identify the dns section"
+    Assert-True ($changedFields -contains "dns.nameserver") "Windows comparison did not identify dns.nameserver"
     Assert-True ($changedFields -contains "rules") "Windows comparison did not identify the rules section"
     Assert-True ($changedFields -contains "ipv6") "Windows comparison did not identify a removed field"
     Assert-True ($changedFields -contains "invalid-key") "Windows comparison did not identify an added field"
     Assert-True (-not (($changedFields -join " ").Contains("Secret"))) "Windows comparison exposed a configuration value"
+    $arrayBefore = "proxies:`n  - name: SecretOne`n    type: ss`n  - name: SecretTwo`n    type: vmess`n"
+    $arrayAfter = "proxies:`n  - name: SecretOne`n    type: ss`n  - name: SecretTwo`n    type: trojan`n"
+    $arrayChanges = @(Get-RedactedYamlChangedPaths $arrayBefore $arrayAfter)
+    Assert-True ($arrayChanges -contains "proxies") "Windows comparison did not safely summarize a changed mapping array"
+    Assert-True (-not (($arrayChanges -join " ").Contains("Secret"))) "Windows array comparison exposed a configuration value"
+    $routeGroups = [pscustomobject]@{
+        "Proxy" = [pscustomobject]@{ type = "Selector"; now = "Taiwan" }
+        "🤖 AI · Clash Patch" = [pscustomobject]@{ type = "Selector"; now = "Taiwan" }
+    }
+    Assert-True ((Find-Group $routeGroups @("AI") "" "AI 分组") -eq "🤖 AI · Clash Patch") "Windows route verifier did not recognize its managed AI group"
 
     Assert-True (Test-MihomoVersionText "Mihomo Meta v1.19.27") "minimum Mihomo version was rejected"
     Assert-True (-not (Test-MihomoVersionText "Mihomo Meta v1.19.26")) "old Mihomo version was accepted"

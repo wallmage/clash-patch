@@ -20,6 +20,7 @@ class SkillContractTest < Minitest::Test
     clash-patch/scripts/uninstall_windows.cmd
     clash-patch/scripts/macos/patch_profiles.rb
     clash-patch/scripts/macos/verify_routes.rb
+    clash-patch/scripts/windows/verify_routes.ps1
     clash-patch/scripts/windows/clash_verge_global.js
     .github/workflows/test.yml
     tests/fixtures/main_group_cases.json
@@ -202,6 +203,59 @@ class SkillContractTest < Minitest::Test
     assert_includes policy, "只有充分反证"
   end
 
+  def test_long_read_only_investigations_can_use_safe_parallel_subagents
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+
+    [skill, policy, design].each do |document|
+      assert_includes document, "Sub Agent"
+      assert_includes document, "超过 10 分钟"
+    end
+    assert_includes policy, "只读证据"
+    assert_includes policy, "统一时间窗"
+    assert_includes policy, "只有一个界面操作者"
+    assert_includes policy, "只有一个主动流量生成者"
+    assert_includes policy, "写入、更新、恢复和最终判断"
+    assert_includes policy, "主代理串行完成"
+  end
+
+  def test_computer_use_rules_cover_windows_without_overstating_availability
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+
+    [skill, policy, design].each do |document|
+      assert_includes document, "Windows Computer Use"
+      assert_includes document, "当前会话"
+      assert_includes document, "前台桌面"
+    end
+    assert_includes policy, "保持解锁"
+    assert_includes policy, "不能操作 UAC"
+    assert_includes policy, "优先使用脚本"
+    assert_includes policy, "2026-07-09"
+  end
+
+  def test_patch_runtime_route_verifiers_exist_on_both_platforms
+    mac_verifier = File.read(File.join(SKILL, "scripts/macos/verify_routes.rb"))
+    windows_verifier = File.read(File.join(SKILL, "scripts/windows/verify_routes.ps1"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+
+    [mac_verifier, windows_verifier].each do |source|
+      assert_includes source, "Google"
+      assert_includes source, "OpenAI"
+      assert_includes source, "Anthropic"
+      assert_includes source, "Claude"
+      assert_includes source, "/connections"
+      assert_includes source, "/proxies"
+      assert_includes source, "DIRECT"
+    end
+    assert_includes policy, "verify_routes.ps1"
+    assert_includes mac_verifier, '!chains.include?("DIRECT")'
+    assert_includes windows_verifier, '$chains -notcontains "DIRECT"'
+    assert_includes windows_verifier, 'type -eq "Selector"'
+  end
+
   def test_diagnostics_separates_clues_from_conclusions
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
 
@@ -334,6 +388,7 @@ class SkillContractTest < Minitest::Test
     assert_includes patcher, "--disable-subscription-auto-update"
     assert_includes installer, "--disable-subscription-auto-update"
     assert_includes File.read(File.join(SKILL, "scripts/install_windows.ps1")), "allow_auto_update"
+    assert_includes File.read(File.join(SKILL, "scripts/install_windows.ps1")), "VerifySafeUpdate"
     [readme, skill, policy, design].each do |document|
       assert_includes document, "不依赖 Computer Use"
     end
@@ -698,6 +753,7 @@ class SkillContractTest < Minitest::Test
 
     assert_operator mac_install.index('id -u'), :<, mac_install.index("\n  save_profile\n")
     assert_operator mac_install.index('if [ "$SAFE_UPDATE" -eq 0 ] && [ "$USAGE_PROFILE" -ne 3 ]'), :<, mac_install.index('core_status=')
+    assert_operator mac_install.index('core_status='), :<, mac_install.index('--disable-subscription-auto-update')
     assert_operator mac_install.index('plutil -extract Label'), :<, mac_install.index('launchctl bootout')
     assert_operator mac_install.index('ProgramArguments.0'), :<, mac_install.index('launchctl bootout')
     assert_operator mac_install.index('ProgramArguments.1'), :<, mac_install.index('launchctl bootout')

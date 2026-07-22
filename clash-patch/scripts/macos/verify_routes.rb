@@ -77,13 +77,19 @@ module ClashRouteVerifier
     return false unless proxies.is_a?(Hash)
 
     expected = { main: main_group, ai: ai_group }
-    output.puts "主代理组：#{ClashPatch.safe_label(main_group)} → #{ClashPatch.safe_label(proxies.dig(main_group, 'now'))}"
-    output.puts "AI 分组：#{ClashPatch.safe_label(ai_group)} → #{ClashPatch.safe_label(proxies.dig(ai_group, 'now'))}"
+    selections = {
+      main: proxies.dig(main_group, "now").to_s,
+      ai: proxies.dig(ai_group, "now").to_s
+    }
+    return false if selections.values.any? { |selection| selection.empty? || selection == "DIRECT" }
+
+    output.puts "主代理组：#{ClashPatch.safe_label(main_group)} → #{ClashPatch.safe_label(selections.fetch(:main))}"
+    output.puts "AI 分组：#{ClashPatch.safe_label(ai_group)} → #{ClashPatch.safe_label(selections.fetch(:ai))}"
 
     checks = TARGETS.map do |label, url, kind, host_pattern|
       connection = observe_connection(socket, url, host_pattern)
       chains = Array(connection && connection["chains"])
-      ok = chains.include?(expected.fetch(kind))
+      ok = !chains.include?("DIRECT") && chains.include?(expected.fetch(kind)) && chains.include?(selections.fetch(kind))
       selected = chains.first
       output.puts "#{label}：#{ok ? '通过' : '失败'}（#{ClashPatch.safe_label(selected)}）"
       ok

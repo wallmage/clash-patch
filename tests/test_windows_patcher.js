@@ -8,6 +8,7 @@ const enginePath = path.join(root, 'clash-patch/scripts/windows/clash_verge_glob
 const policyPath = path.join(root, 'clash-patch/references/policy.json');
 const installerPath = path.join(root, 'clash-patch/scripts/install_windows.ps1');
 const uninstallerPath = path.join(root, 'clash-patch/scripts/uninstall_windows.ps1');
+const routeVerifierPath = path.join(root, 'clash-patch/scripts/windows/verify_routes.ps1');
 const installWrapperPath = path.join(root, 'clash-patch/scripts/install_windows.cmd');
 const uninstallWrapperPath = path.join(root, 'clash-patch/scripts/uninstall_windows.cmd');
 const fixturePath = path.join(root, 'tests/fixtures/main_group_cases.json');
@@ -781,7 +782,7 @@ test('Windows engine contains no unused rule-identity helper', () => {
 });
 
 test('Windows PowerShell entry scripts have a UTF-8 BOM', () => {
-  for (const entry of [installerPath, uninstallerPath]) {
+  for (const entry of [installerPath, uninstallerPath, routeVerifierPath]) {
     assert.deepEqual([...fs.readFileSync(entry).subarray(0, 3)], [0xef, 0xbb, 0xbf], entry);
   }
 });

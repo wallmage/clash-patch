@@ -1,16 +1,19 @@
 require "json"
 require "minitest/autorun"
 require "socket"
+require "stringio"
 require "tmpdir"
 require "yaml"
 
 ROOT = File.expand_path("..", __dir__)
 PATCHER_PATH = File.join(ROOT, "clash-patch/scripts/macos/patch_profiles.rb")
+ROUTE_VERIFIER_PATH = File.join(ROOT, "clash-patch/scripts/macos/verify_routes.rb")
 POLICY_PATH = File.join(ROOT, "clash-patch/references/policy.json")
 MAIN_GROUP_FIXTURES = File.join(ROOT, "tests/fixtures/main_group_cases.json")
 PATCHER_AVAILABLE = File.file?(PATCHER_PATH) && File.file?(POLICY_PATH)
 
 require PATCHER_PATH if PATCHER_AVAILABLE
+require ROUTE_VERIFIER_PATH if File.file?(ROUTE_VERIFIER_PATH)
 
 class MacosPatcherTest < Minitest::Test
   def setup
@@ -753,6 +756,36 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_safe_update_tries_to_restore_every_profile_when_one_rollback_conflicts
+    Dir.mktmpdir do |directory|
+      targets = %w[first second third].map do |name|
+        path = File.join(directory, "#{name}.yaml")
+        File.write(path, YAML.dump(base_config.merge("subscription-marker" => "old-#{name}")))
+        { name: name, path: path, url: "https://subscriptions.invalid/#{name}" }
+      end
+      originals = targets.to_h { |target| [target.fetch(:path), File.binread(target.fetch(:path))] }
+      restore = lambda do |path, bytes|
+        next false if File.basename(path) == "second.yaml"
+
+        File.binwrite(path, bytes)
+        true
+      end
+
+      result = ClashPatch.stub(:replace_profile_bytes, restore) do
+        ClashPatch.safe_update_all(
+          targets: targets, policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 3,
+          fetcher: ->(target) { YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}")) },
+          validator: ->(_path) { true }, activation: ->(_items) { false }
+        )
+      end
+
+      assert_equal :rollback_failed, result.fetch(:status)
+      assert_equal originals.fetch(targets[0].fetch(:path)), File.binread(targets[0].fetch(:path))
+      assert_equal originals.fetch(targets[2].fetch(:path)), File.binread(targets[2].fetch(:path))
+      refute_equal originals.fetch(targets[1].fetch(:path)), File.binread(targets[1].fetch(:path))
+    end
+  end
+
   def test_refresh_during_validation_is_reloaded_before_write
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
@@ -1132,6 +1165,69 @@ class MacosPatcherTest < Minitest::Test
     end
 
     assert_equal({ "Main" => "Singapore" }, ClashPatch.runtime_selections(requester))
+  end
+
+  def test_route_verifier_rejects_direct_hidden_below_ai_selector
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
+      proxies = { "proxies" => {
+        "Main" => { "type" => "Selector", "now" => "Taiwan" },
+        "AI" => { "type" => "Selector", "now" => "Nested" }
+      } }
+      observations = [
+        { "chains" => ["Taiwan", "Main"] },
+        { "chains" => ["DIRECT", "Nested", "AI"] },
+        { "chains" => ["DIRECT", "Nested", "AI"] },
+        { "chains" => ["DIRECT", "Nested", "AI"] }
+      ]
+
+      ClashPatch.stub(:controller_socket, "socket") do
+        ClashRouteVerifier.stub(:active_profile, profile) do
+          ClashRouteVerifier.stub(:get_json, proxies) do
+            ClashRouteVerifier.stub(:observe_connection, ->(*_args) { observations.shift }) do
+              refute ClashRouteVerifier.run(output: StringIO.new)
+            end
+          end
+        end
+      end
+    end
+  end
+
+  def test_active_reload_fails_when_an_existing_selector_disappears
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config)
+      candidate = YAML.dump(base_config.merge("changed" => true))
+      File.binwrite(profile, candidate)
+      proxy_reads = 0
+      requester = lambda do |method, endpoint, _body|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          proxy_reads += 1
+          body = proxy_reads == 1 ? { "Main" => { "type" => "Selector", "now" => "Taiwan" } } : {}
+          [200, JSON.generate("proxies" => body)]
+        when ["PUT", "/configs?force=true"], ["POST", "/cache/fakeip/flush"], ["POST", "/cache/dns/flush"]
+          [204, ""]
+        when ["GET", "/configs"]
+          [200, JSON.generate("tun" => { "enable" => true })]
+        else
+          if method == "GET" && endpoint.start_with?("/dns/query?")
+            [200, JSON.generate("Status" => 0, "Answer" => [{ "data" => "203.0.113.1" }])]
+          else
+            [404, ""]
+          end
+        end
+      end
+
+      result = ClashPatch.activate_updated_profile(
+        { path: profile, rollback_bytes: original.b, patched_digest: Digest::SHA256.hexdigest(candidate.b) },
+        requester: requester, connectivity_checker: -> { true }
+      )
+
+      assert_equal :reload_failed_rolled_back, result.fetch(:status)
+      assert_equal original.b, File.binread(profile)
+    end
   end
 
   def test_failed_active_reload_restores_the_exact_original_profile

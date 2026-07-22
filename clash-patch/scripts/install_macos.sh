@@ -161,7 +161,7 @@ if [ ! -d "/Applications/ClashX Meta.app" ] && [ ! -d "$HOME/Applications/ClashX
   exit 4
 fi
 
-if [ "$PROFILE_SOURCE" != "saved" ]; then
+if [ "$PROFILE_SOURCE" != "saved" ] && [ "$USAGE_PROFILE" -ne 3 ]; then
   save_profile
   say "已保存用途档位 ${USAGE_PROFILE}。"
 fi
@@ -193,6 +193,21 @@ if [ "$SAFE_UPDATE" -eq 0 ] && [ "$USAGE_PROFILE" -ne 3 ]; then
   exit 0
 fi
 
+core_status=$(/usr/bin/ruby "$PATCHER_SOURCE" --print-core-status 2>/dev/null || true)
+if [ "$core_status" != "supported" ]; then
+  case "$core_status" in
+    too_old) say "Mihomo 内核版本过旧，需要 1.19.27 或更高版本。" ;;
+    timeout) say "Mihomo 内核检查超过 30 秒，未修改任何订阅。" ;;
+    *) say "没有找到可用的 Mihomo 内核，或无法确认版本。" ;;
+  esac
+  exit 8
+fi
+
+if [ "$PROFILE_SOURCE" != "saved" ] && [ "$USAGE_PROFILE" -eq 3 ]; then
+  save_profile
+  say "已保存用途档位 ${USAGE_PROFILE}。"
+fi
+
 if [ "$USAGE_PROFILE" -eq 3 ]; then
   if ! auto_update_result=$(/usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --disable-subscription-auto-update 2>&1); then
     say "无法自动关闭 ClashX Meta 的订阅自动更新；本次未修改任何订阅。"
@@ -203,16 +218,6 @@ if [ "$USAGE_PROFILE" -eq 3 ]; then
     already_disabled) say "订阅自动更新已经关闭。" ;;
     *) say "订阅自动更新回读结果异常；本次未修改任何订阅。"; exit 9 ;;
   esac
-fi
-
-core_status=$(/usr/bin/ruby "$PATCHER_SOURCE" --print-core-status 2>/dev/null || true)
-if [ "$core_status" != "supported" ]; then
-  case "$core_status" in
-    too_old) say "Mihomo 内核版本过旧，需要 1.19.27 或更高版本。" ;;
-    timeout) say "Mihomo 内核检查超过 30 秒，未修改任何订阅。" ;;
-    *) say "没有找到可用的 Mihomo 内核，或无法确认版本。" ;;
-  esac
-  exit 8
 fi
 
 /bin/mkdir -p "$BACKUP_DIR"

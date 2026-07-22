@@ -775,6 +775,7 @@ module ClashPatch
     Dir.children(root).select do |name|
       path = File.join(root, name)
       name.match?(/\A\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.\d{9}[+-]\d{4}--[a-z][a-z0-9-]{0,31}--[0-9a-f]{16}--.+\.backup\z/) &&
+        !name.include?("--preference--") &&
         File.file?(path) && !File.symlink?(path)
     end.sort.reverse
   end
@@ -1326,6 +1327,7 @@ module ClashPatch
         handle.fsync
       end
     rescue StandardError
+      rollback_failures = []
       handles.each do |item, handle|
         begin
           handle.rewind
@@ -1334,8 +1336,11 @@ module ClashPatch
           handle.flush
           handle.fsync
         rescue StandardError
-          nil
+          rollback_failures << item.fetch(:name)
         end
+      end
+      unless rollback_failures.empty?
+        return { status: :rollback_failed, failed_profile: rollback_failures.first, reason: :write_failed }
       end
       return { status: :aborted, failed_profile: "", reason: :write_failed }
     ensure
@@ -1349,12 +1354,19 @@ module ClashPatch
       false
     end
     unless activated
+      rollback_failures = []
       items.each do |item|
-        current = File.binread(File.realpath(item.fetch(:path)))
-        next if current == item.fetch(:original)
-        return { status: :rollback_failed, failed_profile: item.fetch(:name), reason: :activation_failed } unless current == item.fetch(:candidate)
-
-        replace_profile_bytes(item.fetch(:path), item.fetch(:original))
+        restored = begin
+          current = File.binread(File.realpath(item.fetch(:path)))
+          current == item.fetch(:original) ||
+            (current == item.fetch(:candidate) && replace_profile_bytes(item.fetch(:path), item.fetch(:original)))
+        rescue StandardError
+          false
+        end
+        rollback_failures << item.fetch(:name) unless restored
+      end
+      unless rollback_failures.empty?
+        return { status: :rollback_failed, failed_profile: rollback_failures.first, reason: :activation_failed }
       end
       return { status: :aborted, failed_profile: "", reason: :activation_failed }
     end
@@ -1594,7 +1606,7 @@ module ClashPatch
     healthy = !require_tun || tun_state(requester: requester) == :enabled
     after = healthy ? runtime_selections(requester) : nil
     healthy &&= after.is_a?(Hash)
-    healthy &&= before.all? { |name, selected| !after.key?(name) || after[name] == selected }
+    healthy &&= before.all? { |name, selected| after.key?(name) && after[name] == selected }
     healthy &&= dns_runtime_healthy?(requester, "www.baidu.com")
     healthy &&= dns_runtime_healthy?(requester, "www.google.com")
     healthy &&= connectivity_checker.call
@@ -1819,7 +1831,12 @@ module ClashPatch
       )
       if result[:status] == :updated
         puts "全部远程订阅已安全更新：#{result.fetch(:count)} 份。"
+        result.fetch(:profiles).each { |name| puts "已更新：#{safe_label(name)}" }
         return 0
+      end
+      if result[:status] == :rollback_failed
+        warn "安全更新失败，且至少一份订阅未能恢复；请立即按备份记录处理。"
+        return 1
       end
       warn "安全更新失败；全部订阅保持原样。"
       return 1

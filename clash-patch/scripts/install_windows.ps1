@@ -4,6 +4,7 @@
     [int]$UsageProfile = 0,
     [switch]$ShowUsageProfile,
     [switch]$SnapshotProfiles,
+    [switch]$VerifySafeUpdate,
     [switch]$ListBackups,
     [string]$CompareBackup = "",
     [string]$RestoreBackup = "",
@@ -253,39 +254,58 @@ function Get-YamlMappingEntry([string]$Line) {
     return [pscustomobject]@{ Key = $key; Value = $Matches[4] }
 }
 
-function Get-YamlTopLevelSectionFingerprints([string]$Text) {
+function Get-YamlPathFingerprints([string]$Text) {
     $lines = @(Split-YamlLines $Text)
-    $sections = @{}
-    $currentKey = $null
-    $currentLines = New-Object System.Collections.Generic.List[string]
-
-    function Save-CurrentSection {
-        if ($null -eq $currentKey) { return }
-        if ($sections.ContainsKey($currentKey)) { throw "YAML 中存在重复键：$currentKey。无法安全比较。" }
-        $sectionText = Join-YamlLines $currentLines.ToArray()
-        $sections[$currentKey] = Get-BytesSha256 (ConvertTo-Utf8Bytes $sectionText)
-        $currentLines.Clear()
-    }
+    $values = @{}
+    $stack = New-Object System.Collections.ArrayList
 
     foreach ($line in $lines) {
-        $entry = $null
-        if (-not [string]::IsNullOrWhiteSpace($line) -and -not $line.TrimStart().StartsWith("#") -and (Get-YamlIndent $line) -eq 0) {
-            $entry = Get-YamlMappingEntry $line
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith("#")) { continue }
+        if ($line -match "`t") { throw "YAML 使用了制表符缩进，无法安全比较。" }
+        $indent = Get-YamlIndent $line
+        while ($stack.Count -gt 0 -and [int]$stack[$stack.Count - 1].Indent -ge $indent) {
+            $stack.RemoveAt($stack.Count - 1)
         }
-        if ($null -ne $entry) {
-            Save-CurrentSection
-            $currentKey = [string]$entry.Key
+        $trimmed = $line.TrimStart()
+        if ($trimmed.StartsWith("- ")) {
+            if ($stack.Count -eq 0) { continue }
+            $path = [string]$stack[$stack.Count - 1].Path
+            $values[$path].Add($trimmed)
+            [void]$stack.Add([pscustomobject]@{ Indent = $indent; Path = $path; Sequence = $true })
+            continue
         }
-        if ($null -ne $currentKey) { $currentLines.Add($line) }
+        if ($stack.Count -gt 0 -and $stack[$stack.Count - 1].Sequence) {
+            $values[[string]$stack[$stack.Count - 1].Path].Add($trimmed)
+            continue
+        }
+        $entry = Get-YamlMappingEntry $trimmed
+        if ($null -eq $entry) {
+            if ($stack.Count -eq 0) { continue }
+            $path = [string]$stack[$stack.Count - 1].Path
+            if (-not $values.ContainsKey($path)) { $values[$path] = New-Object System.Collections.Generic.List[string] }
+            $values[$path].Add($trimmed)
+            continue
+        }
+        $parent = if ($stack.Count -eq 0) { "" } else { [string]$stack[$stack.Count - 1].Path }
+        $path = if ([string]::IsNullOrWhiteSpace($parent)) { [string]$entry.Key } else { "$parent.$($entry.Key)" }
+        if ($values.ContainsKey($path)) { throw "YAML 中存在重复键：$path。无法安全比较。" }
+        $values[$path] = New-Object System.Collections.Generic.List[string]
+        $value = ($entry.Value -replace '\s+#.*$', '').Trim()
+        if (-not [string]::IsNullOrWhiteSpace($value)) { $values[$path].Add($value) }
+        [void]$stack.Add([pscustomobject]@{ Indent = $indent; Path = $path; Sequence = $false })
     }
-    Save-CurrentSection
-    return $sections
+
+    $fingerprints = @{}
+    foreach ($path in $values.Keys) {
+        $fingerprints[$path] = Get-BytesSha256 (ConvertTo-Utf8Bytes (($values[$path].ToArray()) -join "`n"))
+    }
+    return $fingerprints
 }
 
 function Get-RedactedYamlChangedPaths([string]$Before, [string]$After) {
     if ($Before -ceq $After) { return @() }
-    $beforeSections = Get-YamlTopLevelSectionFingerprints $Before
-    $afterSections = Get-YamlTopLevelSectionFingerprints $After
+    $beforeSections = Get-YamlPathFingerprints $Before
+    $afterSections = Get-YamlPathFingerprints $After
     $keys = @($beforeSections.Keys) + @($afterSections.Keys) | Sort-Object -Unique
     $changes = @($keys | Where-Object {
         -not $beforeSections.ContainsKey($_) -or
@@ -512,31 +532,59 @@ function Get-RemoteSubscriptionProfileItems([string[]]$Lines) {
         $start = $starts[$position]
         $finish = if ($position + 1 -lt $starts.Count) { $starts[$position + 1].Index } else { $itemsEnd }
         $fieldIndent = $start.Indent + 2
-        $typeValues = @()
+        $fieldValues = @{}
         $inlineEntry = Get-YamlMappingEntry $start.Inline
-        if ($null -ne $inlineEntry -and $inlineEntry.Key -eq "type") { $typeValues += $inlineEntry.Value }
+        if ($null -ne $inlineEntry) { $fieldValues[[string]$inlineEntry.Key] = @([string]$inlineEntry.Value) }
         $optionIndexes = @()
         for ($i = $start.Index + 1; $i -lt $finish; $i++) {
             if ([string]::IsNullOrWhiteSpace($Lines[$i]) -or $Lines[$i].TrimStart().StartsWith("#")) { continue }
             if ((Get-YamlIndent $Lines[$i]) -ne $fieldIndent) { continue }
             $entry = Get-YamlMappingEntry $Lines[$i]
             if ($null -eq $entry) { continue }
-            if ($entry.Key -eq "type") { $typeValues += $entry.Value }
+            if (-not $fieldValues.ContainsKey([string]$entry.Key)) { $fieldValues[[string]$entry.Key] = @() }
+            $fieldValues[[string]$entry.Key] += [string]$entry.Value
             if ($entry.Key -eq "option") { $optionIndexes += $i }
         }
+        $typeValues = @($fieldValues["type"])
         if ($typeValues.Count -ne 1) { throw "profiles.yaml 的订阅项目缺少唯一 type。" }
         if ($optionIndexes.Count -gt 1) { throw "profiles.yaml 的订阅项目存在重复 option。" }
         $typeValue = (($typeValues[0] -replace '\s+#.*$', '').Trim()).Trim("'`"")
+        $uidValues = @($fieldValues["uid"])
+        $nameValues = @($fieldValues["name"])
+        $uidValue = if ($uidValues.Count -eq 1) { (($uidValues[0] -replace '\s+#.*$', '').Trim()).Trim("'`"") } else { "" }
+        $nameValue = if ($nameValues.Count -eq 1) { (($nameValues[0] -replace '\s+#.*$', '').Trim()).Trim("'`"") } else { "" }
+        if ($typeValue -eq "remote" -and ($uidValues.Count -ne 1 -or $uidValue -notmatch '^[A-Za-z0-9._-]+$')) {
+            throw "profiles.yaml 的远程订阅缺少安全且唯一的 uid。"
+        }
         $items += [pscustomobject]@{
             Start = $start.Index
             End = $finish
             ItemIndent = $start.Indent
             FieldIndent = $fieldIndent
             Type = $typeValue
+            Uid = $uidValue
+            Name = $nameValue
             OptionIndex = $(if ($optionIndexes.Count -eq 1) { [int]$optionIndexes[0] } else { -1 })
         }
     }
     return @($items)
+}
+
+function Get-RemoteSubscriptionTargets([string]$ProfilesIndexText, [string]$Directory) {
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { throw "找不到订阅目录。" }
+    $items = @(Get-RemoteSubscriptionProfileItems @(Split-YamlLines $ProfilesIndexText) | Where-Object { $_.Type -eq "remote" })
+    if ($items.Count -eq 0) { throw "没有可更新的远程订阅。" }
+    $targets = @()
+    foreach ($item in $items) {
+        $matches = @(
+            (Join-Path $Directory ($item.Uid + ".yaml")),
+            (Join-Path $Directory ($item.Uid + ".yml"))
+        ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
+        if ($matches.Count -ne 1) { throw "远程订阅无法对应到唯一配置文件：$($item.Uid)。" }
+        $targets += [pscustomobject]@{ Uid = $item.Uid; Name = $item.Name; Path = $matches[0] }
+    }
+    if (@($targets.Path | Sort-Object -Unique).Count -ne $targets.Count) { throw "多个远程订阅对应到同一配置文件。" }
+    return @($targets)
 }
 
 function Set-RemoteSubscriptionAutoUpdateDisabled([string]$Text) {
@@ -945,6 +993,7 @@ $vergePath = Join-Path $AppHome "verge.yaml"
 $configPath = Join-Path $AppHome "config.yaml"
 $statePath = Join-Path $AppHome "clash-patch-install-state.json"
 $usageStatePath = Join-Path $AppHome "clash-patch-usage-profile.json"
+$safeUpdateStatePath = Join-Path $AppHome "clash-patch-safe-update.json"
 $targetScript = Join-Path $profilesDirectory "Script.js"
 
 function Get-BackupTarget([string]$BackupId) {
@@ -956,7 +1005,7 @@ function Get-BackupTarget([string]$BackupId) {
     if ($BackupId -notmatch '--([0-9a-f]{16})--(.+)\.backup$') { throw "备份编号无效。" }
     $key = $Matches[1]
     $basename = $Matches[2]
-    $candidates = @($targetScript, $profilesIndexPath, $vergePath, $configPath, $statePath)
+    $candidates = @($targetScript, $profilesIndexPath, $vergePath, $configPath, $statePath, $usageStatePath, $safeUpdateStatePath)
     if (Test-Path -LiteralPath $profilesDirectory -PathType Container) {
         $candidates += @(Get-ChildItem -LiteralPath $profilesDirectory -File | ForEach-Object { $_.FullName })
     }
@@ -969,14 +1018,158 @@ function Get-BackupTarget([string]$BackupId) {
     return [pscustomobject]@{ BackupPath = $backupPath; TargetPath = $matches[0] }
 }
 
-if ($SnapshotProfiles) {
-    if (-not (Test-Path -LiteralPath $profilesDirectory -PathType Container)) { throw "找不到订阅目录。" }
-    $profiles = @(Get-ChildItem -LiteralPath $profilesDirectory -File | Where-Object { $_.Extension -match '^\.ya?ml$' })
-    foreach ($profile in $profiles) {
-        Backup-InitialOnce $profile.FullName $backupRoot | Out-Null
-        Backup-Versioned $profile.FullName $backupRoot "pre-update" | Out-Null
+function Test-RestoreCandidate([string]$TargetPath, [byte[]]$Bytes) {
+    $leaf = Split-Path -Leaf $TargetPath
+    $extension = [System.IO.Path]::GetExtension($TargetPath).ToLowerInvariant()
+    $text = [System.Text.Encoding]::UTF8.GetString($Bytes)
+    if ($extension -eq ".json") {
+        $null = $text | ConvertFrom-Json
+        return
     }
-    Write-Info "已为 $($profiles.Count) 份订阅创建安全更新前备份。"
+    if ($extension -notin @(".yaml", ".yml")) { return }
+
+    Test-GeneratedYaml $text $leaf | Out-Null
+    if ($TargetPath -eq $profilesIndexPath -or $TargetPath -eq $vergePath) { return }
+    $core = Find-MihomoCore $MihomoPath
+    Test-MihomoCandidate $core $text (Split-Path -Parent $TargetPath)
+}
+
+function Get-SafeUpdateRecoveryItems([object]$Manifest, [string]$Directory, [string]$BackupDirectory) {
+    $items = @()
+    foreach ($item in @($Manifest.Profiles)) {
+        $uid = [string]$item.Uid
+        $file = [string]$item.File
+        $backup = [string]$item.Backup
+        $beforeSha = ([string]$item.BeforeSha256).ToLowerInvariant()
+        if ($uid -notmatch '^[A-Za-z0-9._-]+$' -or $file -notin @("$uid.yaml", "$uid.yml")) {
+            throw "安全更新准备记录包含无效订阅标识。"
+        }
+        if ($backup -ne (Split-Path -Leaf $backup) -or $backup -notlike "*.backup" -or $beforeSha -notmatch '^[0-9a-f]{64}$') {
+            throw "安全更新准备记录包含无效备份信息。"
+        }
+        $targetPath = Join-Path $Directory $file
+        $expectedSuffix = "--$(Get-PathKey $targetPath)--$file.backup"
+        if (-not $backup.EndsWith($expectedSuffix)) { throw "安全更新准备记录中的备份与订阅不匹配。" }
+        $backupPath = Join-Path $BackupDirectory $backup
+        if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf) -or (Get-FileSha256 $backupPath) -ne $beforeSha) {
+            throw "安全更新前备份缺失或哈希不匹配。"
+        }
+        $items += [pscustomobject]@{ Uid = $uid; File = $file; TargetPath = $targetPath; BackupPath = $backupPath; BeforeSha256 = $beforeSha }
+    }
+    if ($items.Count -eq 0 -or @($items.TargetPath | Sort-Object -Unique).Count -ne $items.Count) {
+        throw "安全更新准备记录中的订阅清单无效。"
+    }
+    return @($items)
+}
+
+function Restore-SafeUpdateFiles([object[]]$RecoveryItems, [hashtable]$ObservedHashes) {
+    $failures = @()
+    $conflicts = @()
+    foreach ($recovery in $RecoveryItems) {
+        try {
+            if (-not $ObservedHashes.ContainsKey($recovery.TargetPath) -or -not (Test-Path -LiteralPath $recovery.TargetPath -PathType Leaf)) {
+                $conflicts += $recovery.File
+                continue
+            }
+            $backupBytes = [System.IO.File]::ReadAllBytes($recovery.BackupPath)
+            $stream = [System.IO.File]::Open(
+                $recovery.TargetPath,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::ReadWrite,
+                [System.IO.FileShare]::None
+            )
+            try {
+                $hasher = [System.Security.Cryptography.SHA256]::Create()
+                try { $currentSha = ([System.BitConverter]::ToString($hasher.ComputeHash($stream))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
+                if ($currentSha -ne [string]$ObservedHashes[$recovery.TargetPath]) {
+                    $conflicts += $recovery.File
+                    continue
+                }
+                $stream.Position = 0
+                $stream.SetLength(0)
+                $stream.Write($backupBytes, 0, $backupBytes.Length)
+                $stream.Flush($true)
+                $stream.Position = 0
+                $hasher = [System.Security.Cryptography.SHA256]::Create()
+                try { $restoredSha = ([System.BitConverter]::ToString($hasher.ComputeHash($stream))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
+                if ($restoredSha -ne $recovery.BeforeSha256) { throw "恢复后哈希不匹配。" }
+            } finally {
+                $stream.Dispose()
+            }
+        } catch {
+            $failures += $recovery.File
+        }
+    }
+    return [pscustomobject]@{ Failures = @($failures); Conflicts = @($conflicts) }
+}
+
+if ($SnapshotProfiles) {
+    if (Test-Path -LiteralPath $safeUpdateStatePath -PathType Leaf) {
+        throw "发现尚未验收的安全更新；请先运行 -VerifySafeUpdate，不能覆盖更新前清单。"
+    }
+    if (-not (Test-Path -LiteralPath $profilesIndexPath -PathType Leaf)) { throw "找不到远程订阅清单。" }
+    $indexText = Get-Content -LiteralPath $profilesIndexPath -Raw -Encoding UTF8
+    $profiles = @(Get-RemoteSubscriptionTargets $indexText $profilesDirectory)
+    $manifestItems = @()
+    foreach ($profile in $profiles) {
+        Backup-InitialOnce $profile.Path $backupRoot | Out-Null
+        $backup = Backup-Versioned $profile.Path $backupRoot "pre-update"
+        $manifestItems += [ordered]@{
+            Uid = $profile.Uid
+            File = (Split-Path -Leaf $profile.Path)
+            BeforeSha256 = (Get-FileSha256 $profile.Path)
+            Backup = (Split-Path -Leaf $backup)
+        }
+    }
+    $manifest = [ordered]@{ Version = 1; CreatedAt = [DateTimeOffset]::Now.ToString("o"); Profiles = $manifestItems }
+    $manifestBytes = ConvertTo-Utf8Bytes (($manifest | ConvertTo-Json -Depth 5) + "`r`n")
+    Write-BytesAtomic $safeUpdateStatePath $manifestBytes
+    Write-Info "已核对远程清单，并为 $($profiles.Count) 份订阅创建安全更新前备份。"
+    foreach ($profile in $profiles) { Write-Info ("待更新：" + $(if ([string]::IsNullOrWhiteSpace($profile.Name)) { $profile.Uid } else { $profile.Name })) }
+    exit 0
+}
+
+if ($VerifySafeUpdate) {
+    if (-not (Test-Path -LiteralPath $safeUpdateStatePath -PathType Leaf)) { throw "没有找到本次安全更新的准备记录。" }
+    $manifest = Get-Content -LiteralPath $safeUpdateStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([int]$manifest.Version -ne 1 -or @($manifest.Profiles).Count -eq 0) { throw "安全更新准备记录无效。" }
+    $recoveryItems = @(Get-SafeUpdateRecoveryItems $manifest $profilesDirectory $backupRoot)
+    $validated = @()
+    $observedCurrentHashes = @{}
+    try {
+        foreach ($recovery in $recoveryItems) {
+            if (-not (Test-Path -LiteralPath $recovery.TargetPath -PathType Leaf)) { throw "更新后的订阅文件缺失。" }
+            $observedCurrentHashes[$recovery.TargetPath] = Get-FileSha256 $recovery.TargetPath
+        }
+        $indexText = Get-Content -LiteralPath $profilesIndexPath -Raw -Encoding UTF8
+        $currentTargets = @(Get-RemoteSubscriptionTargets $indexText $profilesDirectory)
+        if ($currentTargets.Count -ne $recoveryItems.Count) { throw "远程订阅清单在更新期间发生变化。" }
+        $core = Find-MihomoCore $MihomoPath
+        foreach ($item in @($manifest.Profiles)) {
+            $target = @($currentTargets | Where-Object { $_.Uid -eq [string]$item.Uid -and (Split-Path -Leaf $_.Path) -eq [string]$item.File })
+            if ($target.Count -ne 1) { throw "远程订阅清单在更新期间发生变化。" }
+            $text = Get-Content -LiteralPath $target[0].Path -Raw -Encoding UTF8
+            Test-GeneratedYaml $text ([string]$item.File) | Out-Null
+            Test-MihomoCandidate $core $text $profilesDirectory
+            $validated += [pscustomobject]@{ Target = $target[0]; Manifest = $item }
+        }
+        $savedProfile = Get-SavedUsageProfile $usageStatePath
+        if ($savedProfile -eq 3) { Assert-RemoteSubscriptionAutoUpdateDisabled $indexText | Out-Null }
+    } catch {
+        $restoreResult = Restore-SafeUpdateFiles $recoveryItems $observedCurrentHashes
+        if ($restoreResult.Conflicts.Count -gt 0) {
+            throw "更新验收失败；检测到订阅同时发生变化，未覆盖新内容：$($restoreResult.Conflicts -join '、')。安全更新记录已保留。"
+        }
+        if ($restoreResult.Failures.Count -gt 0) { throw "更新验收失败，且部分订阅未能恢复：$($restoreResult.Failures -join '、')。安全更新记录已保留。" }
+        Remove-Item -LiteralPath $safeUpdateStatePath -Force
+        throw "更新验收失败，全部订阅文件已恢复到更新前版本。"
+    }
+    foreach ($entry in $validated) {
+        $changed = (Get-FileSha256 $entry.Target.Path) -ne [string]$entry.Manifest.BeforeSha256
+        Write-Info ($(if ($changed) { "已更新并通过检查：" } else { "内容未变化并通过检查：" }) + $(if ([string]::IsNullOrWhiteSpace($entry.Target.Name)) { $entry.Target.Uid } else { $entry.Target.Name }))
+    }
+    Remove-Item -LiteralPath $safeUpdateStatePath -Force
+    Write-Info "全部远程订阅已逐份通过 YAML 与 Mihomo 检查。"
     exit 0
 }
 
@@ -1022,9 +1215,13 @@ if (-not [string]::IsNullOrWhiteSpace($RestoreBackup)) {
     if ($currentHash -ne $ExpectedCurrentSha256) { throw "当前配置已变化，拒绝覆盖。" }
     $restoreBytes = [System.IO.File]::ReadAllBytes($resolved.BackupPath)
     $currentBytes = [System.IO.File]::ReadAllBytes($resolved.TargetPath)
+    Test-RestoreCandidate $resolved.TargetPath $restoreBytes
     Backup-Versioned $resolved.TargetPath $backupRoot "pre-restore" | Out-Null
     try {
         Write-BytesAtomic $resolved.TargetPath $restoreBytes
+        if ((Get-FileSha256 $resolved.TargetPath) -ne (Get-BytesSha256 $restoreBytes)) {
+            throw "恢复后的文件与已验证备份不一致。"
+        }
     } catch {
         Write-BytesAtomic $resolved.TargetPath $currentBytes
         throw
@@ -1070,7 +1267,7 @@ if ($resolvedUsageProfile -notin @(1, 2, 3)) {
     [Console]::Error.WriteLine("[Clash 补丁] 用途档位无效，只能是 1、2 或 3。")
     exit 64
 }
-if ($profileSource -ne "saved") {
+if ($profileSource -ne "saved" -and $resolvedUsageProfile -ne 3) {
     try {
         Save-UsageProfile $usageStatePath $resolvedUsageProfile
         Write-Info "已保存用途档位 $resolvedUsageProfile。"
@@ -1102,6 +1299,10 @@ try {
     $clientRunning = Test-ClashVergeRunning
     $corePath = Find-MihomoCore $MihomoPath
     Test-MihomoVersion $corePath | Out-Null
+    if ($profileSource -ne "saved") {
+        Save-UsageProfile $usageStatePath $resolvedUsageProfile
+        Write-Info "已保存用途档位 $resolvedUsageProfile。"
+    }
     if (-not (Test-Path -LiteralPath $profilesIndexPath -PathType Leaf)) {
         throw "找不到 Clash Verge Rev 的 profiles.yaml，无法自动关闭订阅更新。"
     }
