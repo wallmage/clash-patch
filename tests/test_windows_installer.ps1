@@ -1920,8 +1920,11 @@ Test-MihomoCandidate $CorePath "proxies:`n  - name: fixture-private-marker" $Dir
                 Stop-Process -Id $candidateChild.Id -Force
                 $candidateChild.WaitForExit()
             }
-            Start-Sleep -Seconds 3
-            $candidateFiles = @(Get-ChildItem -LiteralPath $candidateDirectory -Filter ".clash-patch-validate-*.yaml" -File)
+            $candidateCleanupDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            do {
+                Start-Sleep -Milliseconds 100
+                $candidateFiles = @(Get-ChildItem -LiteralPath $candidateDirectory -Filter ".clash-patch-validate-*.yaml" -File)
+            } while ($candidateFiles.Count -gt 0 -and [DateTime]::UtcNow -lt $candidateCleanupDeadline)
             $candidateLeftBehind = $candidateFiles.Count -gt 0
             foreach ($candidateFile in $candidateFiles) {
                 Remove-Item -LiteralPath $candidateFile.FullName -Force
