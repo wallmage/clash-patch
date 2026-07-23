@@ -795,6 +795,23 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_atomic_backup_publication_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/install_windows/transaction.ps1",
+        "        [System.IO.File]::Move($temporary, $destination)\n",
+        "        [System.IO.File]::Copy($temporary, $destination)\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_windows_backups_are_published_only_after_complete_private_write"
+      )
+    end
+  end
+
   def test_windows_ambiguous_app_home_guard_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

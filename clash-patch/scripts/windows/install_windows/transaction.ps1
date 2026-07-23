@@ -194,6 +194,9 @@ function Backup-Versioned(
         }
     }
     if ([string]::IsNullOrWhiteSpace($destination)) { throw "无法生成唯一的备份编号。" }
+    $temporary = Join-Path $BackupRoot (
+        ".clash-patch-backup-" + [System.Guid]::NewGuid().ToString("N") + ".tmp"
+    )
     $sourceStream = $null
     $backupStream = $null
     $created = $false
@@ -201,7 +204,7 @@ function Backup-Versioned(
     $failure = $null
     try {
         $sourceStream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
-        $backupStream = [System.IO.File]::Open($destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $backupStream = [System.IO.File]::Open($temporary, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
         $created = $true
         $sourceStream.CopyTo($backupStream)
         $backupStream.Flush($true)
@@ -217,14 +220,17 @@ function Backup-Versioned(
     }
     if ($null -ne $failure) {
         if ($created -and $null -ne $createdBytes) {
-            Remove-VerifiedOwnedFile $destination $createdBytes
+            Remove-VerifiedOwnedFile $temporary $createdBytes
         }
         throw $failure
     }
     try {
-        Protect-BackupAcl $destination
+        Protect-BackupAcl $temporary
+        [System.IO.File]::Move($temporary, $destination)
     } catch {
-        Remove-VerifiedOwnedFile $destination $createdBytes
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-VerifiedOwnedFile $temporary $createdBytes
+        }
         throw
     }
     if ($WithMetadata) {

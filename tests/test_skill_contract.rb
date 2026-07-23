@@ -1310,6 +1310,7 @@ class SkillContractTest < Minitest::Test
       "Mihomo candidate privacy and cleanup after caller death",
       "Mihomo timeout terminates descendants",
       "SUBST AppHome lock alias",
+      "backup publication survives caller death",
       "duplicate transaction action field",
       "extended-path AppHome lock alias",
       "installer and uninstaller shared AppHome lock",
@@ -1341,6 +1342,7 @@ class SkillContractTest < Minitest::Test
       trailing-space
     ].sort
     expected_public_kill_markers = %w[
+      CLASH_PATCH_TEST_BACKUP_CRASH_READY
       CLASH_PATCH_TEST_PUBLIC_CRASH_READY
       CLASH_PATCH_TEST_RECOVERY_CRASH_READY
       CLASH_PATCH_TEST_RESTORE_CRASH_READY
@@ -1418,6 +1420,23 @@ class SkillContractTest < Minitest::Test
     ).force_encoding("UTF-8")
 
     assert_includes source, 'Assert-JavaScriptDoesNotBindMain $withoutDeclaration'
+  end
+
+  def test_windows_backups_are_published_only_after_complete_private_write
+    source = File.binread(
+      File.join(SKILL, "scripts/windows/install_windows/transaction.ps1")
+    ).force_encoding("UTF-8")
+    backup = source[/function Backup-Versioned\b.*?(?=^function |\z)/m]
+
+    refute_nil backup
+    assert_includes backup, '".clash-patch-backup-"'
+    assert_includes backup, '$backupStream.Flush($true)'
+    assert_includes backup, 'Protect-BackupAcl $temporary'
+    assert_includes backup, '[System.IO.File]::Move($temporary, $destination)'
+    assert_operator backup.index('$backupStream.Flush($true)'), :<,
+                    backup.index('[System.IO.File]::Move($temporary, $destination)')
+    assert_operator backup.index('Protect-BackupAcl $temporary'), :<,
+                    backup.index('[System.IO.File]::Move($temporary, $destination)')
   end
 
   def test_windows_default_app_home_rejects_multiple_existing_candidates

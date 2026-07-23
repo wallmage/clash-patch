@@ -2027,6 +2027,84 @@ Test-MihomoCandidate $CorePath "proxies:`n  - name: fixture-private-marker" $Dir
     [System.IO.File]::WriteAllBytes($emptyHashFile, [byte[]]@())
     Assert-True ((Get-FileSha256 $emptyHashFile) -eq "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") "empty content did not hash as the empty SHA-256"
     if ($onWindows) {
+        Invoke-DeferredProbe "backup publication survives caller death" {
+            $backupCrashPackageParent = Join-Path $sandbox "backup-crash-package"
+            New-Item -ItemType Directory -Path $backupCrashPackageParent -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $root "clash-patch") -Destination $backupCrashPackageParent -Recurse
+            $backupCrashPackage = Join-Path $backupCrashPackageParent "clash-patch"
+            $backupCrashInstaller = Join-Path (Join-Path $backupCrashPackage "scripts") "install_windows.ps1"
+            $backupCrashTransaction = Join-Path (Join-Path (Join-Path $backupCrashPackage "scripts") "windows/install_windows") "transaction.ps1"
+            $backupCrashTransactionText = [System.IO.File]::ReadAllText($backupCrashTransaction)
+            $backupCopyNeedle = '        $sourceStream.CopyTo($backupStream)'
+            $backupCopyOffset = $backupCrashTransactionText.IndexOf($backupCopyNeedle)
+            Assert-True ($backupCopyOffset -ge 0) "backup crash fixture could not find the backup copy boundary"
+            $backupCrashHook = @'
+        $partial = [System.Text.Encoding]::UTF8.GetBytes("function main(config) {")
+        $backupStream.Write($partial, 0, $partial.Length)
+        $backupStream.SetLength($partial.Length)
+        $backupStream.Flush($true)
+        [System.IO.File]::WriteAllText($env:CLASH_PATCH_TEST_BACKUP_CRASH_READY, "ready")
+        Start-Sleep -Seconds 30
+'@
+            $backupCrashTransactionText = $backupCrashTransactionText.Insert(
+                $backupCopyOffset,
+                $backupCrashHook
+            )
+            [System.IO.File]::WriteAllText(
+                $backupCrashTransaction,
+                $backupCrashTransactionText,
+                (New-Object System.Text.UTF8Encoding($true))
+            )
+
+            $backupCrashHome = Join-Path $sandbox "backup-crash-home"
+            $backupCrashProfiles = Join-Path $backupCrashHome "profiles"
+            $backupCrashRoot = Join-Path $backupCrashHome "clash-patch-backups"
+            $backupCrashReady = Join-Path $sandbox "backup-crash.ready"
+            New-Item -ItemType Directory -Path $backupCrashProfiles -Force | Out-Null
+            [System.IO.File]::WriteAllText(
+                (Join-Path $backupCrashProfiles "Script.js"),
+                "function main(config) { config.friend = true; return config; }`n"
+            )
+            [System.IO.File]::WriteAllText((Join-Path $backupCrashHome "config.yaml"), "ipv6: true`ntun: null`n")
+            [System.IO.File]::WriteAllText((Join-Path $backupCrashHome "verge.yaml"), "enable_tun_mode: false`n")
+            [System.IO.File]::WriteAllText(
+                (Join-Path $backupCrashHome "profiles.yaml"),
+                "items:`n- uid: R-backup-crash`n  type: remote`n  option:`n    allow_auto_update: true`n"
+            )
+            $env:CLASH_PATCH_TEST_BACKUP_CRASH_READY = $backupCrashReady
+            $backupCrashChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+                "-NoLogo", "-NoProfile", "-File", $backupCrashInstaller,
+                "-AppHome", $backupCrashHome,
+                "-UsageProfile", "1",
+                "-MihomoPath", $fakeCore
+            ) -PassThru
+            try {
+                $backupCrashDeadline = [DateTime]::UtcNow.AddSeconds(10)
+                while (-not (Test-Path -LiteralPath $backupCrashReady -PathType Leaf) -and
+                    -not $backupCrashChild.HasExited -and [DateTime]::UtcNow -lt $backupCrashDeadline) {
+                    Start-Sleep -Milliseconds 25
+                }
+                Assert-True (Test-Path -LiteralPath $backupCrashReady -PathType Leaf) "public installer did not reach the partial backup write"
+                Stop-Process -Id $backupCrashChild.Id -Force
+                $backupCrashChild.WaitForExit()
+            } finally {
+                $env:CLASH_PATCH_TEST_BACKUP_CRASH_READY = $null
+                if (-not $backupCrashChild.HasExited) { Stop-Process -Id $backupCrashChild.Id -Force }
+            }
+            $publishedBackups = @(
+                Get-ChildItem -LiteralPath $backupCrashRoot -File -Filter "*.backup" -ErrorAction SilentlyContinue
+            )
+            Assert-True ($publishedBackups.Count -eq 0) "caller death published a partial formal backup"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $backupCrashHome ".clash-patch-transaction.json"))) "partial backup unexpectedly created a file transaction journal"
+            $backupCrashList = Invoke-TestPowerShell $backupCrashInstaller @(
+                "-AppHome", $backupCrashHome,
+                "-ListBackups",
+                "-Json"
+            )
+            $backupCrashListJson = Assert-JsonResult $backupCrashList "install" 0
+            Assert-True (@($backupCrashListJson.items).Count -eq 0) "public backup list exposed an interrupted temporary backup"
+        }
+
         $stableKeyHome = Join-Path $sandbox "stable-key-home"
         $stableKeyProfiles = Join-Path $stableKeyHome "profiles"
         $stableKeyTarget = Join-Path $stableKeyProfiles "R-stable.yaml"
