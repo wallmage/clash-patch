@@ -577,6 +577,24 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_preparation_missing_target_handoff_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/install_windows/transaction.ps1",
+        '        if (-not $target.Exists) { continue }',
+        '        if (-not $target.Exists) { throw "mutant rejected a main-journal cleanup" }'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name",
+        "test_windows_preparation_recovery_accepts_targets_removed_by_the_main_journal"
+      )
+    end
+  end
+
   def test_ruby_automatic_route_group_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

@@ -3234,6 +3234,125 @@ try {
                 )
             )) "recovered install retained the preparation record"
         }
+
+        Invoke-DeferredProbe "public new-target journal handoff strong-kill recovery" {
+            $publicHandoffPackageParent = Join-Path $sandbox "public-journal-handoff-crash-package"
+            New-Item -ItemType Directory -Path $publicHandoffPackageParent -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $root "clash-patch") -Destination $publicHandoffPackageParent -Recurse
+            $publicHandoffPackage = Join-Path $publicHandoffPackageParent "clash-patch"
+            $publicHandoffInstaller = Join-Path (
+                Join-Path $publicHandoffPackage "scripts"
+            ) "install_windows.ps1"
+            $publicHandoffTransaction = Join-Path (
+                Join-Path (Join-Path $publicHandoffPackage "scripts") "windows/install_windows"
+            ) "transaction.ps1"
+            $publicHandoffTransactionText = [System.IO.File]::ReadAllText($publicHandoffTransaction)
+            $publicHandoffFunctionOffset = $publicHandoffTransactionText.IndexOf(
+                "function Invoke-VerifiedPathTransaction("
+            )
+            $publicHandoffNeedle = '        $journalBytes = Write-FileTransactionJournal $opened'
+            $publicHandoffOffset = $publicHandoffTransactionText.IndexOf(
+                $publicHandoffNeedle,
+                $publicHandoffFunctionOffset
+            )
+            Assert-True (
+                $publicHandoffFunctionOffset -ge 0 -and
+                $publicHandoffOffset -ge 0 -and
+                $publicHandoffTransactionText.LastIndexOf($publicHandoffNeedle) -eq $publicHandoffOffset
+            ) "public journal handoff fixture could not find one transaction journal boundary"
+            $publicHandoffLineEnd = $publicHandoffTransactionText.IndexOf("`n", $publicHandoffOffset)
+            Assert-True ($publicHandoffLineEnd -gt $publicHandoffOffset) "transaction journal call was not one complete line"
+            $publicHandoffHook = @'
+        if (-not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_JOURNAL_HANDOFF_CRASH_READY)) {
+            [System.IO.File]::WriteAllText($env:CLASH_PATCH_TEST_JOURNAL_HANDOFF_CRASH_READY, "ready")
+            Start-Sleep -Seconds 30
+        }
+'@
+            $publicHandoffTransactionText = $publicHandoffTransactionText.Insert(
+                $publicHandoffLineEnd + 1,
+                $publicHandoffHook
+            )
+            [System.IO.File]::WriteAllText(
+                $publicHandoffTransaction,
+                $publicHandoffTransactionText,
+                (New-Object System.Text.UTF8Encoding($true))
+            )
+
+            $publicHandoffHome = Join-Path $sandbox "public-journal-handoff-crash-home"
+            $publicHandoffProfiles = Join-Path $publicHandoffHome "profiles"
+            $publicHandoffReady = Join-Path $sandbox "public-journal-handoff-crash.ready"
+            New-Item -ItemType Directory -Path $publicHandoffProfiles -Force | Out-Null
+            [System.IO.File]::WriteAllText(
+                (Join-Path $publicHandoffHome "config.yaml"),
+                "ipv6: true`ntun: null`n"
+            )
+            [System.IO.File]::WriteAllText(
+                (Join-Path $publicHandoffHome "verge.yaml"),
+                "enable_tun_mode: false`n"
+            )
+            [System.IO.File]::WriteAllText(
+                (Join-Path $publicHandoffHome "profiles.yaml"),
+                "items:`n- uid: R-journal-handoff`n  type: remote`n  option:`n    allow_auto_update: true`n"
+            )
+            $env:CLASH_PATCH_TEST_JOURNAL_HANDOFF_CRASH_READY = $publicHandoffReady
+            $publicHandoffChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+                "-NoLogo", "-NoProfile", "-File", $publicHandoffInstaller,
+                "-AppHome", $publicHandoffHome,
+                "-UsageProfile", "1",
+                "-MihomoPath", $fakeCore
+            ) -PassThru
+            try {
+                $publicHandoffDeadline = [DateTime]::UtcNow.AddSeconds(10)
+                while (-not (Test-Path -LiteralPath $publicHandoffReady -PathType Leaf) -and
+                    -not $publicHandoffChild.HasExited -and
+                    [DateTime]::UtcNow -lt $publicHandoffDeadline) {
+                    Start-Sleep -Milliseconds 25
+                }
+                Assert-True (
+                    Test-Path -LiteralPath $publicHandoffReady -PathType Leaf
+                ) "public install did not reach the journal handoff boundary"
+                Stop-Process -Id $publicHandoffChild.Id -Force
+                $publicHandoffChild.WaitForExit()
+            } finally {
+                $env:CLASH_PATCH_TEST_JOURNAL_HANDOFF_CRASH_READY = $null
+                if (-not $publicHandoffChild.HasExited) {
+                    Stop-Process -Id $publicHandoffChild.Id -Force
+                }
+            }
+
+            $publicHandoffUsage = Join-Path $publicHandoffHome "clash-patch-usage-profile.json"
+            $publicHandoffJournal = Join-Path $publicHandoffHome ".clash-patch-transaction.json"
+            $publicHandoffPreparation = Join-Path (
+                $publicHandoffHome
+            ) ".clash-patch-transaction-preparation.json"
+            Assert-True (
+                (Test-Path -LiteralPath $publicHandoffUsage -PathType Leaf) -and
+                (Get-Item -LiteralPath $publicHandoffUsage).Length -eq 0
+            ) "journal handoff fixture did not leave its newly created empty state"
+            Assert-True (
+                Test-Path -LiteralPath $publicHandoffJournal -PathType Leaf
+            ) "journal handoff crash did not publish the main transaction record"
+            Assert-True (
+                Test-Path -LiteralPath $publicHandoffPreparation -PathType Leaf
+            ) "journal handoff crash removed the preparation record too early"
+
+            $publicHandoffRecovery = Invoke-TestPowerShell $publicHandoffInstaller @(
+                "-AppHome", $publicHandoffHome,
+                "-UsageProfile", "1",
+                "-MihomoPath", $fakeCore,
+                "-Json"
+            )
+            $publicHandoffRecoveryJson = Assert-JsonResult $publicHandoffRecovery "install" 0
+            Assert-True (
+                $publicHandoffRecoveryJson.code -eq "installed_common_baseline"
+            ) "next public install did not recover the journal handoff"
+            $publicHandoffUsageJson = Get-Content -LiteralPath $publicHandoffUsage -Raw | ConvertFrom-Json
+            Assert-True ([int]$publicHandoffUsageJson.Profile -eq 1) "handoff recovery did not publish a valid usage state"
+            Assert-True (-not (
+                (Test-Path -LiteralPath $publicHandoffJournal) -or
+                (Test-Path -LiteralPath $publicHandoffPreparation)
+            )) "handoff recovery retained a transaction record"
+        }
     }
 
     $verifiedTargetPath = Join-Path $transactionDir "verified-target.txt"

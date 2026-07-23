@@ -1076,6 +1076,19 @@ class SkillContractTest < Minitest::Test
     assert_equal 1, installer.scan("Remove-VerifiedOwnedFile $safeUpdateStatePath").length
   end
 
+  def test_windows_preparation_recovery_accepts_targets_removed_by_the_main_journal
+    transaction = File.read(
+      File.join(SKILL, "scripts/windows/install_windows/transaction.ps1")
+    )
+    recovery_start = transaction.index("function Repair-InterruptedFilePreparation")
+    recovery_end = transaction.index("function Write-FileTransactionJournal", recovery_start)
+    refute_nil recovery_start
+    refute_nil recovery_end
+    recovery = transaction[recovery_start...recovery_end]
+
+    assert_includes recovery, 'if (-not $target.Exists) { continue }'
+  end
+
   def test_installers_preflight_and_uninstallers_restore_owned_settings
     mac_install = File.read(File.join(SKILL, "scripts/install_macos.sh"))
     mac_uninstall = File.read(File.join(SKILL, "scripts/uninstall_macos.sh"))
@@ -1476,6 +1489,7 @@ class SkillContractTest < Minitest::Test
       "new-file transaction journal empty original bytes",
       "non-proxy route termini",
       "private transaction journal ACL",
+      "public new-target journal handoff strong-kill recovery",
       "public new-target pre-journal strong-kill recovery",
       "public restore strong-kill atomicity",
       "public restore same-byte identity replacement",
@@ -1502,6 +1516,7 @@ class SkillContractTest < Minitest::Test
     ].sort
     expected_public_kill_markers = %w[
       CLASH_PATCH_TEST_BACKUP_CRASH_READY
+      CLASH_PATCH_TEST_JOURNAL_HANDOFF_CRASH_READY
       CLASH_PATCH_TEST_PREJOURNAL_CRASH_READY
       CLASH_PATCH_TEST_PUBLIC_CRASH_READY
       CLASH_PATCH_TEST_RECOVERY_CRASH_READY
