@@ -480,6 +480,22 @@ try {
             Assert-True ($mutexInstallJson.code -eq "operation_in_progress") "parallel install did not report the shared AppHome lock"
             Assert-True ((Get-TreeContentSnapshot $mutexCase) -ceq $mutexBefore) "rejected parallel install changed AppHome"
 
+            $extendedMutexCase = "\\?\$mutexCase"
+            $aliasInstall = Invoke-TestPowerShell $installer @(
+                "-AppHome", $extendedMutexCase,
+                "-UsageProfile", "1",
+                "-MihomoPath", $fakeCore,
+                "-Json"
+            )
+            $aliasInstallJson = Assert-JsonResult $aliasInstall "install" 1
+            Assert-True ($aliasInstallJson.code -eq "operation_in_progress") "extended-path alias bypassed the shared AppHome lock"
+
+            $renamedMutexCase = Join-Path $sandbox "app-home-mutex-renamed"
+            $renameBlocked = $false
+            try { [System.IO.Directory]::Move($mutexCase, $renamedMutexCase) } catch { $renameBlocked = $true }
+            Assert-True $renameBlocked "AppHome could be renamed while its mutation lock was held"
+            Assert-True (-not (Test-Path -LiteralPath $renamedMutexCase)) "AppHome rename created a second mutation-lock identity"
+
             $mutexUninstall = Invoke-TestPowerShell $uninstaller @("-AppHome", $mutexCase, "-Json")
             $mutexUninstallJson = Assert-JsonResult $mutexUninstall "uninstall" 1
             Assert-True ($mutexUninstallJson.code -eq "operation_in_progress") "parallel uninstall did not share the installer AppHome lock"
@@ -1213,6 +1229,31 @@ items:
     [System.IO.File]::WriteAllBytes($emptyHashFile, [byte[]]@())
     Assert-True ((Get-FileSha256 $emptyHashFile) -eq "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") "empty content did not hash as the empty SHA-256"
     if ($onWindows) {
+        $stableKeyHome = Join-Path $sandbox "stable-key-home"
+        $stableKeyProfiles = Join-Path $stableKeyHome "profiles"
+        $stableKeyTarget = Join-Path $stableKeyProfiles "R-stable.yaml"
+        New-Item -ItemType Directory -Path $stableKeyProfiles -Force | Out-Null
+        [System.IO.File]::WriteAllText($stableKeyTarget, "proxies: []`n")
+        $stableKeyLock = Enter-AppHomeMutationLock $stableKeyHome
+        try {
+            $stableKeyBeforeRename = Get-PathKey $stableKeyTarget
+            $stableKeyCaseAlias = Get-PathKey (Join-Path ($stableKeyHome.ToUpperInvariant()) "PROFILES\R-STABLE.YAML")
+            $stableKeyExtendedAlias = Get-PathKey ("\\?\" + $stableKeyTarget)
+            Assert-True ($stableKeyBeforeRename -eq $stableKeyCaseAlias) "backup identity changed across a case-only path alias"
+            Assert-True ($stableKeyBeforeRename -eq $stableKeyExtendedAlias) "backup identity changed across an extended path alias"
+        } finally {
+            Exit-AppHomeMutationLock $stableKeyLock
+        }
+        $stableKeyRenamedHome = Join-Path $sandbox "stable-key-home-renamed"
+        [System.IO.Directory]::Move($stableKeyHome, $stableKeyRenamedHome)
+        $stableKeyLock = Enter-AppHomeMutationLock $stableKeyRenamedHome
+        try {
+            $stableKeyAfterRename = Get-PathKey (Join-Path (Join-Path $stableKeyRenamedHome "profiles") "R-stable.yaml")
+            Assert-True ($stableKeyBeforeRename -eq $stableKeyAfterRename) "backup identity changed after AppHome was renamed"
+        } finally {
+            Exit-AppHomeMutationLock $stableKeyLock
+        }
+
         $backupAcl = Get-Acl -LiteralPath $firstVersionedBackup
         Assert-True $backupAcl.AreAccessRulesProtected "backup ACL still inherits permissions"
         $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -1311,6 +1352,48 @@ items:
         Assert-True $junctionRejected "transaction followed a directory junction outside its expected tree"
         Assert-True ((Get-Content -LiteralPath $outsideSentinelPath -Raw) -eq "outside-original") "junction rejection did not preserve the outside sentinel"
 
+        $raceParentPath = Join-Path $transactionDir "race-parent"
+        $raceParentMovedPath = Join-Path $transactionDir "race-parent-original"
+        $raceOutsidePath = Join-Path $outsideTransactionDir "race-parent"
+        New-Item -ItemType Directory -Path $raceParentPath -Force | Out-Null
+        New-Item -ItemType Directory -Path $raceOutsidePath -Force | Out-Null
+        $raceTargetPath = Join-Path $raceParentPath "target.txt"
+        $raceOutsideTargetPath = Join-Path $raceOutsidePath "target.txt"
+        [System.IO.File]::WriteAllText($raceTargetPath, "inside-original")
+        [System.IO.File]::WriteAllText($raceOutsideTargetPath, "outside-original")
+        $raceSnapshot = Get-OptionalFileSnapshot $raceTargetPath "race target"
+        $savedNoReparseAssertion = ${function:Assert-NoReparsePointPath}
+        $script:parentSwapInjected = $false
+        try {
+            function Assert-NoReparsePointPath([string]$Path, [string]$Label) {
+                & $savedNoReparseAssertion $Path $Label
+                if (-not $script:parentSwapInjected -and $Path -eq $raceTargetPath) {
+                    $script:parentSwapInjected = $true
+                    [System.IO.Directory]::Move($raceParentPath, $raceParentMovedPath)
+                    New-Item -ItemType Junction -Path $raceParentPath -Target $raceOutsidePath | Out-Null
+                }
+            }
+            $parentSwapRejected = $false
+            try {
+                Invoke-VerifiedFileTransaction @(
+                    [pscustomobject]@{
+                        Path = $raceTargetPath
+                        Bytes = [System.Text.Encoding]::UTF8.GetBytes("must-not-write")
+                        Existed = $true
+                        OriginalBytes = $raceSnapshot.Bytes
+                        OriginalIdentity = $raceSnapshot.Identity
+                    }
+                )
+            } catch { $parentSwapRejected = $true }
+            Assert-True $script:parentSwapInjected "parent-junction race fixture did not run"
+            Assert-True $parentSwapRejected "transaction followed a parent directory swapped after path validation"
+            Assert-True ((Get-Content -LiteralPath $raceOutsideTargetPath -Raw) -eq "outside-original") "parent-junction race changed the outside target"
+            Assert-True ((Get-Content -LiteralPath (Join-Path $raceParentMovedPath "target.txt") -Raw) -eq "inside-original") "parent-junction race changed the original target"
+        } finally {
+            Set-Item -Path Function:\Assert-NoReparsePointPath -Value $savedNoReparseAssertion
+            Remove-Variable -Name parentSwapInjected -Scope Script -ErrorAction SilentlyContinue
+        }
+
         $hardLinkSourcePath = Join-Path $transactionDir "hardlink-source.txt"
         $hardLinkAliasPath = Join-Path $transactionDir "hardlink-alias.txt"
         [System.IO.File]::WriteAllText($hardLinkSourcePath, "hardlink-original")
@@ -1336,7 +1419,9 @@ items:
         [System.IO.File]::WriteAllBytes($sameBytesWritePath, $sameBytes)
         $sameBytesWriteSnapshot = Get-OptionalFileSnapshot $sameBytesWritePath "same-bytes write"
         [System.IO.File]::WriteAllBytes($sameBytesWriteReplacement, $sameBytes)
-        [System.IO.File]::Replace($sameBytesWriteReplacement, $sameBytesWritePath, $null)
+        $sameBytesWriteBackup = Join-Path $transactionDir "same-bytes-write-old.txt"
+        [System.IO.File]::Replace($sameBytesWriteReplacement, $sameBytesWritePath, $sameBytesWriteBackup)
+        [System.IO.File]::Delete($sameBytesWriteBackup)
         $sameBytesWriteCurrent = Get-OptionalFileSnapshot $sameBytesWritePath "same-bytes replaced write"
         Assert-True ($sameBytesWriteCurrent.Identity -cne $sameBytesWriteSnapshot.Identity) "same-bytes write fixture did not replace the file identity"
         $sameBytesWriteRejected = $false
@@ -1359,7 +1444,9 @@ items:
         [System.IO.File]::WriteAllBytes($sameBytesDeletePath, $sameBytes)
         $sameBytesDeleteSnapshot = Get-OptionalFileSnapshot $sameBytesDeletePath "same-bytes delete"
         [System.IO.File]::WriteAllBytes($sameBytesDeleteReplacement, $sameBytes)
-        [System.IO.File]::Replace($sameBytesDeleteReplacement, $sameBytesDeletePath, $null)
+        $sameBytesDeleteBackup = Join-Path $transactionDir "same-bytes-delete-old.txt"
+        [System.IO.File]::Replace($sameBytesDeleteReplacement, $sameBytesDeletePath, $sameBytesDeleteBackup)
+        [System.IO.File]::Delete($sameBytesDeleteBackup)
         $sameBytesDeleteCurrent = Get-OptionalFileSnapshot $sameBytesDeletePath "same-bytes replaced delete"
         Assert-True ($sameBytesDeleteCurrent.Identity -cne $sameBytesDeleteSnapshot.Identity) "same-bytes delete fixture did not replace the file identity"
         $sameBytesDeleteRejected = $false
@@ -1375,6 +1462,142 @@ items:
         } catch { $sameBytesDeleteRejected = $true }
         Assert-True $sameBytesDeleteRejected "transaction deleted a same-content replacement with a different file identity"
         Assert-True ((Get-Content -LiteralPath $sameBytesDeletePath -Raw) -eq "same-bytes") "identity rejection removed the replacement delete target"
+
+        $crashWriteHome = Join-Path $sandbox "crash-write-home"
+        $crashWriteFirstPath = Join-Path $crashWriteHome "first.txt"
+        $crashWriteSecondPath = Join-Path $crashWriteHome "second.txt"
+        $crashWriteReadyPath = Join-Path $sandbox "crash-write.ready"
+        $crashWriteChildPath = Join-Path $sandbox "crash-write-child.ps1"
+        New-Item -ItemType Directory -Path $crashWriteHome -Force | Out-Null
+        [System.IO.File]::WriteAllText($crashWriteFirstPath, "first-original")
+        [System.IO.File]::WriteAllText($crashWriteSecondPath, "second-original")
+        $crashWriteChildSource = @'
+param(
+    [string]$ModulePath,
+    [string]$AppHome,
+    [string]$FirstPath,
+    [string]$SecondPath,
+    [string]$ReadyPath
+)
+$ErrorActionPreference = "Stop"
+. $ModulePath
+$held = Enter-AppHomeMutationLock $AppHome
+$first = Get-OptionalFileSnapshot $FirstPath "first"
+$second = Get-OptionalFileSnapshot $SecondPath "second"
+$savedWriter = ${function:Write-LockedStreamBytes}
+$script:writeCount = 0
+function Write-LockedStreamBytes(
+    [System.IO.FileStream]$Stream,
+    [byte[]]$Replacement,
+    [byte[]]$Original
+) {
+    & $savedWriter $Stream $Replacement $Original
+    $script:writeCount++
+    if ($script:writeCount -eq 1) {
+        [System.IO.File]::WriteAllText($ReadyPath, "ready")
+        Start-Sleep -Seconds 30
+    }
+}
+try {
+    Invoke-VerifiedFileTransaction @(
+        [pscustomobject]@{ Path = $FirstPath; Bytes = [System.Text.Encoding]::UTF8.GetBytes("first-new"); Existed = $true; OriginalBytes = $first.Bytes; OriginalIdentity = $first.Identity },
+        [pscustomobject]@{ Path = $SecondPath; Bytes = [System.Text.Encoding]::UTF8.GetBytes("second-new"); Existed = $true; OriginalBytes = $second.Bytes; OriginalIdentity = $second.Identity }
+    )
+} finally {
+    Exit-AppHomeMutationLock $held
+}
+'@
+        [System.IO.File]::WriteAllText($crashWriteChildPath, $crashWriteChildSource, [System.Text.Encoding]::ASCII)
+        $crashWriteChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+            "-NoLogo", "-NoProfile", "-File", $crashWriteChildPath,
+            "-ModulePath", (Join-Path $installerModuleRoot "transaction.ps1"),
+            "-AppHome", $crashWriteHome,
+            "-FirstPath", $crashWriteFirstPath,
+            "-SecondPath", $crashWriteSecondPath,
+            "-ReadyPath", $crashWriteReadyPath
+        ) -PassThru
+        $crashWriteDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not (Test-Path -LiteralPath $crashWriteReadyPath -PathType Leaf) -and
+            -not $crashWriteChild.HasExited -and [DateTime]::UtcNow -lt $crashWriteDeadline) {
+            Start-Sleep -Milliseconds 25
+        }
+        Assert-True (Test-Path -LiteralPath $crashWriteReadyPath -PathType Leaf) "crash-write child did not reach the first durable write"
+        Stop-Process -Id $crashWriteChild.Id -Force
+        $crashWriteChild.WaitForExit()
+        Assert-True ((Get-Content -LiteralPath $crashWriteFirstPath -Raw) -eq "first-new") "crash-write fixture did not leave a partial transaction"
+        Assert-True ((Get-Content -LiteralPath $crashWriteSecondPath -Raw) -eq "second-original") "crash-write fixture unexpectedly completed the transaction"
+        $crashWriteRecoveryLock = Enter-AppHomeMutationLock $crashWriteHome
+        Exit-AppHomeMutationLock $crashWriteRecoveryLock
+        Assert-True ((Get-Content -LiteralPath $crashWriteFirstPath -Raw) -eq "first-original") "next operation did not recover a write interrupted by process death"
+        Assert-True ((Get-Content -LiteralPath $crashWriteSecondPath -Raw) -eq "second-original") "write recovery changed an untouched transaction target"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $crashWriteHome ".clash-patch-transaction.json"))) "write recovery left a stale transaction journal"
+
+        $crashDeleteHome = Join-Path $sandbox "crash-delete-home"
+        $crashDeleteFirstPath = Join-Path $crashDeleteHome "first.txt"
+        $crashDeleteSecondPath = Join-Path $crashDeleteHome "second.txt"
+        $crashDeleteReadyPath = Join-Path $sandbox "crash-delete.ready"
+        $crashDeleteChildPath = Join-Path $sandbox "crash-delete-child.ps1"
+        New-Item -ItemType Directory -Path $crashDeleteHome -Force | Out-Null
+        [System.IO.File]::WriteAllText($crashDeleteFirstPath, "first-original")
+        [System.IO.File]::WriteAllText($crashDeleteSecondPath, "second-original")
+        $crashDeleteChildSource = @'
+param(
+    [string]$ModulePath,
+    [string]$AppHome,
+    [string]$FirstPath,
+    [string]$SecondPath,
+    [string]$ReadyPath
+)
+$ErrorActionPreference = "Stop"
+. $ModulePath
+$held = Enter-AppHomeMutationLock $AppHome
+$first = Get-OptionalFileSnapshot $FirstPath "first"
+$second = Get-OptionalFileSnapshot $SecondPath "second"
+$savedDelete = ${function:Set-VerifiedDeleteDisposition}
+$script:deleteCount = 0
+function Set-VerifiedDeleteDisposition([System.IO.FileStream]$Stream, [bool]$DeleteFile) {
+    & $savedDelete $Stream $DeleteFile
+    if ($DeleteFile) {
+        $script:deleteCount++
+        if ($script:deleteCount -eq 1) {
+            [System.IO.File]::WriteAllText($ReadyPath, "ready")
+            Start-Sleep -Seconds 30
+        }
+    }
+}
+try {
+    Invoke-VerifiedWriteDeleteTransaction @() @(
+        [pscustomobject]@{ Path = $FirstPath; Existed = $true; OriginalBytes = $first.Bytes; OriginalIdentity = $first.Identity },
+        [pscustomobject]@{ Path = $SecondPath; Existed = $true; OriginalBytes = $second.Bytes; OriginalIdentity = $second.Identity }
+    )
+} finally {
+    Exit-AppHomeMutationLock $held
+}
+'@
+        [System.IO.File]::WriteAllText($crashDeleteChildPath, $crashDeleteChildSource, [System.Text.Encoding]::ASCII)
+        $crashDeleteChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+            "-NoLogo", "-NoProfile", "-File", $crashDeleteChildPath,
+            "-ModulePath", (Join-Path $installerModuleRoot "transaction.ps1"),
+            "-AppHome", $crashDeleteHome,
+            "-FirstPath", $crashDeleteFirstPath,
+            "-SecondPath", $crashDeleteSecondPath,
+            "-ReadyPath", $crashDeleteReadyPath
+        ) -PassThru
+        $crashDeleteDeadline = [DateTime]::UtcNow.AddSeconds(10)
+        while (-not (Test-Path -LiteralPath $crashDeleteReadyPath -PathType Leaf) -and
+            -not $crashDeleteChild.HasExited -and [DateTime]::UtcNow -lt $crashDeleteDeadline) {
+            Start-Sleep -Milliseconds 25
+        }
+        Assert-True (Test-Path -LiteralPath $crashDeleteReadyPath -PathType Leaf) "crash-delete child did not mark the first deletion"
+        Stop-Process -Id $crashDeleteChild.Id -Force
+        $crashDeleteChild.WaitForExit()
+        Assert-True (-not (Test-Path -LiteralPath $crashDeleteFirstPath)) "crash-delete fixture did not leave a partial transaction"
+        Assert-True (Test-Path -LiteralPath $crashDeleteSecondPath -PathType Leaf) "crash-delete fixture unexpectedly completed the transaction"
+        $crashDeleteRecoveryLock = Enter-AppHomeMutationLock $crashDeleteHome
+        Exit-AppHomeMutationLock $crashDeleteRecoveryLock
+        Assert-True ((Get-Content -LiteralPath $crashDeleteFirstPath -Raw) -eq "first-original") "next operation did not recover a deletion interrupted by process death"
+        Assert-True ((Get-Content -LiteralPath $crashDeleteSecondPath -Raw) -eq "second-original") "delete recovery changed an untouched transaction target"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $crashDeleteHome ".clash-patch-transaction.json"))) "delete recovery left a stale transaction journal"
     }
 
     $verifiedTargetPath = Join-Path $transactionDir "verified-target.txt"

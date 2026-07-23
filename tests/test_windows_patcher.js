@@ -1026,11 +1026,16 @@ test('Windows installer is split into side-effect-free modules with stable funct
   const expected = {
     'common.ps1': ['Write-Info', 'Complete-InstallResult', 'Get-SavedUsageProfile', 'Save-UsageProfile'],
     'transaction.ps1': [
-      'Protect-BackupAcl', 'Enter-AppHomeMutationLock', 'Exit-AppHomeMutationLock',
+      'Protect-BackupAcl', 'ConvertTo-NormalizedWindowsPath', 'Get-AppHomeRelativePath',
+      'Enter-AppHomeMutationLock', 'Exit-AppHomeMutationLock',
       'Get-PathKey', 'Assert-NoReparsePointPath', 'Backup-Versioned', 'Backup-InitialOnce', 'Write-BytesAtomic',
       'ConvertTo-Utf8Bytes', 'Write-Utf8Atomic', 'Get-BytesSha256', 'Get-FileSha256',
       'Get-StreamBytes', 'Get-OptionalFileSnapshot', 'Remove-VerifiedOwnedFile', 'Write-LockedStreamBytes',
-      'Initialize-VerifiedFileNative', 'Set-VerifiedDeleteDisposition', 'Invoke-VerifiedPathTransaction',
+      'Initialize-VerifiedFileNative', 'Open-VerifiedDirectoryChain', 'Set-VerifiedDeleteDisposition',
+      'Write-FileTransactionJournal', 'Remove-FileTransactionJournal',
+      'Get-ValidatedFileTransactionJournal', 'Get-InterruptedTransactionRecoveryPlan',
+      'Invoke-InterruptedTransactionRecovery', 'Assert-InterruptedTransactionRecovered',
+      'Repair-InterruptedFileTransaction', 'Invoke-VerifiedPathTransaction',
       'Invoke-VerifiedFileTransaction', 'Invoke-VerifiedWriteDeleteTransaction',
       'Get-InstallStateEntry', 'Assert-InstallStateEntry', 'Assert-InstallState', 'Assert-StateSnapshotUnchanged',
       'New-InstallStateEntry'

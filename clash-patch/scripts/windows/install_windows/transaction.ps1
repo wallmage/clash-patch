@@ -23,47 +23,104 @@
     Set-Acl -LiteralPath $Path -AclObject $security
 }
 
-function Enter-AppHomeMutationLock([string]$AppHome) {
-    Assert-NoReparsePointPath $AppHome "Clash Verge Rev 配置目录"
-    $canonical = [System.IO.Path]::GetFullPath($AppHome).TrimEnd(
+function ConvertTo-NormalizedWindowsPath([string]$Path) {
+    $absolute = [System.IO.Path]::GetFullPath($Path)
+    if ($absolute.StartsWith("\\?\UNC\", [StringComparison]::OrdinalIgnoreCase)) {
+        $absolute = "\\" + $absolute.Substring(8)
+    } elseif ($absolute.StartsWith("\\?\", [StringComparison]::OrdinalIgnoreCase)) {
+        $absolute = $absolute.Substring(4)
+    }
+    return $absolute.TrimEnd(
         [System.IO.Path]::DirectorySeparatorChar,
         [System.IO.Path]::AltDirectorySeparatorChar
-    ).ToUpperInvariant()
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($canonical)
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $key = ([System.BitConverter]::ToString($sha.ComputeHash($bytes, 0, $bytes.Length))).Replace("-", "").ToLowerInvariant()
-    } finally {
-        $sha.Dispose()
+    )
+}
+
+function Get-AppHomeRelativePath([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace([string]$script:ClashPatchMutationRoot)) {
+        throw "当前操作没有绑定 Clash Verge Rev 配置目录。"
     }
-    $mutex = New-Object System.Threading.Mutex($false, ("Local\ClashPatch-" + $key))
-    $acquired = $false
+    $root = ConvertTo-NormalizedWindowsPath $script:ClashPatchMutationRoot
+    $absolute = ConvertTo-NormalizedWindowsPath $Path
+    if ([string]::Equals($absolute, $root, [StringComparison]::OrdinalIgnoreCase)) {
+        return "."
+    }
+    $prefix = $root + [System.IO.Path]::DirectorySeparatorChar
+    if (-not $absolute.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "事务目标超出 Clash Verge Rev 配置目录。"
+    }
+    return $absolute.Substring($prefix.Length).Replace(
+        [System.IO.Path]::AltDirectorySeparatorChar,
+        [System.IO.Path]::DirectorySeparatorChar
+    )
+}
+
+function Enter-AppHomeMutationLock([string]$AppHome) {
+    Assert-NoReparsePointPath $AppHome "Clash Verge Rev 配置目录"
+    Initialize-VerifiedFileNative
+    $canonical = ConvertTo-NormalizedWindowsPath $AppHome
+    $rootHandle = $null
+    $lockStream = $null
     try {
         try {
-            $acquired = $mutex.WaitOne(0, $false)
-        } catch [System.Threading.AbandonedMutexException] {
-            $acquired = $true
+            $rootHandle = [ClashPatch.VerifiedDeleteNative]::OpenDirectory($canonical)
+            if ([ClashPatch.VerifiedDeleteNative]::IsReparsePoint($rootHandle)) {
+                throw "Clash Verge Rev 配置目录不能是符号链接、目录联接或其他重解析点。"
+            }
+            $lockHandle = [ClashPatch.VerifiedDeleteNative]::OpenLockFile(
+                (Join-Path $canonical ".clash-patch.lock")
+            )
+            if ([ClashPatch.VerifiedDeleteNative]::IsReparsePoint($lockHandle) -or
+                [ClashPatch.VerifiedDeleteNative]::GetLinkCount($lockHandle) -ne 1) {
+                $lockHandle.Dispose()
+                throw "Clash 补丁锁文件不能是链接。"
+            }
+            $lockStream = New-Object System.IO.FileStream($lockHandle, [System.IO.FileAccess]::ReadWrite)
+        } catch [System.ComponentModel.Win32Exception] {
+            throw "同一配置目录已有 Clash 补丁操作正在进行，请稍后重试。"
         }
-        if (-not $acquired) { throw "同一配置目录已有 Clash 补丁操作正在进行，请稍后重试。" }
-        return $mutex
+
+        $script:ClashPatchMutationRoot = $canonical
+        $script:ClashPatchTransactionJournalPath = Join-Path $canonical ".clash-patch-transaction.json"
+        Repair-InterruptedFileTransaction
+        return [pscustomobject]@{
+            Root = $canonical
+            RootHandle = $rootHandle
+            LockStream = $lockStream
+        }
     } catch {
-        $mutex.Dispose()
+        if ($null -ne $lockStream) { $lockStream.Dispose() }
+        if ($null -ne $rootHandle) { $rootHandle.Dispose() }
+        $script:ClashPatchMutationRoot = $null
+        $script:ClashPatchTransactionJournalPath = $null
         throw
     }
 }
 
-function Exit-AppHomeMutationLock([System.Threading.Mutex]$Mutex) {
-    if ($null -eq $Mutex) { return }
+function Exit-AppHomeMutationLock([object]$Lock) {
+    if ($null -eq $Lock) { return }
     try {
-        $Mutex.ReleaseMutex()
+        if ($null -ne $Lock.LockStream) { $Lock.LockStream.Dispose() }
     } finally {
-        $Mutex.Dispose()
+        if ($null -ne $Lock.RootHandle) { $Lock.RootHandle.Dispose() }
+        if ([string]::Equals(
+            [string]$script:ClashPatchMutationRoot,
+            [string]$Lock.Root,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            $script:ClashPatchMutationRoot = $null
+            $script:ClashPatchTransactionJournalPath = $null
+        }
     }
 }
 
 function Get-PathKey([string]$Path) {
-    $absolute = [System.IO.Path]::GetFullPath($Path)
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($absolute)
+    $identity = if ([string]::IsNullOrWhiteSpace([string]$script:ClashPatchMutationRoot)) {
+        (ConvertTo-NormalizedWindowsPath $Path).ToUpperInvariant()
+    } else {
+        (Get-AppHomeRelativePath $Path).ToUpperInvariant()
+    }
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($identity)
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
         return (($sha.ComputeHash($bytes, 0, $bytes.Length) | ForEach-Object { $_.ToString("x2") }) -join '').Substring(0, 16)
@@ -226,6 +283,7 @@ function Get-OptionalFileSnapshot([string]$Path, [string]$Label) {
         throw "$Label 路径不是文件。"
     }
     Initialize-VerifiedFileNative
+    $directoryHandles = @(Open-VerifiedDirectoryChain (Split-Path -Parent $Path))
     $handle = [ClashPatch.VerifiedDeleteNative]::Open($Path, $false, $false)
     $stream = $null
     try {
@@ -248,6 +306,9 @@ function Get-OptionalFileSnapshot([string]$Path, [string]$Label) {
             $stream.Dispose()
         } else {
             $handle.Dispose()
+        }
+        for ($index = $directoryHandles.Count - 1; $index -ge 0; $index--) {
+            $directoryHandles[$index].Dispose()
         }
     }
 }
@@ -314,7 +375,11 @@ namespace ClashPatch
         private const uint DeleteAccess = 0x00010000;
         private const uint CreateNew = 1;
         private const uint OpenExisting = 3;
+        private const uint OpenAlways = 4;
+        private const uint FileShareRead = 0x00000001;
+        private const uint FileShareWrite = 0x00000002;
         private const uint OpenReparsePoint = 0x00200000;
+        private const uint BackupSemantics = 0x02000000;
         private const uint FileAttributeReparsePoint = 0x00000400;
         private const int FileDispositionInfo = 4;
         private const int FileAttributeTagInfo = 9;
@@ -405,6 +470,46 @@ namespace ClashPatch
             return handle;
         }
 
+        public static SafeFileHandle OpenDirectory(string path)
+        {
+            SafeFileHandle handle = CreateFile(
+                path,
+                0,
+                FileShareRead | FileShareWrite,
+                IntPtr.Zero,
+                OpenExisting,
+                BackupSemantics | OpenReparsePoint,
+                IntPtr.Zero
+            );
+            if (handle.IsInvalid)
+            {
+                int error = Marshal.GetLastWin32Error();
+                handle.Dispose();
+                throw new Win32Exception(error, "无法锁定事务目标目录。");
+            }
+            return handle;
+        }
+
+        public static SafeFileHandle OpenLockFile(string path)
+        {
+            SafeFileHandle handle = CreateFile(
+                path,
+                GenericRead | GenericWrite,
+                0,
+                IntPtr.Zero,
+                OpenAlways,
+                OpenReparsePoint,
+                IntPtr.Zero
+            );
+            if (handle.IsInvalid)
+            {
+                int error = Marshal.GetLastWin32Error();
+                handle.Dispose();
+                throw new Win32Exception(error, "无法获取配置目录操作锁。");
+            }
+            return handle;
+        }
+
         public static bool IsReparsePoint(SafeFileHandle handle)
         {
             FileAttributeTagInformation information;
@@ -461,8 +566,300 @@ namespace ClashPatch
 '@
 }
 
+function Open-VerifiedDirectoryChain([string]$Directory) {
+    Initialize-VerifiedFileNative
+    $absolute = ConvertTo-NormalizedWindowsPath $Directory
+    $root = [System.IO.Path]::GetPathRoot($absolute)
+    if ([string]::IsNullOrWhiteSpace($root)) { throw "事务目标目录无效。" }
+    $relative = $absolute.Substring($root.Length)
+    $segments = @($relative.Split(
+        @([System.IO.Path]::DirectorySeparatorChar, [System.IO.Path]::AltDirectorySeparatorChar),
+        [System.StringSplitOptions]::RemoveEmptyEntries
+    ))
+    $handles = @()
+    $current = $root
+    try {
+        $rootHandle = [ClashPatch.VerifiedDeleteNative]::OpenDirectory($current)
+        if ([ClashPatch.VerifiedDeleteNative]::IsReparsePoint($rootHandle)) {
+            $rootHandle.Dispose()
+            throw "事务目标目录不能经过重解析点：$current"
+        }
+        $handles += $rootHandle
+        foreach ($segment in $segments) {
+            $current = Join-Path $current $segment
+            if (-not (Test-Path -LiteralPath $current -PathType Container)) {
+                New-Item -ItemType Directory -Path $current | Out-Null
+            }
+            $handle = [ClashPatch.VerifiedDeleteNative]::OpenDirectory($current)
+            if ([ClashPatch.VerifiedDeleteNative]::IsReparsePoint($handle)) {
+                $handle.Dispose()
+                throw "事务目标目录不能经过重解析点：$current"
+            }
+            $handles += $handle
+        }
+        return $handles
+    } catch {
+        for ($index = $handles.Count - 1; $index -ge 0; $index--) {
+            $handles[$index].Dispose()
+        }
+        throw
+    }
+}
+
 function Set-VerifiedDeleteDisposition([System.IO.FileStream]$Stream, [bool]$DeleteFile) {
     [ClashPatch.VerifiedDeleteNative]::SetDeleteDisposition($Stream.SafeFileHandle, $DeleteFile)
+}
+
+function Write-FileTransactionJournal([object[]]$Entries) {
+    if ([string]::IsNullOrWhiteSpace([string]$script:ClashPatchTransactionJournalPath) -or
+        @($Entries).Count -eq 0) {
+        return $null
+    }
+    if (Test-Path -LiteralPath $script:ClashPatchTransactionJournalPath) {
+        throw "发现尚未恢复的文件事务记录。"
+    }
+    $journalActions = @()
+    foreach ($entry in $Entries) {
+        $journalActions += [ordered]@{
+            Action = [string]$entry.Action
+            Path = Get-AppHomeRelativePath ([string]$entry.Target.Path)
+            Existed = (-not [bool]$entry.Created)
+            OriginalBase64 = [Convert]::ToBase64String([byte[]]$entry.Original)
+            ReplacementBase64 = if ($entry.Action -eq "write") {
+                [Convert]::ToBase64String([byte[]]$entry.Target.Bytes)
+            } else {
+                ""
+            }
+        }
+    }
+    $journal = [ordered]@{
+        Version = 1
+        Actions = $journalActions
+    }
+    $bytes = ConvertTo-Utf8Bytes (($journal | ConvertTo-Json -Depth 5) + "`r`n")
+    $temporary = Join-Path $script:ClashPatchMutationRoot (
+        ".clash-patch-transaction." + [Guid]::NewGuid().ToString("N") + ".tmp"
+    )
+    $stream = $null
+    $moved = $false
+    try {
+        $stream = [System.IO.File]::Open(
+            $temporary,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        [System.IO.File]::Move($temporary, $script:ClashPatchTransactionJournalPath)
+        $moved = $true
+        return $bytes
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if (-not $moved -and (Test-Path -LiteralPath $temporary -PathType Leaf)) {
+            [System.IO.File]::Delete($temporary)
+        }
+    }
+}
+
+function Remove-FileTransactionJournal([byte[]]$ExpectedBytes) {
+    $path = [string]$script:ClashPatchTransactionJournalPath
+    if ([string]::IsNullOrWhiteSpace($path)) { return }
+    $snapshot = Get-OptionalFileSnapshot $path "文件事务记录"
+    if (-not $snapshot.Exists) { return }
+    if ((Get-BytesSha256 $snapshot.Bytes) -ne (Get-BytesSha256 $ExpectedBytes)) {
+        throw "文件事务记录在操作期间发生变化。"
+    }
+    $directoryHandles = @(Open-VerifiedDirectoryChain (Split-Path -Parent $path))
+    $handle = $null
+    $stream = $null
+    try {
+        $handle = [ClashPatch.VerifiedDeleteNative]::Open($path, $false, $false)
+        $stream = New-Object System.IO.FileStream($handle, [System.IO.FileAccess]::Read)
+        if ([ClashPatch.VerifiedDeleteNative]::GetIdentity($handle) -cne $snapshot.Identity -or
+            (Get-BytesSha256 (Get-StreamBytes $stream)) -ne (Get-BytesSha256 $ExpectedBytes)) {
+            throw "文件事务记录在操作期间发生变化。"
+        }
+        Set-VerifiedDeleteDisposition $stream $true
+    } finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        } elseif ($null -ne $handle) {
+            $handle.Dispose()
+        }
+        for ($index = $directoryHandles.Count - 1; $index -ge 0; $index--) {
+            $directoryHandles[$index].Dispose()
+        }
+    }
+}
+
+function Get-ValidatedFileTransactionJournal([object]$Journal) {
+    if ($null -eq $Journal) { throw "文件事务记录无效。" }
+    $properties = @($Journal.PSObject.Properties.Name | Sort-Object)
+    if (($properties -join ",") -cne "Actions,Version" -or
+        -not ($Journal.Version -is [int] -or $Journal.Version -is [long]) -or
+        [long]$Journal.Version -ne 1) {
+        throw "文件事务记录无效。"
+    }
+    $actions = @($Journal.Actions)
+    if ($actions.Count -eq 0) { throw "文件事务记录没有操作项。" }
+    $paths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $validated = @()
+    foreach ($action in $actions) {
+        $actionProperties = @($action.PSObject.Properties.Name | Sort-Object)
+        if (($actionProperties -join ",") -cne "Action,Existed,OriginalBase64,Path,ReplacementBase64" -or
+            [string]$action.Action -notin @("write", "delete") -or
+            -not ($action.Existed -is [bool]) -or
+            -not ($action.OriginalBase64 -is [string]) -or
+            -not ($action.ReplacementBase64 -is [string])) {
+            throw "文件事务记录操作项无效。"
+        }
+        $relative = [string]$action.Path
+        if ([string]::IsNullOrWhiteSpace($relative) -or
+            [System.IO.Path]::IsPathRooted($relative) -or
+            $relative -eq "." -or
+            @($relative.Split("\") | Where-Object { $_ -eq ".." }).Count -gt 0) {
+            throw "文件事务记录包含无效路径。"
+        }
+        $absolute = [System.IO.Path]::GetFullPath((Join-Path $script:ClashPatchMutationRoot $relative))
+        if ((Get-AppHomeRelativePath $absolute) -cne $relative.Replace(
+            [System.IO.Path]::AltDirectorySeparatorChar,
+            [System.IO.Path]::DirectorySeparatorChar
+        )) {
+            throw "文件事务记录路径不规范。"
+        }
+        if (-not $paths.Add($absolute)) { throw "文件事务记录包含重复路径。" }
+        try {
+            $original = [Convert]::FromBase64String([string]$action.OriginalBase64)
+            $replacement = [Convert]::FromBase64String([string]$action.ReplacementBase64)
+        } catch {
+            throw "文件事务记录包含无效 Base64。"
+        }
+        if ([Convert]::ToBase64String($original) -cne [string]$action.OriginalBase64 -or
+            [Convert]::ToBase64String($replacement) -cne [string]$action.ReplacementBase64 -or
+            ([string]$action.Action -eq "delete" -and
+                (-not [bool]$action.Existed -or $replacement.Length -ne 0)) -or
+            ([string]$action.Action -eq "write" -and
+                -not [bool]$action.Existed -and $original.Length -ne 0)) {
+            throw "文件事务记录内容不规范。"
+        }
+        $validated += [pscustomobject]@{
+            Action = [string]$action.Action
+            Path = $absolute
+            Existed = [bool]$action.Existed
+            Original = $original
+            Replacement = $replacement
+        }
+    }
+    return $validated
+}
+
+function Get-InterruptedTransactionRecoveryPlan([object[]]$Actions) {
+    $plan = @()
+    foreach ($action in $Actions) {
+        $snapshot = Get-OptionalFileSnapshot $action.Path "中断事务目标"
+        $currentHash = if ($snapshot.Exists) { Get-BytesSha256 $snapshot.Bytes } else { "" }
+        $originalHash = Get-BytesSha256 $action.Original
+        $replacementHash = Get-BytesSha256 $action.Replacement
+        if ($action.Action -eq "write" -and $action.Existed) {
+            if (-not $snapshot.Exists -or $currentHash -notin @($originalHash, $replacementHash)) {
+                throw "中断事务目标有无法自动合并的新改动：$($action.Path)"
+            }
+            if ($currentHash -eq $replacementHash -and $currentHash -ne $originalHash) {
+                $plan += [pscustomobject]@{ Operation = "write"; Action = $action; Snapshot = $snapshot }
+            }
+        } elseif ($action.Action -eq "write") {
+            if ($snapshot.Exists -and $currentHash -ne $replacementHash) {
+                throw "中断事务新建目标有无法自动合并的新改动：$($action.Path)"
+            }
+            if ($snapshot.Exists) {
+                $plan += [pscustomobject]@{ Operation = "delete"; Action = $action; Snapshot = $snapshot }
+            }
+        } else {
+            if ($snapshot.Exists -and $currentHash -ne $originalHash) {
+                throw "中断事务删除目标有无法自动合并的新改动：$($action.Path)"
+            }
+            if (-not $snapshot.Exists) {
+                $plan += [pscustomobject]@{ Operation = "create"; Action = $action; Snapshot = $snapshot }
+            }
+        }
+    }
+    return $plan
+}
+
+function Invoke-InterruptedTransactionRecovery([object[]]$Plan) {
+    foreach ($item in $Plan) {
+        $directoryHandles = @(Open-VerifiedDirectoryChain (Split-Path -Parent $item.Action.Path))
+        $handle = $null
+        $stream = $null
+        try {
+            if ($item.Operation -eq "create") {
+                $handle = [ClashPatch.VerifiedDeleteNative]::Open($item.Action.Path, $true, $true)
+                $stream = New-Object System.IO.FileStream($handle, [System.IO.FileAccess]::ReadWrite)
+                Write-LockedStreamBytes $stream $item.Action.Original ([byte[]]@())
+            } else {
+                $writable = $item.Operation -eq "write"
+                $handle = [ClashPatch.VerifiedDeleteNative]::Open($item.Action.Path, $writable, $false)
+                $access = if ($writable) { [System.IO.FileAccess]::ReadWrite } else { [System.IO.FileAccess]::Read }
+                $stream = New-Object System.IO.FileStream($handle, $access)
+                $current = Get-StreamBytes $stream
+                if ([ClashPatch.VerifiedDeleteNative]::GetIdentity($handle) -cne $item.Snapshot.Identity -or
+                    (Get-BytesSha256 $current) -ne (Get-BytesSha256 $item.Snapshot.Bytes)) {
+                    throw "中断事务目标在恢复前再次发生变化：$($item.Action.Path)"
+                }
+                if ($item.Operation -eq "write") {
+                    Write-LockedStreamBytes $stream $item.Action.Original $current
+                } else {
+                    Set-VerifiedDeleteDisposition $stream $true
+                }
+            }
+        } finally {
+            if ($null -ne $stream) {
+                $stream.Dispose()
+            } elseif ($null -ne $handle) {
+                $handle.Dispose()
+            }
+            for ($index = $directoryHandles.Count - 1; $index -ge 0; $index--) {
+                $directoryHandles[$index].Dispose()
+            }
+        }
+    }
+}
+
+function Assert-InterruptedTransactionRecovered([object[]]$Actions) {
+    foreach ($action in $Actions) {
+        $snapshot = Get-OptionalFileSnapshot $action.Path "中断事务恢复结果"
+        if ($action.Action -eq "write" -and -not $action.Existed) {
+            if ($snapshot.Exists) { throw "中断事务新建文件未删除：$($action.Path)" }
+        } elseif (-not $snapshot.Exists -or
+            (Get-BytesSha256 $snapshot.Bytes) -ne (Get-BytesSha256 $action.Original)) {
+            throw "中断事务未恢复原文件：$($action.Path)"
+        }
+    }
+}
+
+function Repair-InterruptedFileTransaction {
+    $path = [string]$script:ClashPatchTransactionJournalPath
+    if ([string]::IsNullOrWhiteSpace($path)) { return }
+    $snapshot = Get-OptionalFileSnapshot $path "文件事务记录"
+    if (-not $snapshot.Exists) { return }
+    try {
+        $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($snapshot.Bytes)
+        if ([regex]::Matches($text, '(?i)"Version"\s*:').Count -ne 1 -or
+            [regex]::Matches($text, '(?i)"Actions"\s*:').Count -ne 1) {
+            throw "字段重复或缺失。"
+        }
+        $journal = $text | ConvertFrom-Json
+        $actions = @(Get-ValidatedFileTransactionJournal $journal)
+    } catch {
+        throw "文件事务记录损坏，无法安全恢复。"
+    }
+    $plan = @(Get-InterruptedTransactionRecoveryPlan $actions)
+    Invoke-InterruptedTransactionRecovery $plan
+    Assert-InterruptedTransactionRecovered $actions
+    Remove-FileTransactionJournal $snapshot.Bytes
 }
 
 function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$DeleteTargets) {
@@ -501,15 +898,15 @@ function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$Dele
     }
     Initialize-VerifiedFileNative
     $opened = @()
+    $directoryHandles = @()
     $markedDeletes = @()
+    $journalBytes = $null
     $operationFailure = $null
     $recoveryFailures = @()
     try {
         foreach ($action in @($actions | Sort-Object Path)) {
             $directory = Split-Path -Parent $action.Path
-            if ($action.CreateNew -and -not (Test-Path -LiteralPath $directory -PathType Container)) {
-                New-Item -ItemType Directory -Path $directory -Force | Out-Null
-            }
+            $directoryHandles += @(Open-VerifiedDirectoryChain $directory)
             if ($action.CreateNew) {
                 if (Test-Path -LiteralPath $action.Path) {
                     throw "目标路径在候选生成后出现，拒绝覆盖：$($action.Path)"
@@ -561,6 +958,7 @@ function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$Dele
             }
         }
 
+        $journalBytes = Write-FileTransactionJournal $opened
         foreach ($entry in @($opened | Where-Object { $_.Action -eq "write" })) {
             Write-LockedStreamBytes $entry.Stream $entry.Target.Bytes $entry.Original
         }
@@ -612,6 +1010,26 @@ function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$Dele
             $opened[$i].Stream.Dispose()
         } catch {
             $recoveryFailures += "$($opened[$i].Target.Path)：关闭事务文件失败：$($_.Exception.Message)"
+        }
+    }
+    for ($i = $directoryHandles.Count - 1; $i -ge 0; $i--) {
+        try {
+            $directoryHandles[$i].Dispose()
+        } catch {
+            $recoveryFailures += "关闭事务目标目录失败：$($_.Exception.Message)"
+        }
+    }
+    if ($null -ne $journalBytes -and $recoveryFailures.Count -eq 0) {
+        try {
+            Remove-FileTransactionJournal $journalBytes
+        } catch {
+            $journalFailure = $_
+            try {
+                Repair-InterruptedFileTransaction
+            } catch {
+                $recoveryFailures += "清理事务记录失败：$($journalFailure.Exception.Message)；自动恢复失败：$($_.Exception.Message)"
+            }
+            if ($null -eq $operationFailure) { $operationFailure = $journalFailure }
         }
     }
     if ($recoveryFailures.Count -gt 0) {
