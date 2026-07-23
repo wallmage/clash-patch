@@ -274,6 +274,7 @@ $target = Join-Path (Join-Path $AppHome "profiles") "Script.js"
 $vergePath = Join-Path $AppHome "verge.yaml"
 $configPath = Join-Path $AppHome "config.yaml"
 $statePath = Join-Path $AppHome "clash-patch-install-state.json"
+$usageStatePath = Join-Path $AppHome "clash-patch-usage-profile.json"
 $state = $null
 
 try {
@@ -338,11 +339,13 @@ try {
         Write-Info "Clash Verge Rev 保持运行；config.yaml 与 verge.yaml 未改动，安装状态文件继续保留。"
     }
 
-    if (-not $scriptChanged -and $null -eq $state) {
+    $usageStateExists = Test-Path -LiteralPath $usageStatePath -PathType Leaf
+    if (-not $scriptChanged -and $null -eq $state -and -not $usageStateExists) {
         Write-Info "没有发现已安装的自动补丁，无需移除。"
         Complete-UninstallResult 0 "no_change" "not_installed" "没有发现已安装的自动补丁，无需移除。"
     }
     if (-not $settingsRestored -and -not $clientRunning) { throw "部分设置在安装后有新改动，未自动覆盖；请根据保留的安装状态文件手动处理。" }
+    if ($usageStateExists) { Remove-Item -LiteralPath $usageStatePath -Force }
 
     if ($clientRunning) {
         Write-Info "全局自动补丁已移除；客户端保持运行，应用设置和现有备份均未改动。"

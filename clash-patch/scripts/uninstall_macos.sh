@@ -5,6 +5,7 @@ set -f
 INSTALL_DIR="$HOME/Library/Application Support/ClashPatch"
 BACKUP_DIR="$INSTALL_DIR/backups"
 STATE_PATH="$INSTALL_DIR/install-state.plist"
+USAGE_STATE_PATH="${CLASH_PATCH_USAGE_STATE_PATH:-$INSTALL_DIR/usage-profile.plist}"
 CURRENT_LABEL="com.clashpatch.profiles"
 CURRENT_PLIST="$HOME/Library/LaunchAgents/$CURRENT_LABEL.plist"
 CURRENT_PATCHER="$INSTALL_DIR/patch_profiles.rb"
@@ -41,6 +42,27 @@ say() {
   [ "$JSON_OUTPUT" -eq 0 ] || return 0
   /usr/bin/printf '%s\n' "[Clash 补丁] $1"
 }
+
+usage() {
+  [ "$JSON_OUTPUT" -eq 0 ] || return 0
+  /usr/bin/printf '%s\n' "用法：uninstall_macos.sh [--json]"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --json)
+      shift
+      ;;
+    -h|--help)
+      usage
+      finish 0 ok help "已显示帮助。"
+      ;;
+    *)
+      usage
+      finish 64 invalid_request invalid_arguments "参数错误。"
+      ;;
+  esac
+done
 
 launch_agent_owned() {
   candidate=$1
@@ -121,6 +143,7 @@ fi
   "$INSTALL_DIR/patch_profiles.rb" \
   "$INSTALL_DIR/policy.json" \
   "$STATE_PATH" \
+  "$USAGE_STATE_PATH" \
   "$INSTALL_DIR/patch.log" \
   "$INSTALL_DIR/patch-error.log"
 /bin/rmdir "$INSTALL_DIR" >/dev/null 2>&1 || true

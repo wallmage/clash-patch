@@ -124,6 +124,16 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+operation_count=0
+[ "$SHOW_PROFILE" -eq 1 ] && operation_count=$((operation_count + 1))
+[ "$SAFE_UPDATE" -eq 1 ] && operation_count=$((operation_count + 1))
+if [ "$operation_count" -gt 1 ]; then
+  finish 64 invalid_request conflicting_operations "一次只能执行一个操作。" parse_arguments
+fi
+if [ "$SHOW_PROFILE" -eq 1 ] && [ -n "$USAGE_PROFILE" ]; then
+  finish 64 invalid_request conflicting_operations "读取档位时不能同时保存新档位。" parse_arguments
+fi
+
 if [ "$SHOW_PROFILE" -eq 1 ]; then
   OPERATION="show_profile"
   saved_profile=$(read_saved_profile || true)

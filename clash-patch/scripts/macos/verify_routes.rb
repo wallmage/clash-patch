@@ -32,10 +32,10 @@ module ClashRouteVerifier
   module_function
 
   TARGETS = [
-    ["Google", "https://www.google.com/search?q=clash-route-verification", :main, /google/i],
-    ["OpenAI", "https://openai.com/", :ai, /openai/i],
-    ["Anthropic", "https://www.anthropic.com/", :ai, /anthropic/i],
-    ["Claude", "https://claude.ai/", :ai, /claude/i]
+    ["Google", "https://www.google.com/search?q=clash-route-verification", :main, /(?:\A|\.)google\.com\z/i],
+    ["OpenAI", "https://openai.com/", :ai, /(?:\A|\.)openai\.com\z/i],
+    ["Anthropic", "https://www.anthropic.com/", :ai, /(?:\A|\.)anthropic\.com\z/i],
+    ["Claude", "https://claude.ai/", :ai, /(?:\A|\.)claude\.ai\z/i]
   ].freeze
 
   def get_json(socket, endpoint)
@@ -93,6 +93,8 @@ module ClashRouteVerifier
     return true if chains.include?(expected_group) && chains.include?(expected_selection)
 
     chains.any? do |name|
+      next false unless name.match?(/google/i)
+
       selection = proxies.dig(name, "now").to_s
       !selection.empty? && selection != "DIRECT" && chains.include?(selection)
     end
@@ -141,6 +143,19 @@ module ClashRouteVerifier
   end
 
   def cli(argv = ARGV, output: $stdout)
+    unknown = argv.reject { |argument| argument == "--json" }
+    unless unknown.empty?
+      json_mode = argv.include?("--json")
+      if json_mode
+        ClashPatchResult.write(
+          output: output, command: "verify_routes", operation: "verify_routes", ok: false,
+          status: "invalid_request", code: "invalid_arguments", exit_code: 64,
+          summary_zh: "参数错误。", profile: nil, changes: [], checks: [], items: [],
+          messages: [], warnings: []
+        )
+      end
+      return 64
+    end
     json_mode = argv.include?("--json")
     details = { checks: [] }
     ok = run(output: json_mode ? StringIO.new : output, details: details)

@@ -134,14 +134,19 @@ function Set-RemoteSubscriptionAutoUpdateDisabled([string]$Text) {
             }
         }
         $childIndent = $item.FieldIndent + 2
+        $childIndentFound = $false
         $allowIndexes = @()
         for ($i = $item.OptionIndex + 1; $i -lt $optionEnd; $i++) {
             if ([string]::IsNullOrWhiteSpace($lines[$i]) -or $lines[$i].TrimStart().StartsWith("#")) { continue }
             $indent = Get-YamlIndent $lines[$i]
             if ($indent -le $item.FieldIndent) { continue }
+            if (-not $childIndentFound) {
+                $childIndent = $indent
+                $childIndentFound = $true
+            }
+            if ($indent -ne $childIndent) { continue }
             $entry = Get-YamlMappingEntry $lines[$i]
             if ($null -ne $entry -and $entry.Key -eq "allow_auto_update") { $allowIndexes += $i }
-            if ($childIndent -eq $item.FieldIndent + 2) { $childIndent = $indent }
         }
         if ($allowIndexes.Count -gt 1) { throw "profiles.yaml 的 option 存在重复 allow_auto_update。" }
         $childPrefix = " " * $childIndent
@@ -169,11 +174,14 @@ function Assert-RemoteSubscriptionAutoUpdateDisabled([string]$Text) {
     foreach ($item in $items) {
         if ($item.Type -ne "remote") { continue }
         if ($item.OptionIndex -lt 0) { throw "远程订阅仍允许自动更新。" }
+        $childIndent = -1
         $found = 0
         for ($i = $item.OptionIndex + 1; $i -lt $item.End; $i++) {
             if ([string]::IsNullOrWhiteSpace($lines[$i]) -or $lines[$i].TrimStart().StartsWith("#")) { continue }
             $indent = Get-YamlIndent $lines[$i]
             if ($indent -le $item.FieldIndent) { break }
+            if ($childIndent -lt 0) { $childIndent = $indent }
+            if ($indent -ne $childIndent) { continue }
             $entry = Get-YamlMappingEntry $lines[$i]
             if ($null -ne $entry -and $entry.Key -eq "allow_auto_update") {
                 $value = ($entry.Value -replace '\s+#.*$', '').Trim()

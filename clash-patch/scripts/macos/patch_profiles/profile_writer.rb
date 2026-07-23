@@ -1,6 +1,30 @@
 module ClashPatch
   module_function
 
+  def write_locked_bytes(source, replacement_bytes, original_bytes)
+    source.rewind
+    written = source.write(replacement_bytes)
+    raise IOError, "配置写入不完整" unless written == replacement_bytes.bytesize
+
+    source.truncate(replacement_bytes.bytesize)
+    source.flush
+    source.fsync
+    true
+  rescue SystemCallError, IOError => write_error
+    begin
+      source.rewind
+      restored = source.write(original_bytes)
+      raise IOError, "原配置恢复不完整" unless restored == original_bytes.bytesize
+
+      source.truncate(original_bytes.bytesize)
+      source.flush
+      source.fsync
+    rescue SystemCallError, IOError => restore_error
+      raise IOError, "配置写入失败且原内容恢复失败：#{restore_error.class}"
+    end
+    raise write_error
+  end
+
   def locked_source_current?(source, path, write_path)
     return false unless File.realpath(path) == write_path
 
@@ -61,11 +85,7 @@ module ClashPatch
             # descriptor still names the old inode and cannot overwrite the
             # newly refreshed file. The post-write identity check then retries.
             patched_bytes = File.binread(temporary.path)
-            source.rewind
-            source.write(patched_bytes)
-            source.truncate(patched_bytes.bytesize)
-            source.flush
-            source.fsync
+            write_locked_bytes(source, patched_bytes, original_bytes)
             outcome = if locked_source_current?(source, path, write_path)
                         result.merge(
                           path: path,

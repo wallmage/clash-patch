@@ -80,6 +80,8 @@ module ClashPatch
   end
 
   def batch_json_status(results)
+    return ["failed", "no_profiles", "没有找到可处理的配置。"] if results.empty?
+
     statuses = results.map { |result| result[:status] }
     failures = statuses - %i[updated unchanged]
     return ["no_change", "no_change", "所有配置都无需修改。"] if failures.empty? && statuses.all? { |status| status == :unchanged }
@@ -342,6 +344,14 @@ module ClashPatch
       auto_reload: options[:auto_reload] && !options[:dry_run],
       usage_profile: options[:usage_profile] || 3
     )
+    if results.empty?
+      return emit_cli_result(
+        operation: options[:dry_run] ? "preview_profiles" : "patch_profiles", exit_code: 1,
+        status: "failed", code: "no_profiles", summary_zh: "没有找到可处理的配置。"
+      ) if options[:json]
+      warn "没有找到可处理的配置。"
+      return 1
+    end
     if options[:json]
       status, code, summary = batch_json_status(results)
       exit_code = %w[ok no_change].include?(status) ? 0 : 1

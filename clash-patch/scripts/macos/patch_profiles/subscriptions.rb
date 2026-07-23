@@ -236,6 +236,14 @@ module ClashPatch
       return { status: :aborted, failed_profile: target[:name].to_s, reason: :download_or_validation_failed }
     end
 
+    identities = items.map do |item|
+      stat = File.stat(File.realpath(item.fetch(:path)))
+      [stat.dev, stat.ino]
+    end
+    if identities.uniq.length != identities.length
+      return { status: :aborted, failed_profile: "", reason: :duplicate_target }
+    end
+
     handles = []
     concurrent_change = false
     begin

@@ -137,6 +137,19 @@ class MacosWrapperTest < Minitest::Test
     end
   end
 
+  def test_uninstaller_rejects_unknown_arguments_without_removing_state
+    Dir.mktmpdir do |home|
+      state = File.join(home, "usage-profile.plist")
+      File.write(state, "owned")
+
+      stdout, _stderr, status = run_script(UNINSTALLER, "--typo", home: home)
+
+      assert_equal 64, status.exitstatus
+      assert_includes stdout, "用法："
+      assert File.file?(state)
+    end
+  end
+
   def test_installer_help_and_argument_errors_have_stable_exit_codes
     Dir.mktmpdir do |home|
       stdout, _stderr, status = run_script(INSTALLER, "--help", home: home)
@@ -152,6 +165,16 @@ class MacosWrapperTest < Minitest::Test
       stdout, _stderr, status = run_script(INSTALLER, "--profile", "4", home: home)
       assert_equal 64, status.exitstatus
       assert_includes stdout, "用途档位无效"
+
+      _stdout, _stderr, status = run_script(
+        INSTALLER, "--show-profile", "--safe-update", home: home
+      )
+      assert_equal 64, status.exitstatus
+
+      _stdout, _stderr, status = run_script(
+        INSTALLER, "--show-profile", "--profile", "1", home: home
+      )
+      assert_equal 64, status.exitstatus
     end
   end
 
@@ -380,6 +403,8 @@ class MacosWrapperTest < Minitest::Test
       FileUtils.mkdir_p(agent_dir)
       File.write(File.join(install_dir, "patch_profiles.rb"), "owned")
       File.write(File.join(install_dir, "policy.json"), "owned")
+      state = File.join(home, "usage-profile.plist")
+      File.write(state, "owned")
       File.write(File.join(backup_dir, "keep.backup"), "keep")
       unowned_agent = File.join(agent_dir, "com.clashpatch.profiles.plist")
       File.write(unowned_agent, "not a plist owned by clash patch")
@@ -389,6 +414,7 @@ class MacosWrapperTest < Minitest::Test
       assert status.success?, stdout
       refute File.exist?(File.join(install_dir, "patch_profiles.rb"))
       refute File.exist?(File.join(install_dir, "policy.json"))
+      refute File.exist?(state)
       assert File.file?(File.join(backup_dir, "keep.backup"))
       assert File.file?(unowned_agent)
       assert_includes stdout, "备份仍保留"

@@ -68,6 +68,21 @@ if ([string]::IsNullOrWhiteSpace($AppHome) -or -not (Test-Path -LiteralPath $App
     exit 2
 }
 
+$requestedOperations = @(
+    [bool]$SnapshotProfiles,
+    [bool]$VerifySafeUpdate,
+    [bool]$ListBackups,
+    (-not [string]::IsNullOrWhiteSpace($CompareBackup)),
+    (-not [string]::IsNullOrWhiteSpace($RestoreBackup)),
+    [bool]$ShowUsageProfile
+) | Where-Object { $_ }
+if ($requestedOperations.Count -gt 1) {
+    Complete-InstallResult 64 "invalid_request" "conflicting_operations" "一次只能执行一个操作。"
+}
+if (-not [string]::IsNullOrWhiteSpace($ExpectedCurrentSha256) -and [string]::IsNullOrWhiteSpace($RestoreBackup)) {
+    Complete-InstallResult 64 "invalid_request" "unexpected_hash" "只有恢复备份时才能提供预期 SHA-256。"
+}
+
 # Clash Verge Rev 的全局扩展脚本位置：profiles/Script.js。
 $profilesDirectory = Join-Path $AppHome "profiles"
 $backupRoot = Join-Path $AppHome "clash-patch-backups"
@@ -128,10 +143,19 @@ if ($VerifySafeUpdate) {
             $text = Get-Content -LiteralPath $target[0].Path -Raw -Encoding UTF8
             Test-GeneratedYaml $text ([string]$item.File) | Out-Null
             Test-MihomoCandidate $core $text $profilesDirectory
-            $validated += [pscustomobject]@{ Target = $target[0]; Manifest = $item }
+            $validated += [pscustomobject]@{
+                Target = $target[0]
+                Manifest = $item
+                ValidatedSha256 = (Get-FileSha256 $target[0].Path)
+            }
         }
         $savedProfile = Get-SavedUsageProfile $usageStatePath
         if ($savedProfile -eq 3) { Assert-RemoteSubscriptionAutoUpdateDisabled $indexText | Out-Null }
+        foreach ($entry in $validated) {
+            if ((Get-FileSha256 $entry.Target.Path) -ne $entry.ValidatedSha256) {
+                throw "订阅在验收期间再次发生变化。"
+            }
+        }
     } catch {
         $restoreResult = Restore-SafeUpdateFiles $recoveryItems $observedCurrentHashes
         if ($restoreResult.Conflicts.Count -gt 0) {
@@ -198,6 +222,9 @@ if (-not [string]::IsNullOrWhiteSpace($RestoreBackup)) {
     $restoreBytes = [System.IO.File]::ReadAllBytes($resolved.BackupPath)
     $currentBytes = [System.IO.File]::ReadAllBytes($resolved.TargetPath)
     Test-RestoreCandidate $resolved.TargetPath $restoreBytes
+    if ((Get-FileSha256 $resolved.TargetPath) -ne $currentHash.ToLowerInvariant()) {
+        throw "当前配置在检查期间发生变化，拒绝覆盖。"
+    }
     Backup-Versioned $resolved.TargetPath $backupRoot "pre-restore" | Out-Null
     try {
         Write-BytesAtomic $resolved.TargetPath $restoreBytes

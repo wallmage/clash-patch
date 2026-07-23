@@ -46,6 +46,7 @@ class SkillContractTest < Minitest::Test
     tests/generate_windows_policy.rb
     tests/test_macos_patcher.rb
     tests/test_macos_wrappers.rb
+    tests/test_mutation_safety.rb
     tests/test_skill_contract.rb
     tests/test_windows_installer.ps1
     tests/test_windows_patcher.js
@@ -950,6 +951,7 @@ class SkillContractTest < Minitest::Test
     assert_includes workflow, "runs-on: macos-15"
     assert_includes workflow, "/usr/bin/ruby tests/test_macos_patcher.rb"
     assert_includes workflow, "ruby tests/coverage_ruby.rb"
+    assert_includes workflow, "ruby tests/test_mutation_safety.rb"
     assert_includes workflow, "ruby tests/test_macos_wrappers.rb"
     assert_includes workflow, "/usr/bin/ruby tests/test_macos_wrappers.rb"
     assert_includes workflow, "--test-coverage-lines=100"
@@ -960,6 +962,10 @@ class SkillContractTest < Minitest::Test
     assert_includes workflow, "shell: pwsh"
     assert_includes workflow, "Get-Command pwsh.exe"
     assert_includes workflow, "git diff --check"
+    assert_includes workflow, "fetch-depth: 0"
+    assert_includes workflow, "github.event.before"
+    assert_includes workflow, "github.event.pull_request.base.sha"
+    assert_equal 2, workflow.scan(/timeout-minutes:\s*20/).length
   end
 
   def test_windows_runtime_tests_use_powershell_ast_for_automatic_variable_writes
@@ -973,6 +979,16 @@ class SkillContractTest < Minitest::Test
     assert_includes source, "PostfixPlusPlus"
     assert_includes source, "CommandAst"
     assert_includes source, "Set-Variable"
+  end
+
+  def test_every_test_entrypoint_is_wired_into_ci
+    workflow = File.read(File.join(ROOT, ".github/workflows/test.yml"))
+    entrypoints = Dir[File.join(ROOT, "tests/test_*.{rb,js,ps1}")].sort
+
+    refute_empty entrypoints
+    entrypoints.each do |path|
+      assert_includes workflow, File.basename(path), "test entrypoint is not executed by CI: #{path}"
+    end
   end
 
   def test_all_public_commands_expose_the_versioned_result_contract

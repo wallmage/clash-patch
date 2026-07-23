@@ -1025,6 +1025,8 @@ test('Windows route verifier accepts an explicit non-AI Google proxy group', () 
   assert.match(source, /function Test-RouteChains/);
   assert.match(source, /Observe-Route "Google"[^\r\n]+\$true/);
   assert.match(source, /Observe-Route "OpenAI"[^\r\n]+\$false/);
+  assert.match(source, /\(\?\i\)\(\^\|\\\.\)google\\\.com\$/);
+  assert.doesNotMatch(source, /Observe-Route "Google"[^\r\n]+"google"/);
 });
 
 test('PowerShell scripts never assign to read-only automatic variables', () => {

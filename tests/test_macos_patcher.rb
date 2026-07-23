@@ -254,6 +254,28 @@ class MacosPatcherTest < Minitest::Test
     assert_equal "中文结果\n", output.string
   end
 
+  def test_route_verifier_rejects_unknown_arguments_before_running
+    output = StringIO.new
+    ClashRouteVerifier.stub(:run, ->(**) { flunk "invalid arguments reached route verification" }) do
+      assert_equal 64, ClashRouteVerifier.cli(["--typo", "--json"], output: output)
+    end
+    result = JSON.parse(output.string)
+    assert_equal "invalid_request", result.fetch("status")
+    assert_equal "invalid_arguments", result.fetch("code")
+  end
+
+  def test_route_target_patterns_require_real_domain_boundaries
+    patterns = ClashRouteVerifier::TARGETS.to_h { |label, _url, _kind, pattern| [label, pattern] }
+
+    assert_match patterns.fetch("Google"), "www.google.com"
+    refute_match patterns.fetch("Google"), "notgoogle.com"
+    refute_match patterns.fetch("Google"), "google.com.attacker.invalid"
+    assert_match patterns.fetch("OpenAI"), "api.openai.com"
+    refute_match patterns.fetch("OpenAI"), "openai.com.attacker.invalid"
+    assert_match patterns.fetch("Claude"), "claude.ai"
+    refute_match patterns.fetch("Claude"), "notclaude.ai"
+  end
+
   def test_unknown_policy_version_is_rejected_without_mutating_config
     config = base_config
     snapshot = Marshal.load(Marshal.dump(config))
@@ -265,6 +287,47 @@ class MacosPatcherTest < Minitest::Test
     assert_equal :invalid_policy, result.fetch(:status)
     assert_equal snapshot, config
     assert_equal snapshot, result.fetch(:config)
+  end
+
+  def test_locked_write_restores_original_bytes_after_a_partial_write_error
+    fake = Class.new do
+      attr_reader :bytes
+
+      def initialize(original)
+        @bytes = original.dup
+        @position = 0
+        @writes = 0
+      end
+
+      def rewind
+        @position = 0
+      end
+
+      def write(value)
+        @writes += 1
+        if @writes == 1
+          half = [value.bytesize / 2, 1].max
+          @bytes[0, half] = value.byteslice(0, half)
+          @position = half
+          raise Errno::ENOSPC
+        end
+        @bytes = value.dup
+        @position = value.bytesize
+        value.bytesize
+      end
+
+      def truncate(length)
+        @bytes = @bytes.byteslice(0, length)
+      end
+
+      def flush; end
+      def fsync; end
+    end.new("original configuration")
+
+    assert_raises(Errno::ENOSPC) do
+      ClashPatch.write_locked_bytes(fake, "replacement configuration", "original configuration")
+    end
+    assert_equal "original configuration", fake.bytes
   end
 
   def test_applies_dns_tun_ai_and_webrtc_policy
@@ -3065,6 +3128,18 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_route_verifier_rejects_an_unrelated_selector_for_google
+    proxies = {
+      "Main" => { "now" => "Taiwan" },
+      "AI" => { "now" => "Japan" },
+      "Gaming" => { "now" => "GameNode" }
+    }
+    refute ClashRouteVerifier.route_passes?(
+      ["GameNode", "Gaming"], proxies: proxies, kind: :main,
+      expected_group: "Main", expected_selection: "Taiwan", ai_group: "AI"
+    )
+  end
+
   def test_route_verifier_accepts_a_user_google_proxy_group
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
@@ -3089,6 +3164,41 @@ class MacosPatcherTest < Minitest::Test
           end
         end
       end
+    end
+  end
+
+  def test_safe_update_rejects_two_paths_to_the_same_inode
+    Dir.mktmpdir do |directory|
+      first = File.join(directory, "first.yaml")
+      second = File.join(directory, "second.yaml")
+      File.write(first, YAML.dump(base_config))
+      File.link(first, second)
+
+      result = ClashPatch.safe_update_all(
+        targets: [{ name: "first", path: first }, { name: "second", path: second }],
+        backup_root: File.join(directory, "backups"),
+        policy: @policy, usage_profile: 3,
+        fetcher: ->(_target) { YAML.dump(base_config) },
+        validator: ->(_path) { true }
+      )
+
+      assert_equal :aborted, result.fetch(:status)
+      assert_equal :duplicate_target, result.fetch(:reason)
+    end
+  end
+
+  def test_cli_rejects_an_empty_profile_directory
+    Dir.mktmpdir do |directory|
+      output, error = capture_io do
+        assert_equal 1, ClashPatch.cli([
+          "--json", "--profile-dir", directory, "--policy", POLICY_PATH,
+          "--usage-profile", "1", "--no-reload"
+        ])
+      end
+      assert_empty error
+      result = JSON.parse(output)
+      assert_equal "failed", result.fetch("status")
+      assert_equal "no_profiles", result.fetch("code")
     end
   end
 

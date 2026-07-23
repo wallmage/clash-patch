@@ -202,11 +202,10 @@ module ClashPatch
              Digest::SHA256.hexdigest(locked_bytes).casecmp(expected_current_sha256).zero?
         return { status: :restore_conflict, path: target }
       end
+      write_locked_bytes(source, backup_bytes, locked_bytes)
       source.rewind
-      source.write(backup_bytes)
-      source.truncate(backup_bytes.bytesize)
-      source.flush
-      source.fsync
+      return { status: :restore_conflict, path: target } unless
+        locked_source_current?(source, target, write_path) && source.read == backup_bytes
     end
     {
       status: :updated,

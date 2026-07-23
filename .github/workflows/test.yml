@@ -11,8 +11,11 @@ permissions:
 jobs:
   macos:
     runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: ruby/setup-ruby@003a5c4d8d6321bd302e38f6f0ec593f77f06600 # v1.319.0
         with:
           ruby-version: "3.3"
@@ -23,6 +26,8 @@ jobs:
         run: ruby tests/coverage_ruby.rb
       - name: Ruby 3.3 skill contract suite
         run: ruby tests/test_skill_contract.rb
+      - name: Safety mutation checks
+        run: ruby tests/test_mutation_safety.rb
       - name: macOS command wrapper behavior
         run: ruby tests/test_macos_wrappers.rb
       - name: Windows engine suite
@@ -49,12 +54,21 @@ jobs:
           sh -n clash-patch/scripts/install_macos.sh
           sh -n clash-patch/scripts/uninstall_macos.sh
       - name: Source tree whitespace checks
+        env:
+          PUSH_BASE_SHA: ${{ github.event.before }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           git diff --check
-          git show --check --format= HEAD
+          base_sha="${PR_BASE_SHA:-$PUSH_BASE_SHA}"
+          if [ -n "$base_sha" ] && [ "$base_sha" != "0000000000000000000000000000000000000000" ]; then
+            git diff --check "$base_sha" HEAD
+          else
+            git show --check --format= HEAD
+          fi
 
   windows-installer:
     runs-on: windows-2022
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

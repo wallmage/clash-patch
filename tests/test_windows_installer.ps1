@@ -380,6 +380,18 @@ try {
     Assert-True (-not [bool]$jsonInvalidResult.ok) "invalid request was reported as successful"
     Assert-True ($jsonInvalidResult.status -eq "invalid_request") "invalid request status mismatch"
 
+    $conflictingOperations = Invoke-TestPowerShell $installer @(
+        "-AppHome", $jsonShowCase, "-ShowUsageProfile", "-ListBackups", "-Json"
+    )
+    $conflictingOperationsResult = Assert-JsonResult $conflictingOperations "install" 64
+    Assert-True ($conflictingOperationsResult.code -eq "conflicting_operations") "conflicting public operations were not rejected"
+
+    $orphanExpectedHash = Invoke-TestPowerShell $installer @(
+        "-AppHome", $jsonShowCase, "-ExpectedCurrentSha256", ("a" * 64), "-Json"
+    )
+    $orphanExpectedHashResult = Assert-JsonResult $orphanExpectedHash "install" 64
+    Assert-True ($orphanExpectedHashResult.code -eq "unexpected_hash") "orphan restore hash was not rejected"
+
     $jsonUninstall = Invoke-TestPowerShell $uninstaller @("-AppHome", $jsonShowCase, "-Json")
     $jsonUninstallResult = Assert-JsonResult $jsonUninstall "uninstall" 0
     Assert-True ($jsonUninstallResult.status -eq "no_change") "empty uninstall was not no_change"
@@ -650,6 +662,34 @@ items:
     Assert-True ((Set-RemoteSubscriptionAutoUpdateDisabled $profilesIndexOutput) -eq $profilesIndexOutput) "profiles.yaml transform is not idempotent"
     Assert-RemoteSubscriptionAutoUpdateDisabled $profilesIndexOutput
 
+    $nestedProfilesInput = @'
+items:
+- uid: R-nested
+  type: remote
+  option:
+    headers:
+      User-Agent: Clash
+    update_interval: 1440
+'@
+    $nestedProfilesOutput = Set-RemoteSubscriptionAutoUpdateDisabled $nestedProfilesInput
+    Assert-True ($nestedProfilesOutput -match '(?m)^    allow_auto_update: false$') "nested option did not receive a direct allow_auto_update field"
+    Assert-True ($nestedProfilesOutput -notmatch '(?m)^      allow_auto_update: false$') "allow_auto_update was inserted into a nested option mapping"
+    Assert-True ($nestedProfilesOutput.Contains("      User-Agent: Clash")) "nested option content was changed"
+    Assert-RemoteSubscriptionAutoUpdateDisabled $nestedProfilesOutput
+
+    $nestedOnlyRejected = $false
+    try {
+        Assert-RemoteSubscriptionAutoUpdateDisabled @'
+items:
+- uid: R-nested
+  type: remote
+  option:
+    headers:
+      allow_auto_update: false
+'@ | Out-Null
+    } catch { $nestedOnlyRejected = $true }
+    Assert-True $nestedOnlyRejected "nested allow_auto_update was mistaken for the direct option setting"
+
     $flowProfilesRejected = $false
     try { Set-RemoteSubscriptionAutoUpdateDisabled "items: [{ type: remote }]`n" | Out-Null } catch { $flowProfilesRejected = $true }
     Assert-True $flowProfilesRejected "inline profiles list was modified instead of rejected"
@@ -867,6 +907,12 @@ items:
     Assert-True ($profilesBackups.Count -ge 1) "profiles.yaml was changed without a dated backup"
     $nullCaseJson = Invoke-TestPowerShell $installer @("-AppHome", $nullCase, "-MihomoPath", $fakeCore, "-Json")
     Assert-JsonResult $nullCaseJson "install" 0 | Out-Null
+    Invoke-Uninstaller $nullCase
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $nullCase "clash-patch-usage-profile.json"))) "successful safe uninstall retained the profile 3 gate"
+    $postUninstallLight = Invoke-TestPowerShell $installer @("-AppHome", $nullCase, "-UsageProfile", "1", "-MihomoPath", $fakeCore)
+    Assert-True ($postUninstallLight.ExitCode -eq 0) "safe uninstall did not permit a documented profile 3 to profile 1 downgrade: $($postUninstallLight.Output)"
+    $postUninstallProfile = Get-Content -LiteralPath (Join-Path $nullCase "clash-patch-usage-profile.json") -Raw | ConvertFrom-Json
+    Assert-True ([int]$postUninstallProfile.Profile -eq 1) "post-uninstall downgrade did not save profile 1"
     if ($onWindows) {
         $mihomoArguments = Get-Content -LiteralPath (Join-Path $sandbox "mihomo-arguments.log") -Raw
         Assert-True ($mihomoArguments -match '(?m)(^| )-t( |$)') "installer never asked Mihomo to test a generated candidate"

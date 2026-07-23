@@ -167,10 +167,10 @@ try {
         Write-Output "AI 分组：已识别；当前选择已隐藏"
     }
     $checks = @(
-        (Observe-Route "Google" "https://www.google.com/search?q=clash-route-verification" "google" $main $mainSelection $proxies $ai $true),
-        (Observe-Route "OpenAI" "https://openai.com/" "openai" $ai $aiSelection $proxies $ai $false),
-        (Observe-Route "Anthropic" "https://www.anthropic.com/" "anthropic" $ai $aiSelection $proxies $ai $false),
-        (Observe-Route "Claude" "https://claude.ai/" "claude" $ai $aiSelection $proxies $ai $false)
+        (Observe-Route "Google" "https://www.google.com/search?q=clash-route-verification" '(?i)(^|\.)google\.com$' $main $mainSelection $proxies $ai $true),
+        (Observe-Route "OpenAI" "https://openai.com/" '(?i)(^|\.)openai\.com$' $ai $aiSelection $proxies $ai $false),
+        (Observe-Route "Anthropic" "https://www.anthropic.com/" '(?i)(^|\.)anthropic\.com$' $ai $aiSelection $proxies $ai $false),
+        (Observe-Route "Claude" "https://claude.ai/" '(?i)(^|\.)claude\.ai$' $ai $aiSelection $proxies $ai $false)
     )
     if (@($checks | Where-Object { -not $_ }).Count -gt 0) {
         if ($Json) { Write-ClashPatchResult (New-ClashPatchResult -Command "verify_routes" -Operation "verify_routes" -Ok $false -Status "failed" -Code "route_check_failed" -ExitCode 1 -SummaryZh "Windows 分流验证未通过。" -Checks @($script:ClashPatchChecks)) }
