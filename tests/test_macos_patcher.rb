@@ -14,6 +14,24 @@ RESULT_CONTRACT_PATH = File.join(ROOT, "clash-patch/scripts/macos/result_contrac
 POLICY_PATH = File.join(ROOT, "clash-patch/references/policy.json")
 MAIN_GROUP_FIXTURES = File.join(ROOT, "tests/fixtures/main_group_cases.json")
 PATCHER_AVAILABLE = File.file?(PATCHER_PATH) && File.file?(POLICY_PATH)
+CHILD_COVERAGE_DIRECTORY_ENV = "CLASH_PATCH_CHILD_COVERAGE_DIRECTORY"
+CHILD_COVERAGE_RUNNER = <<~'RUBY'
+  require "coverage"
+  require "digest"
+
+  entrypoint = ARGV.shift
+  output_path = ENV.fetch("CLASH_PATCH_CHILD_COVERAGE_OUTPUT")
+  Coverage.start(lines: true, branches: true)
+  at_exit do
+    coverage = Coverage.result
+    digests = coverage.each_key.to_h do |path|
+      [path, File.file?(path) ? Digest::SHA256.file(path).hexdigest : nil]
+    end
+    File.binwrite(output_path, Marshal.dump({ coverage: coverage, digests: digests }))
+  end
+  $PROGRAM_NAME = entrypoint
+  load entrypoint
+RUBY
 
 require PATCHER_PATH if PATCHER_AVAILABLE
 require ROUTE_VERIFIER_PATH if File.file?(ROUTE_VERIFIER_PATH)
@@ -38,6 +56,20 @@ class MacosPatcherTest < Minitest::Test
     status.success? && output.include?(marker)
   rescue SystemCallError
     false
+  end
+
+  def capture_ruby_entrypoint(path, *arguments)
+    coverage_directory = ENV[CHILD_COVERAGE_DIRECTORY_ENV]
+    return Open3.capture3(RbConfig.ruby, path, *arguments) unless coverage_directory
+
+    coverage_output = File.join(
+      coverage_directory,
+      "#{Process.pid}-#{Thread.current.object_id}-#{rand(1 << 62)}.marshal"
+    )
+    environment = { "CLASH_PATCH_CHILD_COVERAGE_OUTPUT" => coverage_output }
+    Open3.capture3(
+      environment, RbConfig.ruby, "-e", CHILD_COVERAGE_RUNNER, path, *arguments
+    )
   end
 
   def test_production_probe_normal_batch_restores_a_commit_when_bookkeeping_raises
@@ -455,6 +487,20 @@ class MacosPatcherTest < Minitest::Test
     assert_equal "invalid_request", result.fetch("status")
   end
 
+  def test_result_contract_executable_emits_the_cli_result
+    output, error, status = capture_ruby_entrypoint(
+      RESULT_CONTRACT_PATH,
+      "--command", "patch", "--operation", "entrypoint", "--ok", "true",
+      "--status", "ok", "--code", "completed", "--exit-code", "0", "--summary", "完成"
+    )
+
+    assert status.success?, error
+    assert_empty error
+    result = JSON.parse(output)
+    assert_equal "entrypoint", result.fetch("operation")
+    assert_equal status.exitstatus, result.fetch("exit_code")
+  end
+
   def test_result_contract_normalizes_unknown_status_and_value_types
     result = ClashPatchResult.build(
       command: :install, operation: :test, ok: false, status: :unknown, code: :failed,
@@ -490,8 +536,8 @@ class MacosPatcherTest < Minitest::Test
       config["proxies"].first["name"] = "PRIVATE-NODE-NAME"
       File.write(profile, YAML.dump(config))
 
-      output, error, status = Open3.capture3(
-        RbConfig.ruby, PATCHER_PATH, "--json", "--profile-dir", directory, "--dry-run"
+      output, error, status = capture_ruby_entrypoint(
+        PATCHER_PATH, "--json", "--profile-dir", directory, "--dry-run"
       )
 
       assert status.success?, error
@@ -509,7 +555,7 @@ class MacosPatcherTest < Minitest::Test
   end
 
   def test_patcher_json_mode_structures_argument_errors_regardless_of_argument_order
-    output, error, status = Open3.capture3(RbConfig.ruby, PATCHER_PATH, "--unknown", "--json")
+    output, error, status = capture_ruby_entrypoint(PATCHER_PATH, "--unknown", "--json")
 
     assert_equal 64, status.exitstatus
     assert_empty error
@@ -529,7 +575,7 @@ class MacosPatcherTest < Minitest::Test
       FileUtils.cp(ROUTE_VERIFIER_PATH, verifier)
 
       [[patcher, "patch"], [verifier, "verify_routes"]].each do |path, command|
-        output, error, status = Open3.capture3(RbConfig.ruby, path, "--json")
+        output, error, status = capture_ruby_entrypoint(path, "--json")
         assert_equal 1, status.exitstatus
         assert_empty error
         result = JSON.parse(output)
