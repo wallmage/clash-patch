@@ -95,7 +95,7 @@ function Get-RemoteSubscriptionAutoUpdateStateRecords([string]$Text) {
         if ($item.OptionIndex -ge 0) {
             $optionLine = [string]$lines[$item.OptionIndex]
             $optionEntry = Get-YamlMappingEntry $lines[$item.OptionIndex]
-            $optionValue = ($optionEntry.Value -replace '\s+#.*$', '').Trim()
+            $optionValue = (($optionEntry.Value -replace '^\s*#.*$', '') -replace '\s+#.*$', '').Trim()
             if ($optionValue -match '^[&*]' -or ($optionValue -match '^\{' -and $optionValue -ne '{}')) {
                 throw "profiles.yaml 的 option 使用了无法安全修改的写法。"
             }
@@ -313,7 +313,7 @@ function Assert-RemoteSubscriptionAutoUpdateOwnershipState([object]$State) {
             if ($null -eq $optionEntry -or $optionEntry.Key -ne "option") {
                 throw "订阅自动更新所有权状态项目无效。"
             }
-            $optionValue = ($optionEntry.Value -replace '\s+#.*$', '').Trim()
+            $optionValue = (($optionEntry.Value -replace '^\s*#.*$', '') -replace '\s+#.*$', '').Trim()
             if ($originalState -eq "true" -and $optionValue -ne "") {
                 throw "订阅自动更新所有权状态项目无效。"
             }
@@ -397,7 +397,7 @@ function Set-RemoteSubscriptionAutoUpdateDisabled([string]$Text) {
         }
 
         $optionEntry = Get-YamlMappingEntry $lines[$item.OptionIndex]
-        $optionValue = ($optionEntry.Value -replace '\s+#.*$', '').Trim()
+        $optionValue = (($optionEntry.Value -replace '^\s*#.*$', '') -replace '\s+#.*$', '').Trim()
         if ($optionValue -match '^[&*]' -or ($optionValue -match '^\{' -and $optionValue -ne '{}')) {
             throw "profiles.yaml 的 option 使用了无法安全修改的写法。"
         }
