@@ -456,15 +456,32 @@ class MutationSafetyTest < Minitest::Test
     with_repo_copy do |root|
       replace_once(
         root,
-        ".github/workflows/test.yml",
-        '          CLASH_PATCH_RUN_PRODUCTION_PROBES: "1"',
-        '          CLASH_PATCH_RUN_PRODUCTION_PROBES: "0"'
+        "tests/run_macos_production_probes.rb",
+        'probe_environment = { "CLASH_PATCH_RUN_PRODUCTION_PROBES" => "1" }.freeze',
+        'probe_environment = { "CLASH_PATCH_RUN_PRODUCTION_PROBES" => "0" }.freeze'
       )
 
       assert_mutation_is_killed(
         root,
         RbConfig.ruby, "tests/test_skill_contract.rb",
-        "--name", "test_ci_covers_production_runtimes_and_pins_actions"
+        "--name", "test_macos_production_probe_runner_executes_all_cases_and_propagates_any_failure"
+      )
+    end
+  end
+
+  def test_macos_production_probe_failure_aggregation_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "tests/run_macos_production_probes.rb",
+        "  failed ||= !success\n",
+        "  failed ||= false\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_macos_production_probe_runner_executes_all_cases_and_propagates_any_failure"
       )
     end
   end

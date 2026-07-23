@@ -75,22 +75,7 @@ jobs:
         with:
           ruby-version: "3.3"
       - name: Fault-inject production commit, kill, alias, process, and uninstall boundaries
-        env:
-          CLASH_PATCH_RUN_PRODUCTION_PROBES: "1"
-        run: |
-          set +e
-          ruby tests/test_macos_patcher.rb --name /production_probe/
-          patcher_status=$?
-          ruby tests/test_macos_wrappers.rb --name /production_probe/
-          wrapper_status=$?
-          /usr/bin/ruby tests/test_macos_patcher.rb --name /production_probe/
-          system_patcher_status=$?
-          /usr/bin/ruby tests/test_macos_wrappers.rb --name /production_probe/
-          system_wrapper_status=$?
-          if [ "$patcher_status" -ne 0 ] || [ "$wrapper_status" -ne 0 ] ||
-             [ "$system_patcher_status" -ne 0 ] || [ "$system_wrapper_status" -ne 0 ]; then
-            exit 1
-          fi
+        run: ruby tests/run_macos_production_probes.rb
 
   mihomo:
     strategy:

@@ -48,6 +48,7 @@ class SkillContractTest < Minitest::Test
     tests/baseline.md
     tests/coverage_ruby.rb
     tests/generate_windows_policy.rb
+    tests/run_macos_production_probes.rb
     tests/test_macos_patcher.rb
     tests/test_macos_wrappers.rb
     tests/test_mutation_safety.rb
@@ -1089,11 +1090,10 @@ class SkillContractTest < Minitest::Test
     refute_empty uses
     uses.each { |entry| assert_match(/@[0-9a-f]{40}\z/, entry, entry) }
     assert_includes workflow, "runs-on: macos-15"
-    assert_includes workflow, "/usr/bin/ruby tests/test_macos_patcher.rb"
+    assert_includes workflow, "ruby tests/run_macos_production_probes.rb"
     assert_includes workflow, "ruby tests/coverage_ruby.rb"
     assert_includes workflow, "ruby tests/test_mutation_safety.rb"
     assert_includes workflow, "ruby tests/test_macos_wrappers.rb"
-    assert_includes workflow, "/usr/bin/ruby tests/test_macos_wrappers.rb"
     assert_includes workflow, "runs-on: ${{ matrix.runner }}"
     assert_includes workflow, "runner: macos-15-intel"
     assert_includes workflow, "architecture: arm64"
@@ -1120,9 +1120,6 @@ class SkillContractTest < Minitest::Test
     assert_includes workflow, "--test-coverage-lines=100"
     assert_includes workflow, "--test-coverage-functions=100"
     assert_includes workflow, "--test-coverage-branches=80"
-    assert_includes workflow, 'CLASH_PATCH_RUN_PRODUCTION_PROBES: "1"'
-    assert_includes workflow, "ruby tests/test_macos_patcher.rb --name /production_probe/"
-    assert_includes workflow, "ruby tests/test_macos_wrappers.rb --name /production_probe/"
     assert_includes workflow, "34b4c5bc0c176eebd298f6624aa23ea41985a2c54efb04eb0e9c4542e45190ee"
     assert_includes workflow, "1a8520cfe425441eba3eba8623b27b985020031243fe1ecaa1af2b92358a03f9"
     assert_includes workflow, "mihomo-windows-amd64-$env:MIHOMO_VERSION.zip"
@@ -1212,6 +1209,7 @@ class SkillContractTest < Minitest::Test
   def test_production_probe_inventory_and_ci_aggregation_are_fixed
     patcher_source = File.read(File.join(ROOT, "tests/test_macos_patcher.rb"))
     wrapper_source = File.read(File.join(ROOT, "tests/test_macos_wrappers.rb"))
+    runner_source = File.read(File.join(ROOT, "tests/run_macos_production_probes.rb"))
     windows_source = File.read(File.join(ROOT, "tests/test_windows_installer.ps1"))
     workflow = File.read(File.join(ROOT, ".github/workflows/test.yml"))
     expected_macos = %w[
@@ -1283,12 +1281,76 @@ class SkillContractTest < Minitest::Test
     ).reject { |_, value| value == "null" }.map(&:first).uniq.sort
     assert_equal expected_public_kill_markers, armed_public_kill_markers
     assert_includes windows_source, '"real Mihomo core #{0} profile {1}: {2}"'
-    assert_includes workflow, "/usr/bin/ruby tests/test_macos_patcher.rb --name /production_probe/"
-    assert_includes workflow, "/usr/bin/ruby tests/test_macos_wrappers.rb --name /production_probe/"
-    assert_match(
-      /set \+e.*patcher_status=\$\?.*wrapper_status=\$\?.*system_patcher_status=\$\?.*system_wrapper_status=\$\?.*exit 1/m,
-      workflow
-    )
+    assert_equal 1, workflow.scan("ruby tests/run_macos_production_probes.rb").length
+    assert_includes runner_source, 'ENV.fetch("CLASH_PATCH_CURRENT_RUBY", RbConfig.ruby)'
+    assert_includes runner_source, 'ENV.fetch("CLASH_PATCH_SYSTEM_RUBY", "/usr/bin/ruby")'
+  end
+
+  def test_macos_production_probe_runner_executes_all_cases_and_propagates_any_failure
+    runner = File.join(ROOT, "tests/run_macos_production_probes.rb")
+    assert File.file?(runner), "macOS production probes need one behaviorally testable CI runner"
+
+    Dir.mktmpdir("clash-patch-probe-runner-") do |directory|
+      current_ruby = File.join(directory, "current-ruby")
+      system_ruby = File.join(directory, "system-ruby")
+      counter = File.join(directory, "counter")
+      log = File.join(directory, "calls")
+      fake_ruby_source = <<~RUBY
+        #!#{RbConfig.ruby}
+        statuses = ENV.fetch("CLASH_PATCH_FAKE_PROBE_STATUSES").split(",").map(&:to_i)
+        counter_path = ENV.fetch("CLASH_PATCH_FAKE_PROBE_COUNTER")
+        call_index = File.file?(counter_path) ? File.read(counter_path).to_i : 0
+        File.write(counter_path, (call_index + 1).to_s)
+        File.open(ENV.fetch("CLASH_PATCH_FAKE_PROBE_LOG"), "a") do |file|
+          file.puts(([File.basename($PROGRAM_NAME), ENV["CLASH_PATCH_RUN_PRODUCTION_PROBES"]] + ARGV).join("|"))
+        end
+        exit statuses.fetch(call_index, 99)
+      RUBY
+      [current_ruby, system_ruby].each do |path|
+        File.write(path, fake_ruby_source)
+        FileUtils.chmod(0o700, path)
+      end
+      expected_calls = [
+        "current-ruby|1|tests/test_macos_patcher.rb|--name|/production_probe/",
+        "current-ruby|1|tests/test_macos_wrappers.rb|--name|/production_probe/",
+        "system-ruby|1|tests/test_macos_patcher.rb|--name|/production_probe/",
+        "system-ruby|1|tests/test_macos_wrappers.rb|--name|/production_probe/"
+      ]
+
+      4.times do |failed_index|
+        statuses = Array.new(4, 0)
+        statuses[failed_index] = 7
+        FileUtils.rm_f([counter, log])
+        _output, _error, status = Open3.capture3(
+          {
+            "CLASH_PATCH_CURRENT_RUBY" => current_ruby,
+            "CLASH_PATCH_SYSTEM_RUBY" => system_ruby,
+            "CLASH_PATCH_FAKE_PROBE_STATUSES" => statuses.join(","),
+            "CLASH_PATCH_FAKE_PROBE_COUNTER" => counter,
+            "CLASH_PATCH_FAKE_PROBE_LOG" => log
+          },
+          RbConfig.ruby, runner, chdir: ROOT
+        )
+        refute status.success?, "probe runner ignored failure at command #{failed_index + 1}"
+        calls = File.readlines(log, chomp: true)
+        assert_equal expected_calls, calls,
+                     "probe runner did not execute every suite on both supported Rubies"
+      end
+
+      FileUtils.rm_f([counter, log])
+      _output, _error, status = Open3.capture3(
+        {
+          "CLASH_PATCH_CURRENT_RUBY" => current_ruby,
+          "CLASH_PATCH_SYSTEM_RUBY" => system_ruby,
+          "CLASH_PATCH_FAKE_PROBE_STATUSES" => "0,0,0,0",
+          "CLASH_PATCH_FAKE_PROBE_COUNTER" => counter,
+          "CLASH_PATCH_FAKE_PROBE_LOG" => log
+        },
+        RbConfig.ruby, runner, chdir: ROOT
+      )
+      assert status.success?, "probe runner rejected four successful probe suites"
+      assert_equal expected_calls, File.readlines(log, chomp: true)
+    end
   end
 
   def test_every_test_entrypoint_is_wired_into_ci
