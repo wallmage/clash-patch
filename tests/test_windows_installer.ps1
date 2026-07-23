@@ -1328,6 +1328,7 @@ public static class FakeCurl {
     $unitDebug = $unitOutput | ConvertTo-Json -Compress
     Assert-True ($unitOutput -match '(?m)^tun:') "unit transform lost tun node: type=$($unitOutput.GetType().FullName) count=$($unitOutput.Count) $(Get-TestOutputDiagnostic $unitDebug)"
     Test-GeneratedYaml $unitOutput "config.yaml" | Out-Null
+    Test-GeneratedYaml (Set-YamlTunMapping "ipv6: false`n") "config.yaml" | Out-Null
 
     $quotedInput = "`"ipv6`" : true`n`"tun`": null`n"
     $quotedOutput = Set-YamlTunMapping (Set-YamlTopLevelScalar $quotedInput "ipv6" "false")

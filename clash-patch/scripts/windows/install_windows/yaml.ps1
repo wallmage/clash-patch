@@ -177,8 +177,8 @@ function Set-YamlTunMapping([string]$Text) {
         while ($lines.Count -gt 0 -and [string]::IsNullOrWhiteSpace($lines[$lines.Count - 1])) {
             $lines = if ($lines.Count -eq 1) { @() } else { @($lines[0..($lines.Count - 2)]) }
         }
-        $replacement = @(New-ManagedTunBlock)
-        return (Join-YamlLines -Lines @($lines + $replacement))
+        $updated = Replace-YamlRange -Lines $lines -Start $lines.Count -End $lines.Count -Replacement @(New-ManagedTunBlock)
+        return (Join-YamlLines -Lines $updated)
     }
 
     $semanticValue = ($tun.Value -replace '\s+#.*$', '').Trim()
