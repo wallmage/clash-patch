@@ -187,7 +187,12 @@ module ClashPatch
 
     current_bytes = File.binread(write_path)
     return { status: :restore_conflict, path: target } unless Digest::SHA256.hexdigest(current_bytes).casecmp(expected_current_sha256).zero?
-    return { status: :no_change, path: target } if current_bytes == backup_bytes
+    if current_bytes == backup_bytes
+      return {
+        status: :no_change, path: target, rollback_bytes: current_bytes,
+        patched_digest: Digest::SHA256.hexdigest(backup_bytes), restored_backup: backup_id
+      }
+    end
 
     create_versioned_backup(target, backup_root, content: current_bytes, reason: "pre-restore")
     File.open(write_path, "r+b") do |source|
@@ -217,4 +222,3 @@ module ClashPatch
   end
 
 end
-

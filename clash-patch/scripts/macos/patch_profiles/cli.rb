@@ -247,11 +247,35 @@ module ClashPatch
         options[:restore_backup], directories: directories, backup_root: options[:backup_root],
         expected_current_sha256: options[:expected_current_sha256], validator: method(:validate_with_mihomo)
       )
-      exit_code = result[:status] == :updated || result[:status] == :no_change ? 0 : 1
+      if %i[updated no_change].include?(result[:status]) && result[:path]
+        selected = selected_profile_name
+        active_root = active_profile_root(directories, selected)
+        active = active_root &&
+                 File.expand_path(File.dirname(result.fetch(:path))) == File.expand_path(active_root) &&
+                 active_profile?(result.fetch(:path), selected)
+        result = result.merge(active: !!active)
+        result = activate_updated_profile(result, require_tun: :preserve) if active
+      end
+
+      status, code, summary = case result[:status]
+                              when :updated
+                                ["ok", "updated", result[:active] ? "备份已恢复并通过运行检查。" : "备份已恢复。"]
+                              when :no_change
+                                summary = result[:reloaded] ? "当前配置已经与备份一致，并通过运行检查。" : "当前配置已经与备份一致。"
+                                ["no_change", "no_change", summary]
+                              when :reload_failed_rolled_back
+                                ["rolled_back", "restore_runtime_check_failed", "备份未能通过运行检查，已恢复回滚前版本。"]
+                              when :reload_failed_restore_pending
+                                ["partial", "restore_runtime_pending", "备份未能通过运行检查；文件已恢复回滚前版本，但运行内核恢复失败。"]
+                              when :reload_failed_rollback_conflict
+                                ["partial", "restore_rollback_conflict", "备份未能通过运行检查，且订阅同时发生变化；未覆盖新内容。"]
+                              else
+                                ["failed", result[:status].to_s, "备份恢复失败。"]
+                              end
+      exit_code = %w[ok no_change].include?(status) ? 0 : 1
       return emit_cli_result(
         operation: "restore_backup", exit_code: exit_code,
-        status: result[:status] == :updated ? "ok" : (result[:status] == :no_change ? "no_change" : "failed"),
-        code: result[:status].to_s, summary_zh: exit_code.zero? ? "备份恢复处理完成。" : "备份恢复失败。",
+        status: status, code: code, summary_zh: summary,
         changes: result[:status] == :updated ? ["profile_restored"] : []
       ) if options[:json]
       puts JSON.generate(result.reject { |key, _value| key == :rollback_bytes })
@@ -291,6 +315,14 @@ module ClashPatch
           summary_zh: "安全更新失败，且至少一份订阅未能恢复。", profile: options[:usage_profile]
         ) if options[:json]
         warn "安全更新失败，且至少一份订阅未能恢复；请立即按备份记录处理。"
+        return 1
+      end
+      if result[:status] == :runtime_restore_pending
+        return emit_cli_result(
+          operation: "safe_update", exit_code: 1, status: "partial", code: "safe_update_runtime_pending",
+          summary_zh: "安全更新失败；订阅文件已恢复，但运行内核恢复失败。", profile: options[:usage_profile]
+        ) if options[:json]
+        warn "安全更新失败；订阅文件已恢复，但运行内核恢复失败。"
         return 1
       end
       return emit_cli_result(

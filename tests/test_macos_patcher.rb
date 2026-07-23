@@ -783,6 +783,14 @@ class MacosPatcherTest < Minitest::Test
       assert_equal original.b, File.binread(profile)
       assert_equal 2, Dir.glob(File.join(backup_root, "*.backup")).length
       assert Dir.glob(File.join(backup_root, "*--pre-restore--*.backup")).any?
+
+      already_restored = ClashPatch.restore_backup(
+        File.basename(backup), directories: [directory], backup_root: backup_root,
+        expected_current_sha256: Digest::SHA256.hexdigest(original.b), validator: ->(_candidate) { true }
+      )
+      assert_equal :no_change, already_restored.fetch(:status)
+      assert_equal original.b, already_restored[:rollback_bytes]
+      assert_equal Digest::SHA256.hexdigest(original.b), already_restored[:patched_digest]
     end
   end
 
@@ -986,6 +994,43 @@ class MacosPatcherTest < Minitest::Test
       assert_equal :aborted, result.fetch(:status)
       assert_equal :activation_failed, result.fetch(:reason)
       targets.each { |target| assert_equal originals.fetch(target.fetch(:path)), File.binread(target.fetch(:path)) }
+    end
+  end
+
+  def test_default_safe_update_activation_preserves_runtime_recovery_status
+    item = {
+      path: "/profiles/friend.yaml", original: "original", candidate: "candidate"
+    }
+    activation_result = {
+      path: item.fetch(:path), status: :reload_failed_restore_pending
+    }
+
+    ClashPatch.stub(:active_profile?, true) do
+      ClashPatch.stub(:activate_updated_profile, activation_result) do
+        result = ClashPatch.default_safe_update_activation([item], 3, "friend")
+
+        assert_equal activation_result, result
+      end
+    end
+  end
+
+  def test_safe_update_reports_when_files_are_restored_but_runtime_is_not
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old"))
+      File.write(profile, original)
+      target = { name: "friend", path: profile, url: "https://subscriptions.invalid/friend" }
+
+      result = ClashPatch.safe_update_all(
+        targets: [target], policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 3,
+        fetcher: ->(_target) { YAML.dump(base_config.merge("subscription-marker" => "new")) },
+        validator: ->(_path) { true },
+        activation: ->(_items) { { status: :reload_failed_restore_pending } }
+      )
+
+      assert_equal :runtime_restore_pending, result.fetch(:status)
+      assert_equal :reload_failed_restore_pending, result.fetch(:runtime_status)
+      assert_equal original.b, File.binread(profile)
     end
   end
 
@@ -1517,6 +1562,45 @@ class MacosPatcherTest < Minitest::Test
 
       assert_equal :reload_failed_rolled_back, result.fetch(:status)
       assert_equal original.b, File.binread(profile)
+    end
+  end
+
+  def test_restore_activation_preserves_the_existing_tun_state
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config)
+      candidate = YAML.dump(base_config.merge("changed" => true))
+      File.binwrite(profile, candidate)
+      proxy_body = JSON.generate(
+        "proxies" => { "Main" => { "type" => "Selector", "now" => "Taiwan" } }
+      )
+      requester = lambda do |method, endpoint, _body|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          [200, proxy_body]
+        when ["GET", "/configs"]
+          [200, JSON.generate("tun" => { "enable" => false })]
+        when ["PUT", "/configs?force=true"], ["POST", "/cache/fakeip/flush"], ["POST", "/cache/dns/flush"]
+          [204, ""]
+        else
+          if method == "GET" && endpoint.start_with?("/dns/query?")
+            [200, JSON.generate("Status" => 0, "Answer" => [{ "data" => "203.0.113.1" }])]
+          else
+            [404, ""]
+          end
+        end
+      end
+
+      result = ClashPatch.activate_updated_profile(
+        {
+          path: profile, rollback_bytes: original.b,
+          patched_digest: Digest::SHA256.hexdigest(candidate.b)
+        },
+        requester: requester, connectivity_checker: -> { true }, require_tun: :preserve
+      )
+
+      assert_equal true, result[:reloaded]
+      assert_equal candidate.b, File.binread(profile)
     end
   end
 
@@ -2593,6 +2677,133 @@ class MacosPatcherTest < Minitest::Test
         end
         assert_empty error
         assert_equal "auto_update_failed", JSON.parse(output).fetch("code")
+      end
+    end
+  end
+
+  def test_cli_restore_backup_reloads_and_checks_the_active_profile
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      restore_result = {
+        status: :updated, path: profile, rollback_bytes: "current",
+        patched_digest: Digest::SHA256.hexdigest("restored")
+      }
+      activated = false
+      activation = lambda do |result, require_tun:|
+        activated = true
+        assert_equal :preserve, require_tun
+        result.merge(reloaded: true)
+      end
+
+      ClashPatch.stub(:restore_backup, restore_result) do
+        ClashPatch.stub(:selected_profile_name, "friend") do
+          ClashPatch.stub(:active_profile_root, directory) do
+            ClashPatch.stub(:activate_updated_profile, activation) do
+              output, error = capture_io do
+                assert_equal 0, ClashPatch.cli([
+                  "--json", "--profile-dir", directory, "--restore-backup", "backup-id",
+                  "--expected-current-sha256", "0" * 64
+                ])
+              end
+              assert_empty error
+              assert_equal "ok", JSON.parse(output).fetch("status")
+            end
+          end
+        end
+      end
+
+      assert activated
+    end
+  end
+
+  def test_cli_restore_backup_reports_when_the_previous_runtime_cannot_be_reloaded
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      restore_result = {
+        status: :updated, path: profile, rollback_bytes: "current",
+        patched_digest: Digest::SHA256.hexdigest("restored")
+      }
+      activation_result = restore_result.merge(status: :reload_failed_restore_pending)
+
+      ClashPatch.stub(:restore_backup, restore_result) do
+        ClashPatch.stub(:selected_profile_name, "friend") do
+          ClashPatch.stub(:active_profile_root, directory) do
+            ClashPatch.stub(:activate_updated_profile, activation_result) do
+              output, error = capture_io do
+                assert_equal 1, ClashPatch.cli([
+                  "--json", "--profile-dir", directory, "--restore-backup", "backup-id",
+                  "--expected-current-sha256", "0" * 64
+                ])
+              end
+              assert_empty error
+              result = JSON.parse(output)
+              assert_equal "partial", result.fetch("status")
+              assert_equal "restore_runtime_pending", result.fetch("code")
+              assert_includes result.fetch("summary_zh"), "运行内核"
+            end
+          end
+        end
+      end
+    end
+  end
+
+  def test_cli_restore_backup_checks_the_active_runtime_when_the_file_already_matches
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      restore_result = {
+        status: :no_change, path: profile, rollback_bytes: "restored",
+        patched_digest: Digest::SHA256.hexdigest("restored")
+      }
+      activated = false
+      activation = lambda do |result, require_tun:|
+        activated = true
+        assert_equal :preserve, require_tun
+        result.merge(reloaded: true)
+      end
+
+      ClashPatch.stub(:restore_backup, restore_result) do
+        ClashPatch.stub(:selected_profile_name, "friend") do
+          ClashPatch.stub(:active_profile_root, directory) do
+            ClashPatch.stub(:activate_updated_profile, activation) do
+              output, error = capture_io do
+                assert_equal 0, ClashPatch.cli([
+                  "--json", "--profile-dir", directory, "--restore-backup", "backup-id",
+                  "--expected-current-sha256", "0" * 64
+                ])
+              end
+              assert_empty error
+              result = JSON.parse(output)
+              assert_equal "no_change", result.fetch("status")
+              assert_includes result.fetch("summary_zh"), "运行检查"
+            end
+          end
+        end
+      end
+
+      assert activated
+    end
+  end
+
+  def test_cli_safe_update_reports_unresolved_runtime_recovery
+    Dir.mktmpdir do |directory|
+      ClashPatch.stub(:remote_subscription_targets, []) do
+        ClashPatch.stub(:selected_profile_name, "friend") do
+          ClashPatch.stub(
+            :safe_update_all,
+            { status: :runtime_restore_pending, runtime_status: :reload_failed_restore_pending }
+          ) do
+            output, error = capture_io do
+              assert_equal 1, ClashPatch.cli([
+                "--json", "--profile-dir", directory, "--safe-update-all", "--usage-profile", "3"
+              ])
+            end
+            assert_empty error
+            result = JSON.parse(output)
+            assert_equal "partial", result.fetch("status")
+            assert_equal "safe_update_runtime_pending", result.fetch("code")
+            assert_includes result.fetch("summary_zh"), "运行内核"
+          end
+        end
       end
     end
   end

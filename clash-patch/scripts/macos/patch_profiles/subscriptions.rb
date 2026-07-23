@@ -206,7 +206,7 @@ module ClashPatch
       path: active.fetch(:path), status: :updated, active: true,
       rollback_bytes: active.fetch(:original), patched_digest: Digest::SHA256.hexdigest(active.fetch(:candidate))
     }
-    activate_updated_profile(result, require_tun: usage_profile >= 2).fetch(:reloaded, false)
+    activate_updated_profile(result, require_tun: usage_profile >= 2)
   end
 
   def safe_update_all(targets:, policy:, backup_root:, usage_profile:, fetcher: method(:fetch_remote_subscription),
@@ -267,11 +267,14 @@ module ClashPatch
     end
 
     activation ||= ->(updated_items) { default_safe_update_activation(updated_items, usage_profile, selected_name) }
-    activated = begin
+    activation_result = begin
       activation.call(items)
     rescue StandardError
       false
     end
+    activated = activation_result == true ||
+                (activation_result.is_a?(Hash) && activation_result[:reloaded] == true)
+    runtime_status = activation_result[:status] if activation_result.is_a?(Hash)
     unless activated
       rollback_failures = []
       items.each do |item|
@@ -286,6 +289,12 @@ module ClashPatch
       end
       unless rollback_failures.empty?
         return { status: :rollback_failed, failed_profile: rollback_failures.first, reason: :activation_failed }
+      end
+      if %i[reload_failed_restore_pending reload_failed_rollback_conflict].include?(runtime_status)
+        return {
+          status: :runtime_restore_pending, failed_profile: "", reason: :activation_failed,
+          runtime_status: runtime_status
+        }
       end
       return { status: :aborted, failed_profile: "", reason: :activation_failed }
     end

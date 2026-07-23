@@ -137,6 +137,10 @@ module ClashPatch
 
     before = runtime_selections(requester)
     return result.merge(status: rollback_after_reload_failure(result, requester, result[:path])) unless before
+    preserved_tun_state = tun_state(requester: requester) if require_tun == :preserve
+    if require_tun == :preserve && preserved_tun_state == :unknown
+      return result.merge(status: rollback_after_reload_failure(result, nil, nil))
+    end
 
     code, _body = requester.call(
       "PUT", "/configs?force=true", JSON.generate("path" => File.expand_path(result.fetch(:path)))
@@ -153,7 +157,11 @@ module ClashPatch
       return result.merge(status: rollback_after_reload_failure(result, requester, result[:path]))
     end
 
-    healthy = !require_tun || tun_state(requester: requester) == :enabled
+    healthy = if require_tun == :preserve
+                tun_state(requester: requester) == preserved_tun_state
+              else
+                !require_tun || tun_state(requester: requester) == :enabled
+              end
     after = healthy ? runtime_selections(requester) : nil
     healthy &&= after.is_a?(Hash)
     healthy &&= before.all? { |name, selected| after.key?(name) && after[name] == selected }
@@ -181,4 +189,3 @@ module ClashPatch
   end
 
 end
-

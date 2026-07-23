@@ -219,7 +219,7 @@ bash clash-patch/scripts/install_macos.sh --profile N
 
 用户说“昨天改完今天变慢”时，Skill 会先列出备份（macOS `--list-backups`，Windows `-ListBackups`），选择症状出现前最近的一份，先做配置差异比较（`--compare-backup ID` / `-CompareBackup ID`）：只报告发生变化的字段名和文件 SHA-256，不显示节点、订阅地址或其他配置值。时间只能帮助选择候选，不能单独证明某项改动造成故障。
 
-只有配置差异与现场证据相符时才恢复。恢复（`--restore-backup ID --expected-current-sha256 SHA256` / `-RestoreBackup ID -ExpectedCurrentSha256 SHA256`）前先校验备份内容、确认当前文件仍与比较时相同，并再备份一次当前版本；恢复后回到原应用和原操作复测，没有改善或验收失败时恢复回滚前版本。Windows 客户端正在运行时不会为了回滚而结束它，只完成安全比较并说明当前不能自动恢复。
+只有配置差异与现场证据相符时才恢复。恢复（`--restore-backup ID --expected-current-sha256 SHA256` / `-RestoreBackup ID -ExpectedCurrentSha256 SHA256`）前先校验备份内容、确认当前文件仍与比较时相同，并再备份一次当前版本；恢复后回到原应用和原操作复测，没有改善或验收失败时恢复回滚前版本。macOS 恢复当前订阅后会通过本地控制器重新加载，并确认 TUN 开关、代理组选择、DNS 与连接状态；检查失败时恢复回滚前版本，文件恢复但运行内核未恢复时会明确报错。恢复其他订阅不会切换当前订阅。Windows 客户端正在运行时不会为了回滚而结束它，只完成安全比较并说明当前不能自动恢复。
 
 ## 第三档验证
 

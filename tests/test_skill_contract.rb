@@ -489,6 +489,21 @@ class SkillContractTest < Minitest::Test
     refute_includes skill, "订阅以后刷新时，请再次运行"
   end
 
+  def test_macos_backup_recovery_includes_the_active_runtime
+    documents = [
+      File.read(File.join(ROOT, "README.md")),
+      File.read(File.join(SKILL, "SKILL.md")),
+      File.read(File.join(SKILL, "references/patch-policy.md")),
+      File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+    ]
+
+    documents.each do |document|
+      assert_includes document, "macOS 恢复当前订阅后"
+      assert_includes document, "运行内核"
+      assert_includes document, "恢复回滚前版本"
+    end
+  end
+
   def test_diagnostics_selects_tools_by_the_observed_symptom
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
 
