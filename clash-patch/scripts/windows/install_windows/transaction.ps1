@@ -5,7 +5,7 @@
     $security.SetAccessRuleProtection($true, $false)
     @($security.Access) | Where-Object { -not $_.IsInherited } | ForEach-Object {
         $security.RemoveAccessRuleSpecific($_)
-    }
+    } | Out-Null
     $sidValues = @(
         [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
         "S-1-5-18",
@@ -111,6 +111,8 @@ function Write-Utf8Atomic([string]$Path, [string]$Content) {
 
 
 function Get-BytesSha256([byte[]]$Bytes) {
+    # PowerShell binds an empty byte array as $null; empty input must still hash.
+    if ($null -eq $Bytes) { $Bytes = [byte[]]@() }
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
         return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes, 0, $Bytes.Length))).Replace("-", "").ToLowerInvariant()

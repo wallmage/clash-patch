@@ -432,6 +432,9 @@ items:
     $initialTwo = Backup-InitialOnce $backupSource $versionedBackupRoot
     Assert-True (-not [string]::IsNullOrWhiteSpace($initialOne)) "initial backup was not created"
     Assert-True ([string]::IsNullOrWhiteSpace($initialTwo)) "initial backup was duplicated"
+    $emptyHashFile = Join-Path $sandbox "empty-hash.bin"
+    [System.IO.File]::WriteAllBytes($emptyHashFile, [byte[]]@())
+    Assert-True ((Get-FileSha256 $emptyHashFile) -eq "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855") "empty content did not hash as the empty SHA-256"
     if ($onWindows) {
         $backupAcl = Get-Acl -LiteralPath $firstVersionedBackup
         Assert-True $backupAcl.AreAccessRulesProtected "backup ACL still inherits permissions"
@@ -492,6 +495,8 @@ items:
     Assert-True ($nullProfilesIndex -match '(?m)^\s+allow_auto_update:\s+false\s*$') "profile 3 did not disable subscription auto-update"
     $profilesBackups = @(Get-ChildItem -LiteralPath (Join-Path $nullCase "clash-patch-backups") -File | Where-Object { $_.Name -like "*--profiles.yaml.backup" })
     Assert-True ($profilesBackups.Count -ge 1) "profiles.yaml was changed without a dated backup"
+    $nullCaseJson = Invoke-TestPowerShell $installer @("-AppHome", $nullCase, "-MihomoPath", $fakeCore, "-Json")
+    Assert-JsonResult $nullCaseJson "install" 0 | Out-Null
 
     if ($onWindows) {
         $runningCase = Join-Path $sandbox "running-client-case"

@@ -302,7 +302,7 @@ try {
     }
     $profilesIndexInput = Get-Content -LiteralPath $profilesIndexPath -Raw -Encoding UTF8
     $profilesIndexOutput = Set-RemoteSubscriptionAutoUpdateDisabled $profilesIndexInput
-    Assert-RemoteSubscriptionAutoUpdateDisabled $profilesIndexOutput
+    Assert-RemoteSubscriptionAutoUpdateDisabled $profilesIndexOutput | Out-Null
     $profilesIndexBytes = ConvertTo-Utf8Bytes $profilesIndexOutput
 
     if ($clientRunning) {
@@ -319,7 +319,7 @@ try {
         }
         try {
             foreach ($target in $runningTargets) { Write-BytesAtomic $target.Path $target.Bytes }
-            Assert-RemoteSubscriptionAutoUpdateDisabled (Get-Content -LiteralPath $profilesIndexPath -Raw -Encoding UTF8)
+            Assert-RemoteSubscriptionAutoUpdateDisabled (Get-Content -LiteralPath $profilesIndexPath -Raw -Encoding UTF8) | Out-Null
         } catch {
             Restore-Transaction $runningTargets
             throw
