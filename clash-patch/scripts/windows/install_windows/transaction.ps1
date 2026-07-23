@@ -620,7 +620,8 @@ function Write-FileTransactionJournal([object[]]$Entries) {
     }
     $journalActions = @()
     foreach ($entry in $Entries) {
-        $originalBytes = if ($null -eq $entry.Original) { [byte[]]@() } else { [byte[]]$entry.Original }
+        [byte[]]$originalBytes = @()
+        if ($null -ne $entry.Original) { $originalBytes = [byte[]]$entry.Original }
         $journalActions += [ordered]@{
             Action = [string]$entry.Action
             Path = Get-AppHomeRelativePath ([string]$entry.Target.Path)
