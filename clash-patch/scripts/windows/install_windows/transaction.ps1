@@ -376,6 +376,7 @@ function Write-LockedStreamBytes(
 ) {
     try {
         $Stream.Position = 0
+        $Stream.SetLength(0)
         $Stream.Write($Replacement, 0, $Replacement.Length)
         $Stream.SetLength($Replacement.Length)
         $Stream.Flush($true)
@@ -383,6 +384,7 @@ function Write-LockedStreamBytes(
         $writeError = $_
         try {
             $Stream.Position = 0
+            $Stream.SetLength(0)
             $Stream.Write($Original, 0, $Original.Length)
             $Stream.SetLength($Original.Length)
             $Stream.Flush($true)

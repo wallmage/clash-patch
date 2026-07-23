@@ -2863,9 +2863,7 @@ try {
             Assert-True ($publicRestoreFunctionOffset -ge 0 -and $publicRestoreWriteOffset -ge 0) "public restore crash fixture could not find the stream write boundary"
             $publicRestoreHook = @'
         if (-not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_RESTORE_CRASH_READY)) {
-            $partialLength = [Math]::Max(1, [Math]::Floor($Replacement.Length / 2))
-            $Stream.Write($Replacement, 0, $partialLength)
-            $Stream.SetLength($partialLength)
+            $Stream.Write($Replacement, 0, $Replacement.Length)
             $Stream.Flush($true)
             [System.IO.File]::WriteAllText($env:CLASH_PATCH_TEST_RESTORE_CRASH_READY, "ready")
             Start-Sleep -Seconds 30
@@ -2894,6 +2892,9 @@ try {
             $publicRestoreCurrentBytes = [System.Text.Encoding]::UTF8.GetBytes(
                 "mode: global`nipv6: false`ntun:`n  enable: true`n  stack: system`n  dns-hijack:`n    - any:53`n  auto-route: true`n  auto-detect-interface: true`n  strict-route: true`nproxies: []`nproxy-groups: []`nrules: []`n"
             )
+            Assert-True (
+                $publicRestoreBackupBytes.Length -lt $publicRestoreCurrentBytes.Length
+            ) "public restore crash fixture must replace a longer file with shorter bytes"
             New-Item -ItemType Directory -Path $publicRestoreHome -Force | Out-Null
             [System.IO.File]::WriteAllBytes($publicRestoreTarget, $publicRestoreBackupBytes)
             $publicRestoreLock = Enter-AppHomeMutationLock $publicRestoreHome
