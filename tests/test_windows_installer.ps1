@@ -340,10 +340,23 @@ function Get-TreeContentSnapshot([string]$Path) {
     })) -join "`n"
 }
 
+function Get-TestOutputDiagnostic([object]$Output) {
+    $text = [string]$Output
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join ""
+    } finally {
+        $sha.Dispose()
+    }
+    return "output_length=$($text.Length) output_sha256=$digest"
+}
+
 function Assert-JsonResult([object]$Invocation, [string]$Command, [int]$ExitCode) {
     $text = $Invocation.Output.Trim()
-    Assert-True ($text.StartsWith("{") -and $text.EndsWith("}")) "JSON mode did not emit exactly one object: $text"
-    try { $result = $text | ConvertFrom-Json } catch { throw "JSON mode emitted invalid JSON: $text" }
+    $diagnostic = Get-TestOutputDiagnostic $text
+    Assert-True ($text.StartsWith("{") -and $text.EndsWith("}")) "JSON mode did not emit exactly one object: $diagnostic"
+    try { $result = $text | ConvertFrom-Json } catch { throw "JSON mode emitted invalid JSON: $diagnostic" }
     foreach ($field in @("schema", "version", "command", "platform", "client", "operation", "ok", "status", "code", "exit_code", "summary_zh", "profile", "changes", "checks", "items", "messages", "warnings")) {
         Assert-True ($null -ne $result.PSObject.Properties[$field]) "JSON result omitted $field"
     }
@@ -353,10 +366,10 @@ function Assert-JsonResult([object]$Invocation, [string]$Command, [int]$ExitCode
     Assert-True ($result.platform -eq "windows") "JSON result platform mismatch"
     Assert-True ($result.client -eq "clash-verge-rev") "JSON result client mismatch"
     Assert-True ([int]$result.exit_code -eq $ExitCode) (
-        "JSON result exit_code mismatch for ${Command}: expected $ExitCode, JSON reported $($result.exit_code), process exited $($Invocation.ExitCode)"
+        "JSON result exit_code mismatch for ${Command}: expected $ExitCode, JSON reported $($result.exit_code), process exited $($Invocation.ExitCode), status=$($result.status), code=$($result.code)"
     )
     Assert-True ($Invocation.ExitCode -eq $ExitCode) (
-        "process exit mismatch for ${Command}: expected $ExitCode, process exited $($Invocation.ExitCode), JSON reported $($result.exit_code)"
+        "process exit mismatch for ${Command}: expected $ExitCode, process exited $($Invocation.ExitCode), JSON reported $($result.exit_code), status=$($result.status), code=$($result.code)"
     )
     Assert-True ($text -notmatch '(?i)https?://|Bearer\s+|password\s*[:=]|secret\s*[:=]') "JSON result leaked a secret or URL"
     return $result
@@ -384,12 +397,16 @@ function Invoke-TestPowerShell([string]$ScriptPath, [string[]]$ScriptArguments) 
 
 function Invoke-Installer([string]$AppHome) {
     $result = Invoke-TestPowerShell $installer @("-AppHome", $AppHome, "-MihomoPath", $fakeCore)
-    if ($result.ExitCode -ne 0) { throw "Windows installer returned $($result.ExitCode)`n$($result.Output)" }
+    if ($result.ExitCode -ne 0) {
+        throw "Windows installer returned $($result.ExitCode); $(Get-TestOutputDiagnostic $result.Output)"
+    }
 }
 
 function Invoke-Uninstaller([string]$AppHome) {
     $result = Invoke-TestPowerShell $uninstaller @("-AppHome", $AppHome)
-    if ($result.ExitCode -ne 0) { throw "Windows uninstaller returned $($result.ExitCode)`n$($result.Output)" }
+    if ($result.ExitCode -ne 0) {
+        throw "Windows uninstaller returned $($result.ExitCode); $(Get-TestOutputDiagnostic $result.Output)"
+    }
 }
 
 function Assert-InstallerRejectsScript([string]$Name, [string]$Script, [string]$MessageFragment) {
@@ -403,12 +420,16 @@ function Assert-InstallerRejectsScript([string]$Name, [string]$Script, [string]$
     [System.IO.File]::WriteAllText($scriptPath, $Script)
     $result = Invoke-TestPowerShell $installer @("-AppHome", $case, "-MihomoPath", $fakeCore)
     Assert-True ($result.ExitCode -eq 1) "$Name was accepted"
-    Assert-True ($result.Output.Contains($MessageFragment)) "$Name rejection did not explain the problem: $($result.Output)"
+    Assert-True ($result.Output.Contains($MessageFragment)) "$Name rejection did not explain the problem; $(Get-TestOutputDiagnostic $result.Output)"
     Assert-True ((Get-Content -LiteralPath $scriptPath -Raw) -eq $Script) "$Name rejection changed Script.js"
 }
 
 try {
     New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
+    $failureDiagnosticCanary = "https://subscription.invalid/private?token=fixture-secret password=fixture-password 11111111-2222-3333-4444-555555555555"
+    $failureDiagnostic = Get-TestOutputDiagnostic $failureDiagnosticCanary
+    Assert-True ($failureDiagnostic -notmatch 'subscription|token|secret|password|11111111') "test failure diagnostics exposed captured command output"
+    Assert-True ($failureDiagnostic -match '^output_length=\d+ output_sha256=[0-9a-f]{64}$') "test failure diagnostics omitted safe debugging metadata"
     if ($onWindows) {
         $fakeCoreText = "@echo off`r`necho %*>>`"%~dp0mihomo-arguments.log`"`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nexit /b 0`r`n"
     } else {
@@ -434,6 +455,50 @@ try {
 
         if ($RealMihomoOnly) {
             Assert-True ($RealMihomoPaths.Count -gt 0) "real Mihomo mode requires at least one core"
+            $realNode = Get-Command node.exe -ErrorAction SilentlyContinue
+            Assert-True ($null -ne $realNode) "real Mihomo mode requires Node.js"
+            $realTransformHarness = Join-Path $sandbox "run-global-script.js"
+            [System.IO.File]::WriteAllText(
+                $realTransformHarness,
+                @'
+const fs = require("node:fs");
+const script = fs.readFileSync(process.argv[2], "utf8");
+const input = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+const transform = new Function(`${script}
+return main;`)();
+const output = transform(input);
+fs.writeFileSync(process.argv[4], JSON.stringify(output));
+'@,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+            $realSubscriptionJson = @'
+{
+  "mixed-port": 7890,
+  "mode": "rule",
+  "ipv6": true,
+  "tun": { "enable": false },
+  "proxies": [
+    {
+      "name": "US Home",
+      "type": "socks5",
+      "server": "127.0.0.1",
+      "port": 1080
+    }
+  ],
+  "proxy-groups": [
+    {
+      "name": "Main",
+      "type": "select",
+      "proxies": ["US Home"]
+    }
+  ],
+  "dns": {
+    "enable": true,
+    "nameserver": ["8.8.8.8"]
+  },
+  "rules": ["MATCH,Main"]
+}
+'@
             foreach ($realMihomoPath in $RealMihomoPaths) {
                 Assert-True (Test-Path -LiteralPath $realMihomoPath -PathType Leaf) "real Mihomo path is missing"
                 Assert-True (Test-MihomoVersion $realMihomoPath) "real Mihomo version gate failed"
@@ -469,6 +534,26 @@ try {
                         "-f", (Join-Path $realCase "config.yaml")
                     )
                     Assert-True ($realValidation.ExitCode -eq 0) "real Mihomo rejected an installed profile"
+                    $realSubscriptionPath = Join-Path $realCase "subscription.json"
+                    $realTransformedPath = Join-Path $realCase "transformed.yaml"
+                    [System.IO.File]::WriteAllText(
+                        $realSubscriptionPath,
+                        $realSubscriptionJson,
+                        (New-Object System.Text.UTF8Encoding($false))
+                    )
+                    $realScriptPath = Join-Path $realProfiles "Script.js"
+                    Assert-True (Test-Path -LiteralPath $realScriptPath -PathType Leaf) "public install omitted Script.js"
+                    & $realNode.Source $realTransformHarness $realScriptPath $realSubscriptionPath $realTransformedPath 2>&1 | Out-Null
+                    $realNodeExitCode = $LASTEXITCODE
+                    Assert-True ($realNodeExitCode -eq 0) "installed Script.js could not transform a full subscription"
+                    $realTransformedValidation = Invoke-Mihomo $realMihomoPath @(
+                        "-d", $realCase,
+                        "-t",
+                        "-f", $realTransformedPath
+                    )
+                    Assert-True (
+                        $realTransformedValidation.ExitCode -eq 0
+                    ) "real Mihomo rejected the installed Script.js output"
                 }
             }
             Write-Host "Windows real Mihomo public-entry cases passed"
@@ -489,15 +574,22 @@ try {
             '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt","Existed":false,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3"}]}',
             '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3"},{"Action":"delete","Path":"TARGET.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":""}]}'
         )
-        foreach ($invalidTransactionJournalText in $invalidTransactionJournals) {
-            $invalidTransactionJournal = $invalidTransactionJournalText | ConvertFrom-Json
-            $invalidTransactionJournalRejected = $false
-            try {
-                Get-ValidatedFileTransactionJournal $invalidTransactionJournal | Out-Null
-            } catch {
-                $invalidTransactionJournalRejected = $true
+        $journalValidationHome = Join-Path $sandbox "transaction-journal-validation"
+        New-Item -ItemType Directory -Path $journalValidationHome -Force | Out-Null
+        $journalValidationLock = Enter-AppHomeMutationLock $journalValidationHome
+        try {
+            foreach ($invalidTransactionJournalText in $invalidTransactionJournals) {
+                $invalidTransactionJournal = $invalidTransactionJournalText | ConvertFrom-Json
+                $invalidTransactionJournalRejected = $false
+                try {
+                    Get-ValidatedFileTransactionJournal $invalidTransactionJournal | Out-Null
+                } catch {
+                    $invalidTransactionJournalRejected = $true
+                }
+                Assert-True $invalidTransactionJournalRejected "transaction journal validator accepted a malformed state"
             }
-            Assert-True $invalidTransactionJournalRejected "transaction journal validator accepted a malformed state"
+        } finally {
+            Exit-AppHomeMutationLock $journalValidationLock
         }
 
         Invoke-DeferredProbe "duplicate transaction action field" {
@@ -539,17 +631,17 @@ try {
         $wrapperCase = Join-Path $sandbox "cmd-wrapper-case"
         New-Item -ItemType Directory -Path $wrapperCase -Force | Out-Null
         $wrapperOutput = & $installWrapper -ShowUsageProfile -AppHome $wrapperCase 2>&1 | Out-String
-        Assert-True ($LASTEXITCODE -eq 0) "install_windows.cmd did not propagate a successful exit: $wrapperOutput"
+        Assert-True ($LASTEXITCODE -eq 0) "install_windows.cmd did not propagate a successful exit; $(Get-TestOutputDiagnostic $wrapperOutput)"
         Assert-True ($wrapperOutput.Contains("unset")) "install_windows.cmd did not forward PowerShell output"
 
         $wrapperJsonOutput = & $installWrapper -ShowUsageProfile -AppHome $wrapperCase -Json 2>&1 | Out-String
-        Assert-True ($LASTEXITCODE -eq 0) "install_windows.cmd did not propagate JSON-mode success: $wrapperJsonOutput"
+        Assert-True ($LASTEXITCODE -eq 0) "install_windows.cmd did not propagate JSON-mode success; $(Get-TestOutputDiagnostic $wrapperJsonOutput)"
         $wrapperJson = $wrapperJsonOutput.Trim() | ConvertFrom-Json
         Assert-True ($wrapperJson.schema -eq "clash-patch.result") "install_windows.cmd did not pass -Json through"
 
         $invalidWrapperOutput = & $installWrapper -UsageProfile 9 -AppHome $wrapperCase -Json 2>&1 | Out-String
         $invalidWrapperExit = $LASTEXITCODE
-        Assert-True ($invalidWrapperExit -eq 64) "install_windows.cmd swallowed an installer failure: $invalidWrapperOutput"
+        Assert-True ($invalidWrapperExit -eq 64) "install_windows.cmd swallowed an installer failure; $(Get-TestOutputDiagnostic $invalidWrapperOutput)"
         $invalidWrapperJson = $invalidWrapperOutput.Trim() | ConvertFrom-Json
         Assert-True ([int]$invalidWrapperJson.exit_code -eq $invalidWrapperExit) "install_windows.cmd changed the JSON failure exit code"
 
@@ -557,7 +649,7 @@ try {
         New-Item -ItemType Directory -Path (Split-Path -Parent $wrapperBackup) -Force | Out-Null
         [System.IO.File]::WriteAllText($wrapperBackup, "keep")
         $uninstallWrapperOutput = & $uninstallWrapper -AppHome $wrapperCase 2>&1 | Out-String
-        Assert-True ($LASTEXITCODE -eq 0) "uninstall_windows.cmd did not propagate a successful exit: $uninstallWrapperOutput"
+        Assert-True ($LASTEXITCODE -eq 0) "uninstall_windows.cmd did not propagate a successful exit; $(Get-TestOutputDiagnostic $uninstallWrapperOutput)"
         Assert-True (Test-Path -LiteralPath $wrapperBackup -PathType Leaf) "uninstall_windows.cmd deleted configuration history"
 
         $mutexCase = Join-Path $sandbox "app-home-mutex-case"
@@ -779,7 +871,7 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
     $routeHarness = (@($routeFunctionSources) + $routeHarnessMocks) -join "`r`n"
     [System.IO.File]::WriteAllText($routeHarnessPath, $routeHarness, (New-Object System.Text.UTF8Encoding($true)))
     $routeObservation = Invoke-TestPowerShell $routeHarnessPath @()
-    Assert-True ($routeObservation.ExitCode -eq 0) "Observe-Route crashed on a matching connection: $($routeObservation.Output)"
+    Assert-True ($routeObservation.ExitCode -eq 0) "Observe-Route crashed on a matching connection; $(Get-TestOutputDiagnostic $routeObservation.Output)"
 
     if ($onWindows) {
         $controllerReadyPath = Join-Path $sandbox "route-controller-ready"
@@ -960,7 +1052,7 @@ public static class FakeCurl {
     [System.IO.File]::WriteAllText((Join-Path $lightCase "config.yaml"), $lightConfig)
     [System.IO.File]::WriteAllText((Join-Path $lightCase "verge.yaml"), $lightVerge)
     $profileOne = Invoke-TestPowerShell $installer @("-AppHome", $lightCase, "-UsageProfile", "1", "-MihomoPath", $fakeCore)
-    Assert-True ($profileOne.ExitCode -eq 0) "profile 1 installer failed: $($profileOne.Output)"
+    Assert-True ($profileOne.ExitCode -eq 0) "profile 1 installer failed; $(Get-TestOutputDiagnostic $profileOne.Output)"
     Assert-True ((Get-Content -LiteralPath (Join-Path $lightCase "config.yaml") -Raw) -eq $lightConfig) "profile 1 modified config.yaml"
     Assert-True ((Get-Content -LiteralPath (Join-Path $lightCase "verge.yaml") -Raw) -eq $lightVerge) "profile 1 modified verge.yaml"
     $lightScript = Join-Path (Join-Path $lightCase "profiles") "Script.js"
@@ -971,7 +1063,7 @@ public static class FakeCurl {
     $savedProfileOne = Get-Content -LiteralPath (Join-Path $lightCase "clash-patch-usage-profile.json") -Raw | ConvertFrom-Json
     Assert-True ([int]$savedProfileOne.Profile -eq 1) "profile 1 was not saved"
     $profileTwo = Invoke-TestPowerShell $installer @("-AppHome", $lightCase, "-UsageProfile", "2", "-MihomoPath", $fakeCore)
-    Assert-True ($profileTwo.ExitCode -eq 0) "profile 2 installer failed: $($profileTwo.Output)"
+    Assert-True ($profileTwo.ExitCode -eq 0) "profile 2 installer failed; $(Get-TestOutputDiagnostic $profileTwo.Output)"
     Assert-True ((Get-Content -LiteralPath (Join-Path $lightCase "config.yaml") -Raw) -eq $lightConfig) "profile 2 modified config.yaml"
     Assert-True (Test-Path -LiteralPath $lightScript -PathType Leaf) "profile 2 removed the shared subscription patch"
     $profileTwoScript = Get-Content -LiteralPath $lightScript -Raw
@@ -1003,7 +1095,7 @@ public static class FakeCurl {
     Assert-True ($unitReplaced.Count -gt 2) "range replacement collapsed: $($unitReplaced | ConvertTo-Json -Compress)"
     $unitOutput = Set-YamlTunMapping $unitStage
     $unitDebug = $unitOutput | ConvertTo-Json -Compress
-    Assert-True ($unitOutput -match '(?m)^tun:') "unit transform lost tun node: type=$($unitOutput.GetType().FullName) count=$($unitOutput.Count) json=$unitDebug"
+    Assert-True ($unitOutput -match '(?m)^tun:') "unit transform lost tun node: type=$($unitOutput.GetType().FullName) count=$($unitOutput.Count) $(Get-TestOutputDiagnostic $unitDebug)"
     Test-GeneratedYaml $unitOutput "config.yaml" | Out-Null
 
     $quotedInput = "`"ipv6`" : true`n`"tun`": null`n"
@@ -1221,7 +1313,7 @@ items:
         Assert-True $caseAliasRejected "case-alias remote subscriptions were allowed to share one file"
     }
     $snapshotResult = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
-    Assert-True ($snapshotResult.ExitCode -eq 0) "safe update snapshot failed: $($snapshotResult.Output)"
+    Assert-True ($snapshotResult.ExitCode -eq 0) "safe update snapshot failed; $(Get-TestOutputDiagnostic $snapshotResult.Output)"
     $safeBackups = @(Get-ChildItem -LiteralPath (Join-Path $safeUpdateCase "clash-patch-backups") -File | Where-Object { $_.Name -like "*--pre-update--*" })
     Assert-True ($safeBackups.Count -eq 2) "snapshot did not back up exactly the two remote subscriptions"
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), "changed: true`n")
@@ -1233,20 +1325,20 @@ items:
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json"))) "completed rollback left a reusable stale safe-update manifest"
 
     $successSnapshot = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
-    Assert-True ($successSnapshot.ExitCode -eq 0) "second safe update snapshot failed: $($successSnapshot.Output)"
+    Assert-True ($successSnapshot.ExitCode -eq 0) "second safe update snapshot failed; $(Get-TestOutputDiagnostic $successSnapshot.Output)"
     $firstSafeUpdated = "mode: rule`nproxies: []`n"
     $secondSafeUpdated = "mode: global`nproxy-groups: []`n"
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), $firstSafeUpdated)
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), $secondSafeUpdated)
     $successVerify = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-VerifySafeUpdate", "-MihomoPath", $fakeCore)
-    Assert-True ($successVerify.ExitCode -eq 0) "valid safe update was rejected: $($successVerify.Output)"
+    Assert-True ($successVerify.ExitCode -eq 0) "valid safe update was rejected; $(Get-TestOutputDiagnostic $successVerify.Output)"
     Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-first.yaml") -Raw) -eq $firstSafeUpdated) "valid safe update incorrectly restored first remote subscription"
     Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-second.yml") -Raw) -eq $secondSafeUpdated) "valid safe update incorrectly restored second remote subscription"
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json"))) "accepted safe update left a stale manifest"
 
     if ($onWindows) {
         $concurrentVerifySnapshot = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
-        Assert-True ($concurrentVerifySnapshot.ExitCode -eq 0) "concurrent verification snapshot failed: $($concurrentVerifySnapshot.Output)"
+        Assert-True ($concurrentVerifySnapshot.ExitCode -eq 0) "concurrent verification snapshot failed; $(Get-TestOutputDiagnostic $concurrentVerifySnapshot.Output)"
         [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), "mode: rule`nproxies: []`n")
         [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), "mode: rule`nproxy-groups: []`n")
         $env:CLASH_PATCH_MUTATE_TARGET = Join-Path $safeUpdateProfiles "R-first.yaml"
@@ -2079,6 +2171,169 @@ try {
         Assert-True ((Get-Content -LiteralPath $crashDeleteFirstPath -Raw) -eq "first-original") "next operation did not recover a deletion interrupted by process death"
         Assert-True ((Get-Content -LiteralPath $crashDeleteSecondPath -Raw) -eq "second-original") "delete recovery changed an untouched transaction target"
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $crashDeleteHome ".clash-patch-transaction.json"))) "delete recovery left a stale transaction journal"
+
+        $publicCrashPackageParent = Join-Path $sandbox "public-crash-package"
+        New-Item -ItemType Directory -Path $publicCrashPackageParent -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path $root "clash-patch") -Destination $publicCrashPackageParent -Recurse
+        $publicCrashPackage = Join-Path $publicCrashPackageParent "clash-patch"
+        $publicCrashInstaller = Join-Path (Join-Path $publicCrashPackage "scripts") "install_windows.ps1"
+        $publicCrashUninstaller = Join-Path (Join-Path $publicCrashPackage "scripts") "uninstall_windows.ps1"
+        $publicCrashTransaction = Join-Path (Join-Path (Join-Path $publicCrashPackage "scripts") "windows/install_windows") "transaction.ps1"
+        $publicCrashTransactionText = [System.IO.File]::ReadAllText($publicCrashTransaction)
+        $publicCrashFunctionOffset = $publicCrashTransactionText.IndexOf("function Write-LockedStreamBytes(")
+        $publicCrashFlushNeedle = '        $Stream.Flush($true)'
+        $publicCrashFlushOffset = $publicCrashTransactionText.IndexOf(
+            $publicCrashFlushNeedle,
+            $publicCrashFunctionOffset
+        )
+        Assert-True ($publicCrashFunctionOffset -ge 0 -and $publicCrashFlushOffset -ge 0) "public crash fixture could not find the durable write boundary"
+        $publicCrashFlushEnd = $publicCrashFlushOffset + $publicCrashFlushNeedle.Length
+        $publicCrashHook = @'
+
+        if (-not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_PUBLIC_CRASH_READY) -and
+            -not (Test-Path -LiteralPath $env:CLASH_PATCH_TEST_PUBLIC_CRASH_READY)) {
+            [System.IO.File]::WriteAllText($env:CLASH_PATCH_TEST_PUBLIC_CRASH_READY, "ready")
+            Start-Sleep -Seconds 30
+        }
+'@
+        $publicCrashTransactionText = $publicCrashTransactionText.Insert(
+            $publicCrashFlushEnd,
+            $publicCrashHook
+        )
+        [System.IO.File]::WriteAllText(
+            $publicCrashTransaction,
+            $publicCrashTransactionText,
+            (New-Object System.Text.UTF8Encoding($true))
+        )
+
+        $publicCrashHome = Join-Path $sandbox "public-crash-home"
+        $publicCrashProfiles = Join-Path $publicCrashHome "profiles"
+        $publicCrashReady = Join-Path $sandbox "public-installer-crash.ready"
+        $publicCrashConfig = "ipv6: true`ntun: null`n"
+        $publicCrashVerge = "enable_tun_mode: false`n"
+        $publicCrashProfilesIndex = "items:`n- uid: R-public-crash`n  type: remote`n  option:`n    allow_auto_update: true`n"
+        New-Item -ItemType Directory -Path $publicCrashProfiles -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $publicCrashHome "config.yaml"), $publicCrashConfig)
+        [System.IO.File]::WriteAllText((Join-Path $publicCrashHome "verge.yaml"), $publicCrashVerge)
+        [System.IO.File]::WriteAllText((Join-Path $publicCrashHome "profiles.yaml"), $publicCrashProfilesIndex)
+        $env:CLASH_PATCH_TEST_PUBLIC_CRASH_READY = $publicCrashReady
+        $publicCrashChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+            "-NoLogo", "-NoProfile", "-File", $publicCrashInstaller,
+            "-AppHome", $publicCrashHome,
+            "-UsageProfile", "1",
+            "-MihomoPath", $fakeCore
+        ) -PassThru
+        try {
+            $publicCrashDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while (-not (Test-Path -LiteralPath $publicCrashReady -PathType Leaf) -and
+                -not $publicCrashChild.HasExited -and [DateTime]::UtcNow -lt $publicCrashDeadline) {
+                Start-Sleep -Milliseconds 25
+            }
+            Assert-True (Test-Path -LiteralPath $publicCrashReady -PathType Leaf) "public installer did not reach its first durable transaction write"
+            Stop-Process -Id $publicCrashChild.Id -Force
+            $publicCrashChild.WaitForExit()
+        } finally {
+            $env:CLASH_PATCH_TEST_PUBLIC_CRASH_READY = $null
+            if (-not $publicCrashChild.HasExited) { Stop-Process -Id $publicCrashChild.Id -Force }
+        }
+        Assert-True (Test-Path -LiteralPath (Join-Path $publicCrashHome ".clash-patch-transaction.json") -PathType Leaf) "public installer crash did not leave a recoverable transaction journal"
+        $publicRecoveryResult = Invoke-TestPowerShell $publicCrashUninstaller @(
+            "-AppHome", $publicCrashHome,
+            "-Json"
+        )
+        $publicRecoveryJson = Assert-JsonResult $publicRecoveryResult "uninstall" 0
+        Assert-True ($publicRecoveryJson.code -eq "uninstalled") "public uninstaller did not finish after recovering an interrupted install"
+        Assert-True ((Get-Content -LiteralPath (Join-Path $publicCrashHome "config.yaml") -Raw) -ceq $publicCrashConfig) "public-entry recovery changed original config.yaml"
+        Assert-True ((Get-Content -LiteralPath (Join-Path $publicCrashHome "verge.yaml") -Raw) -ceq $publicCrashVerge) "public-entry recovery changed original verge.yaml"
+        Assert-True ((Get-Content -LiteralPath (Join-Path $publicCrashHome "profiles.yaml") -Raw) -ceq $publicCrashProfilesIndex) "public-entry recovery changed original profiles.yaml"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $publicCrashProfiles "Script.js"))) "public-entry recovery retained a partially installed Script.js"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $publicCrashHome ".clash-patch-transaction.json"))) "public uninstaller left the recovered transaction journal"
+
+        Invoke-DeferredProbe "public restore strong-kill atomicity" {
+            $publicRestorePackageParent = Join-Path $sandbox "public-restore-crash-package"
+            New-Item -ItemType Directory -Path $publicRestorePackageParent -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $root "clash-patch") -Destination $publicRestorePackageParent -Recurse
+            $publicRestorePackage = Join-Path $publicRestorePackageParent "clash-patch"
+            $publicRestoreInstaller = Join-Path (Join-Path $publicRestorePackage "scripts") "install_windows.ps1"
+            $publicRestoreTransaction = Join-Path (Join-Path (Join-Path $publicRestorePackage "scripts") "windows/install_windows") "transaction.ps1"
+            $publicRestoreTransactionText = [System.IO.File]::ReadAllText($publicRestoreTransaction)
+            $publicRestoreFunctionOffset = $publicRestoreTransactionText.IndexOf("function Write-LockedStreamBytes(")
+            $publicRestoreWriteNeedle = '        $Stream.Write($Replacement, 0, $Replacement.Length)'
+            $publicRestoreWriteOffset = $publicRestoreTransactionText.IndexOf(
+                $publicRestoreWriteNeedle,
+                $publicRestoreFunctionOffset
+            )
+            Assert-True ($publicRestoreFunctionOffset -ge 0 -and $publicRestoreWriteOffset -ge 0) "public restore crash fixture could not find the stream write boundary"
+            $publicRestoreHook = @'
+        if (-not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_RESTORE_CRASH_READY)) {
+            $partialLength = [Math]::Max(1, [Math]::Floor($Replacement.Length / 2))
+            $Stream.Write($Replacement, 0, $partialLength)
+            $Stream.SetLength($partialLength)
+            $Stream.Flush($true)
+            [System.IO.File]::WriteAllText($env:CLASH_PATCH_TEST_RESTORE_CRASH_READY, "ready")
+            Start-Sleep -Seconds 30
+        }
+'@
+            $publicRestoreTransactionText = $publicRestoreTransactionText.Remove(
+                $publicRestoreWriteOffset,
+                $publicRestoreWriteNeedle.Length
+            ).Insert(
+                $publicRestoreWriteOffset,
+                $publicRestoreHook + $publicRestoreWriteNeedle
+            )
+            [System.IO.File]::WriteAllText(
+                $publicRestoreTransaction,
+                $publicRestoreTransactionText,
+                (New-Object System.Text.UTF8Encoding($true))
+            )
+
+            $publicRestoreHome = Join-Path $sandbox "public-restore-crash-home"
+            $publicRestoreTarget = Join-Path $publicRestoreHome "config.yaml"
+            $publicRestoreBackupRoot = Join-Path $publicRestoreHome "clash-patch-backups"
+            $publicRestoreReady = Join-Path $sandbox "public-restore-crash.ready"
+            $publicRestoreBackupBytes = [System.Text.Encoding]::UTF8.GetBytes(
+                "mode: rule`nproxies: []`nproxy-groups: []`nrules: []`n"
+            )
+            $publicRestoreCurrentBytes = [System.Text.Encoding]::UTF8.GetBytes(
+                "mode: global`nproxies: []`nproxy-groups: []`nrules: []`n"
+            )
+            New-Item -ItemType Directory -Path $publicRestoreHome -Force | Out-Null
+            [System.IO.File]::WriteAllBytes($publicRestoreTarget, $publicRestoreBackupBytes)
+            $publicRestoreLock = Enter-AppHomeMutationLock $publicRestoreHome
+            try {
+                $publicRestoreBackup = Backup-Versioned $publicRestoreTarget $publicRestoreBackupRoot "prewrite"
+            } finally {
+                Exit-AppHomeMutationLock $publicRestoreLock
+            }
+            [System.IO.File]::WriteAllBytes($publicRestoreTarget, $publicRestoreCurrentBytes)
+            $publicRestoreExpectedHash = Get-FileSha256 $publicRestoreTarget
+            $env:CLASH_PATCH_TEST_RESTORE_CRASH_READY = $publicRestoreReady
+            $publicRestoreChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+                "-NoLogo", "-NoProfile", "-File", $publicRestoreInstaller,
+                "-AppHome", $publicRestoreHome,
+                "-RestoreBackup", (Split-Path -Leaf $publicRestoreBackup),
+                "-ExpectedCurrentSha256", $publicRestoreExpectedHash
+            ) -PassThru
+            try {
+                $publicRestoreDeadline = [DateTime]::UtcNow.AddSeconds(10)
+                while (-not (Test-Path -LiteralPath $publicRestoreReady -PathType Leaf) -and
+                    -not $publicRestoreChild.HasExited -and [DateTime]::UtcNow -lt $publicRestoreDeadline) {
+                    Start-Sleep -Milliseconds 25
+                }
+                Assert-True (Test-Path -LiteralPath $publicRestoreReady -PathType Leaf) "public restore did not reach an interrupted stream write"
+                Stop-Process -Id $publicRestoreChild.Id -Force
+                $publicRestoreChild.WaitForExit()
+            } finally {
+                $env:CLASH_PATCH_TEST_RESTORE_CRASH_READY = $null
+                if (-not $publicRestoreChild.HasExited) { Stop-Process -Id $publicRestoreChild.Id -Force }
+            }
+            $publicRestoreAfterKill = [System.IO.File]::ReadAllBytes($publicRestoreTarget)
+            $publicRestoreIsWholeVersion = (Get-BytesSha256 $publicRestoreAfterKill) -in @(
+                (Get-BytesSha256 $publicRestoreCurrentBytes),
+                (Get-BytesSha256 $publicRestoreBackupBytes)
+            )
+            Assert-True $publicRestoreIsWholeVersion "public restore left a truncated configuration after process death"
+        }
     }
 
     $verifiedTargetPath = Join-Path $transactionDir "verified-target.txt"
@@ -2445,7 +2700,7 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $nullAutoUpdateStatePath)) "successful safe uninstall retained auto-update ownership state"
     Assert-True ((Get-Content -LiteralPath (Join-Path $nullCase "profiles.yaml") -Raw) -match '(?m)^\s+allow_auto_update:\s+true\s*$') "safe uninstall did not restore remote subscription auto-update"
     $postUninstallLight = Invoke-TestPowerShell $installer @("-AppHome", $nullCase, "-UsageProfile", "1", "-MihomoPath", $fakeCore)
-    Assert-True ($postUninstallLight.ExitCode -eq 0) "safe uninstall did not permit a documented profile 3 to profile 1 downgrade: $($postUninstallLight.Output)"
+    Assert-True ($postUninstallLight.ExitCode -eq 0) "safe uninstall did not permit a documented profile 3 to profile 1 downgrade; $(Get-TestOutputDiagnostic $postUninstallLight.Output)"
     $postUninstallProfile = Get-Content -LiteralPath (Join-Path $nullCase "clash-patch-usage-profile.json") -Raw | ConvertFrom-Json
     Assert-True ([int]$postUninstallProfile.Profile -eq 1) "post-uninstall downgrade did not save profile 1"
     if ($onWindows) {
@@ -2621,7 +2876,7 @@ try {
         try {
             Start-Sleep -Milliseconds 100
             $runningResult = Invoke-TestPowerShell $installer @("-AppHome", $runningCase, "-MihomoPath", $fakeCore)
-            Assert-True ($runningResult.ExitCode -eq 0) "installer did not use the running-client boundary: $($runningResult.Output)"
+            Assert-True ($runningResult.ExitCode -eq 0) "installer did not use the running-client boundary; $(Get-TestOutputDiagnostic $runningResult.Output)"
             Assert-True (Test-Path -LiteralPath (Join-Path $runningProfiles "Script.js") -PathType Leaf) "running client did not receive the global script"
             Assert-True ((Get-Content -LiteralPath (Join-Path $runningCase "profiles.yaml") -Raw) -match '(?m)^\s+allow_auto_update:\s+false\s*$') "running client did not disable remote auto-update"
             Assert-True ((Get-Content -LiteralPath (Join-Path $runningCase "config.yaml") -Raw) -eq $runningConfig) "running client changed config.yaml"
@@ -2733,7 +2988,7 @@ if (!result["rule-providers"] || !Object.keys(result["rule-providers"]).some((na
         [System.IO.File]::WriteAllText($generatedScriptHarness, $generatedScriptHarnessSource, (New-Object System.Text.UTF8Encoding($false)))
         $node = Get-Command node.exe -ErrorAction Stop
         $generatedScriptOutput = & $node.Source $generatedScriptHarness $composedPath 2>&1 | Out-String
-        Assert-True ($LASTEXITCODE -eq 0) "generated Script.js failed syntax or execution: $generatedScriptOutput"
+        Assert-True ($LASTEXITCODE -eq 0) "generated Script.js failed syntax or execution; $(Get-TestOutputDiagnostic $generatedScriptOutput)"
     }
     Invoke-Uninstaller $composeCase
     $restoredScript = Get-Content -LiteralPath (Join-Path $composeProfiles "Script.js") -Raw

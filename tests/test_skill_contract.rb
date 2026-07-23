@@ -1127,6 +1127,9 @@ class SkillContractTest < Minitest::Test
     assert_includes workflow, "1a8520cfe425441eba3eba8623b27b985020031243fe1ecaa1af2b92358a03f9"
     assert_includes workflow, "mihomo-windows-amd64-$env:MIHOMO_VERSION.zip"
     assert_includes workflow, "-RealMihomoOnly"
+    assert_includes workflow, "executable: powershell.exe"
+    assert_includes workflow, "executable: pwsh.exe"
+    assert_equal 4, workflow.scan(/- version: v1\.19\.(?:27|29)\n\s+sha256: "[0-9a-f]{64}"\n\s+shell: (?:powershell|pwsh)/).length
     assert_includes workflow, "--connect-timeout 15 --max-time 300"
     assert_includes workflow, "shell: powershell"
     assert_includes workflow, "Get-Command powershell.exe"
@@ -1178,6 +1181,63 @@ class SkillContractTest < Minitest::Test
     assert_includes source, "Compress-Archive"
     assert_includes source, "Expand-Archive"
     assert_includes source, "incomplete release changed AppHome"
+  end
+
+  def test_windows_test_failure_diagnostics_do_not_echo_captured_output
+    source = File.read(File.join(ROOT, "tests/test_windows_installer.ps1"))
+    diagnostic = source[/function Get-TestOutputDiagnostic\b.*?^}/m]
+
+    refute_nil diagnostic
+    assert_includes diagnostic, '[System.Security.Cryptography.SHA256]::Create()'
+    assert_includes diagnostic, 'return "output_length=$($text.Length) output_sha256=$digest"'
+    refute_match(/return\s+\$text\b/, diagnostic)
+    refute_match(/throw "[^"]*\$\(\$result\.Output\)/, source)
+    refute_match(/Assert-True .*"[^"]*\$\(\$[A-Za-z0-9_]+\.Output\)/, source)
+  end
+
+  def test_production_probe_inventory_and_ci_aggregation_are_fixed
+    patcher_source = File.read(File.join(ROOT, "tests/test_macos_patcher.rb"))
+    wrapper_source = File.read(File.join(ROOT, "tests/test_macos_wrappers.rb"))
+    windows_source = File.read(File.join(ROOT, "tests/test_windows_installer.ps1"))
+    workflow = File.read(File.join(ROOT, ".github/workflows/test.yml"))
+    expected_macos = %w[
+      test_production_probe_mihomo_does_not_survive_a_killed_validator
+      test_production_probe_next_run_recovers_batch_killed_after_first_commit
+      test_production_probe_next_safe_update_recovers_batch_killed_after_first_swap
+      test_production_probe_normal_batch_rejects_duplicate_file_aliases
+      test_production_probe_normal_batch_restores_a_commit_when_bookkeeping_raises
+      test_production_probe_safe_update_restores_a_swap_when_bookkeeping_raises
+    ].sort
+    expected_wrappers = %w[
+      test_production_probe_uninstall_preserves_a_file_replaced_after_staging
+    ]
+    expected_windows = [
+      "Mihomo candidate cleanup after caller death",
+      "Mihomo timeout terminates descendants",
+      "duplicate transaction action field",
+      "extended-path AppHome lock alias",
+      "installer and uninstaller shared AppHome lock",
+      "interrupted transaction same-byte identity replacement",
+      "non-proxy route termini",
+      "private transaction journal ACL",
+      "public restore strong-kill atomicity",
+      "public restore same-byte identity replacement",
+      "strict UTF-8 safe-update validation",
+      "strict safe-update manifest schema"
+    ].sort
+
+    assert_equal expected_macos,
+                 patcher_source.scan(/^  def (test_production_probe_[a-z0-9_]+)/).flatten.sort
+    assert_equal expected_wrappers,
+                 wrapper_source.scan(/^  def (test_production_probe_[a-z0-9_]+)/).flatten.sort
+    assert_equal expected_windows,
+                 windows_source.scan(/Invoke-DeferredProbe "([^"]+)"/).flatten.sort
+    assert_includes workflow, "/usr/bin/ruby tests/test_macos_patcher.rb --name /production_probe/"
+    assert_includes workflow, "/usr/bin/ruby tests/test_macos_wrappers.rb --name /production_probe/"
+    assert_match(
+      /set \+e.*patcher_status=\$\?.*wrapper_status=\$\?.*system_patcher_status=\$\?.*system_wrapper_status=\$\?.*exit 1/m,
+      workflow
+    )
   end
 
   def test_every_test_entrypoint_is_wired_into_ci

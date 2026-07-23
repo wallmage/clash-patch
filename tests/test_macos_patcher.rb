@@ -29,6 +29,17 @@ class MacosPatcherTest < Minitest::Test
       ENV["CLASH_PATCH_RUN_PRODUCTION_PROBES"] == "1"
   end
 
+  def fixture_process?(process_id, marker)
+    return false unless process_id
+
+    output, status = Open3.capture2(
+      "/bin/ps", "-p", process_id.to_s, "-o", "command="
+    )
+    status.success? && output.include?(marker)
+  rescue SystemCallError
+    false
+  end
+
   def test_production_probe_normal_batch_restores_a_commit_when_bookkeeping_raises
     require_production_probe!
     Dir.mktmpdir do |directory|
@@ -188,9 +199,9 @@ class MacosPatcherTest < Minitest::Test
         assert_equal 9, status.termsig
 
         ClashPatch.run(
-          directory: directory, policy_path: POLICY_PATH, dry_run: true,
+          directory: directory, policy_path: POLICY_PATH,
           backup_root: File.join(directory, "backups"), selected_name: "none",
-          validator: ->(_path) { true }, auto_reload: false, usage_profile: 1
+          validator: ->(_path) { false }, auto_reload: false, usage_profile: 1
         )
         originals.each do |path, bytes|
           assert File.binread(path) == bytes, "next run did not recover #{File.basename(path)}"
@@ -324,8 +335,10 @@ class MacosPatcherTest < Minitest::Test
       ensure
         Process.kill("KILL", worker_id) rescue nil
         Process.waitpid(worker_id) rescue nil
-        Process.kill("KILL", -core_id) rescue nil
-        Process.kill("KILL", core_id) rescue nil
+        if fixture_process?(core_id, core)
+          Process.kill("KILL", -core_id) rescue nil
+          Process.kill("KILL", core_id) rescue nil
+        end
         connection&.close rescue nil
         listener.close rescue nil
         Dir.glob(File.join(directory, "clash-patch-command*")).each { |path| FileUtils.rm_f(path) }
@@ -1243,6 +1256,105 @@ class MacosPatcherTest < Minitest::Test
 
       assert_equal 2, attempts
       assert_equal "original", File.read(backup)
+    end
+  end
+
+  def test_backup_boundaries_reject_unsafe_roots_ids_and_collision_exhaustion
+    assert_empty ClashPatch.profile_paths("/path/that/does/not/exist")
+    assert_empty ClashPatch.list_backups("/path/that/does/not/exist")
+    Dir.mktmpdir do |directory|
+      real_root = File.join(directory, "real-backups")
+      FileUtils.mkdir_p(real_root)
+      linked_root = File.join(directory, "linked-backups")
+      File.symlink(real_root, linked_root)
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.secure_backup_root!(linked_root)
+      end
+      assert_empty ClashPatch.list_backups(linked_root)
+
+      file_root = File.join(directory, "not-a-directory")
+      File.write(file_root, "fixture")
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.secure_backup_root!(file_root)
+      end
+
+      source = File.join(directory, "friend.yaml")
+      File.write(source, "original")
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.create_versioned_backup(source, real_root, reason: "../unsafe")
+      end
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.resolve_backup_id("../friend.backup", real_root)
+      end
+
+      symlinked_backup = File.join(real_root, "fixture.backup")
+      File.symlink(source, symlinked_backup)
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.resolve_backup_id(File.basename(symlinked_backup), real_root)
+      end
+
+      attempts = 0
+      collision = lambda do |path, *_arguments, &_block|
+        if path.to_s.end_with?(".backup")
+          attempts += 1
+          raise Errno::EEXIST
+        end
+        raise "unexpected open target"
+      end
+      File.stub(:open, collision) do
+        assert_raises(IOError) do
+          ClashPatch.create_versioned_backup(source, real_root)
+        end
+      end
+      assert_equal 100, attempts
+      assert_empty Dir.glob(File.join(real_root, "*--prewrite--*.backup"))
+    end
+  end
+
+  def test_restore_backup_rejects_invalid_bytes_validation_failures_and_commit_conflicts
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config)
+      changed = YAML.dump(base_config.merge("subscription-marker" => "changed"))
+      File.write(profile, changed)
+      valid_backup = ClashPatch.create_versioned_backup(
+        profile, backup_root, content: original, reason: "prewrite"
+      )
+      expected_hash = Digest::SHA256.hexdigest(changed.b)
+
+      timeout = ClashPatch.restore_backup(
+        File.basename(valid_backup), directories: [directory], backup_root: backup_root,
+        expected_current_sha256: expected_hash, validator: ->(_path) { :timeout }
+      )
+      assert_equal :validation_timeout, timeout.fetch(:status)
+      assert_equal changed.b, File.binread(profile)
+
+      rejected = ClashPatch.restore_backup(
+        File.basename(valid_backup), directories: [directory], backup_root: backup_root,
+        expected_current_sha256: expected_hash, validator: ->(_path) { false }
+      )
+      assert_equal :validation_failed, rejected.fetch(:status)
+      assert_equal changed.b, File.binread(profile)
+
+      ClashPatch.stub(:atomic_compare_and_swap_bytes, false) do
+        conflict = ClashPatch.restore_backup(
+          File.basename(valid_backup), directories: [directory], backup_root: backup_root,
+          expected_current_sha256: expected_hash, validator: ->(_path) { true }
+        )
+        assert_equal :restore_conflict, conflict.fetch(:status)
+      end
+      assert_equal changed.b, File.binread(profile)
+
+      invalid_backup = ClashPatch.create_versioned_backup(
+        profile, backup_root, content: "\xFF".b, reason: "prewrite"
+      )
+      invalid = ClashPatch.restore_backup(
+        File.basename(invalid_backup), directories: [directory], backup_root: backup_root,
+        expected_current_sha256: expected_hash, validator: ->(_path) { true }
+      )
+      assert_equal :invalid_backup, invalid.fetch(:status)
+      assert_equal changed.b, File.binread(profile)
     end
   end
 
@@ -4490,6 +4602,13 @@ class MacosPatcherTest < Minitest::Test
         end
       end
     end
+    ClashPatch.stub(:selected_profile_name, "missing") do
+      ClashPatch.stub(:default_profile_directories, ["one", "two"]) do
+        ClashPatch.stub(:profile_paths, []) do
+          assert_nil ClashRouteVerifier.active_profile
+        end
+      end
+    end
   end
 
   def test_route_verifier_reserves_and_releases_a_local_source_port
@@ -4589,10 +4708,80 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_route_verifier_returns_nil_when_no_matching_connection_is_observed
+    ClashRouteVerifier.stub(:get_json, { "connections" => [] }) do
+      ClashRouteVerifier.stub(:reserve_local_port, 45_555) do
+        ClashRouteVerifier.stub(:sleep, ->(_seconds) {}) do
+          Process.stub(:spawn, 42) do
+            Process.stub(:kill, true) do
+              Process.stub(:waitpid, ->(*_arguments) { raise Errno::ECHILD }) do
+                assert_nil ClashRouteVerifier.observe_connection(
+                  "socket", "https://www.google.com", /google/i
+                )
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
+  def test_route_verifier_gracefully_reaps_a_finished_curl_process
+    signals = []
+    waits = [nil, [42, Struct.new(:success?).new(true)]]
+    Process.stub(:kill, ->(signal, process_id) { signals << [signal, process_id] }) do
+      Process.stub(:waitpid, ->(*_arguments) { waits.shift }) do
+        assert_nil ClashRouteVerifier.terminate_process(42, grace_seconds: 1)
+      end
+    end
+    assert_equal [["TERM", 42]], signals
+    assert_empty waits
+  end
+
   def test_route_verifier_returns_false_when_profile_loading_raises
     ClashPatch.stub(:controller_socket, "socket") do
       ClashRouteVerifier.stub(:active_profile, -> { raise IOError, "profile disappeared" }) do
         refute ClashRouteVerifier.run(output: StringIO.new)
+      end
+    end
+  end
+
+  def test_route_verifier_fails_closed_at_every_discovery_boundary
+    ClashPatch.stub(:controller_socket, nil) do
+      ClashRouteVerifier.stub(:active_profile, "/tmp/friend.yaml") do
+        refute ClashRouteVerifier.run(output: StringIO.new)
+      end
+    end
+    ClashPatch.stub(:controller_socket, "socket") do
+      ClashRouteVerifier.stub(:active_profile, nil) do
+        refute ClashRouteVerifier.run(output: StringIO.new)
+      end
+    end
+
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
+      ClashPatch.stub(:controller_socket, "socket") do
+        ClashRouteVerifier.stub(:active_profile, profile) do
+          ClashPatch.stub(:detect_main_group, nil) do
+            refute ClashRouteVerifier.run(output: StringIO.new)
+          end
+          ClashPatch.stub(:existing_ai_group, nil) do
+            refute ClashRouteVerifier.run(output: StringIO.new)
+          end
+          ClashRouteVerifier.stub(:get_json, { "proxies" => [] }) do
+            refute ClashRouteVerifier.run(output: StringIO.new)
+          end
+          direct_proxies = {
+            "proxies" => {
+              "Main" => { "now" => "DIRECT" },
+              "AI" => { "now" => "Japan" }
+            }
+          }
+          ClashRouteVerifier.stub(:get_json, direct_proxies) do
+            refute ClashRouteVerifier.run(output: StringIO.new)
+          end
+        end
       end
     end
   end
@@ -4633,6 +4822,14 @@ class MacosPatcherTest < Minitest::Test
     }
     refute ClashRouteVerifier.route_passes?(
       ["GameNode", "Gaming"], proxies: proxies, kind: :main,
+      expected_group: "Main", expected_selection: "Taiwan", ai_group: "AI"
+    )
+    refute ClashRouteVerifier.route_passes?(
+      ["Google"], proxies: proxies.merge("Google" => { "now" => "" }), kind: :main,
+      expected_group: "Main", expected_selection: "Taiwan", ai_group: "AI"
+    )
+    refute ClashRouteVerifier.route_passes?(
+      ["DIRECT", "Google"], proxies: proxies.merge("Google" => { "now" => "DIRECT" }), kind: :main,
       expected_group: "Main", expected_selection: "Taiwan", ai_group: "AI"
     )
   end
