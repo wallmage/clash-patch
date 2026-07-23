@@ -431,9 +431,14 @@ function Invoke-TestPowerShell([string]$ScriptPath, [string[]]$ScriptArguments) 
 }
 
 function Invoke-Installer([string]$AppHome) {
-    $result = Invoke-TestPowerShell $installer @("-AppHome", $AppHome, "-MihomoPath", $fakeCore)
+    $result = Invoke-TestPowerShell $installer @("-AppHome", $AppHome, "-MihomoPath", $fakeCore, "-Json")
     if ($result.ExitCode -ne 0) {
-        throw "Windows installer returned $($result.ExitCode); $(Get-TestOutputDiagnostic $result.Output)"
+        $detail = Get-TestOutputDiagnostic $result.Output
+        try {
+            $failure = $result.Output.Trim() | ConvertFrom-Json
+            $detail = "code=$($failure.code) summary=$($failure.summary_zh)"
+        } catch {}
+        throw "Windows installer returned $($result.ExitCode); $detail"
     }
 }
 
