@@ -200,8 +200,8 @@ bash clash-patch/scripts/install_macos.sh --profile N
 
 - 三个档位都会安装全局扩展脚本并写入数字档位，让每份订阅加载时使用共同国内域名直连基线。档位 1、2 只运行共同基线；档位 3 才修改 Clash Verge Rev 的 `profiles.yaml`，把每个远程订阅的 `option.allow_auto_update` 设为 `false`，并追加完整增强。
 - 补丁通过全局扩展脚本 `profiles/Script.js` 生效：之后每次加载或刷新订阅，客户端都会运行它并应用与 macOS 相同的策略（含二次转换一致性检查，不一致时返回原配置）。已有同步 `main` 的脚本会先改名保留、与补丁组合（先运行原脚本，再应用补丁）；检测到异步 `main`、递归 `main` 或补丁保留标识符时拒绝组合，原文件不被修改。
-- 客户端正在运行时，安装程序只更新全局脚本和 `profiles.yaml` 中的自动更新字段，不碰 `verge.yaml`、`config.yaml` 或当前运行配置；补丁内容等待各订阅随后正常加载或刷新时生效，此时只能写“已更新，尚未生效”。
-- 客户端原本没有运行时，安装程序才事务式更新应用级设置：`verge.yaml` 的 `enable_tun_mode` 设为 `true`、`enable_dns_settings` 设为 `false`，`config.yaml` 关闭 `ipv6` 并写入托管 TUN 块（保留非托管的 TUN 设置和行内注释）；同时把两份文件的原始字节和安装后哈希写入本地安装状态文件，供卸载核对。全部目标先备份再写入，任一失败整体回滚。
+- 客户端正在运行时，安装程序只更新全局脚本（档位 3 另外更新 `profiles.yaml` 中的自动更新字段），不碰 `verge.yaml`、`config.yaml` 或当前运行配置；补丁内容等待各订阅随后正常加载或刷新时生效，此时只能写“已更新，尚未生效”。
+- 档位 3 且客户端原本没有运行时，安装程序才事务式更新应用级设置：`verge.yaml` 的 `enable_tun_mode` 设为 `true`、`enable_dns_settings` 设为 `false`，`config.yaml` 关闭 `ipv6` 并写入托管 TUN 块（保留非托管的 TUN 设置和行内注释）；同时把两份文件的原始字节和安装后哈希写入本地安装状态文件，供卸载核对。全部目标先备份再写入，任一失败整体回滚。
 - 每次写入前都创建带日期时间的版本化备份，保存在应用目录的 `clash-patch-backups`；备份停止继承目录权限，只允许当前用户、SYSTEM 和 Administrators 访问。
 - 脚本不会结束 Clash 进程。Windows Computer Use 已在 2026 年 7 月提供；当前会话实际启用时，它与 macOS 一样负责界面开关、原应用复现和浏览器验收，但只能操作前台桌面，设备必须保持解锁，不能操作 UAC 或管理员授权窗口。
 
