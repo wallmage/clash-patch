@@ -2523,6 +2523,7 @@ try {
         $publicUninstallCrashHome = Join-Path $sandbox "public-uninstaller-crash-home"
         $publicUninstallCrashProfiles = Join-Path $publicUninstallCrashHome "profiles"
         $publicUninstallCrashReady = Join-Path $sandbox "public-uninstaller-crash.ready"
+        $publicUninstallRecoveryCrashReady = Join-Path $sandbox "public-uninstaller-recovery-crash.ready"
         New-Item -ItemType Directory -Path $publicUninstallCrashProfiles -Force | Out-Null
         [System.IO.File]::WriteAllText((Join-Path $publicUninstallCrashHome "config.yaml"), $publicCrashConfig)
         [System.IO.File]::WriteAllText((Join-Path $publicUninstallCrashHome "verge.yaml"), $publicCrashVerge)
@@ -2572,6 +2573,25 @@ try {
             $publicUninstallDeleteEnd,
             $publicUninstallHook
         )
+        $publicUninstallRecoveryNeedle =
+            '                Write-LockedStreamBytes $stream $item.Action.Original ([byte[]]@())'
+        $publicUninstallRecoveryOffset = $publicUninstallTransactionText.IndexOf(
+            $publicUninstallRecoveryNeedle
+        )
+        Assert-True ($publicUninstallRecoveryOffset -ge 0) "public uninstall crash fixture could not find the recovery create boundary"
+        $publicUninstallRecoveryEnd =
+            $publicUninstallRecoveryOffset + $publicUninstallRecoveryNeedle.Length
+        $publicUninstallRecoveryHook = @'
+
+                if (-not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_RECOVERY_CRASH_READY)) {
+                    [System.IO.File]::WriteAllText($env:CLASH_PATCH_TEST_RECOVERY_CRASH_READY, "ready")
+                    Start-Sleep -Seconds 30
+                }
+'@
+        $publicUninstallTransactionText = $publicUninstallTransactionText.Insert(
+            $publicUninstallRecoveryEnd,
+            $publicUninstallRecoveryHook
+        )
         [System.IO.File]::WriteAllText(
             $publicCrashTransaction,
             $publicUninstallTransactionText,
@@ -2599,6 +2619,34 @@ try {
             }
         }
         Assert-True (Test-Path -LiteralPath (Join-Path $publicUninstallCrashHome ".clash-patch-transaction.json") -PathType Leaf) "public uninstaller crash did not leave a recoverable transaction journal"
+        $env:CLASH_PATCH_TEST_RECOVERY_CRASH_READY = $publicUninstallRecoveryCrashReady
+        $publicUninstallRecoveryCrashChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+            "-NoLogo", "-NoProfile", "-File", $publicCrashInstaller,
+            "-AppHome", $publicUninstallCrashHome,
+            "-ShowUsageProfile",
+            "-Json"
+        ) -PassThru
+        try {
+            $publicUninstallRecoveryCrashDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while (-not (Test-Path -LiteralPath $publicUninstallRecoveryCrashReady -PathType Leaf) -and
+                -not $publicUninstallRecoveryCrashChild.HasExited -and
+                [DateTime]::UtcNow -lt $publicUninstallRecoveryCrashDeadline) {
+                Start-Sleep -Milliseconds 25
+            }
+            Assert-True (
+                Test-Path -LiteralPath $publicUninstallRecoveryCrashReady -PathType Leaf
+            ) "public recovery did not recreate an interrupted deletion"
+            Stop-Process -Id $publicUninstallRecoveryCrashChild.Id -Force
+            $publicUninstallRecoveryCrashChild.WaitForExit()
+        } finally {
+            $env:CLASH_PATCH_TEST_RECOVERY_CRASH_READY = $null
+            if (-not $publicUninstallRecoveryCrashChild.HasExited) {
+                Stop-Process -Id $publicUninstallRecoveryCrashChild.Id -Force
+            }
+        }
+        Assert-True (
+            Test-Path -LiteralPath (Join-Path $publicUninstallCrashHome ".clash-patch-transaction.json") -PathType Leaf
+        ) "second recovery interruption removed the transaction journal"
         $publicUninstallRecovery = Invoke-TestPowerShell $publicCrashInstaller @(
             "-AppHome", $publicUninstallCrashHome,
             "-ShowUsageProfile",

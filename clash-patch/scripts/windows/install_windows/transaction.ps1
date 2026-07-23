@@ -782,8 +782,15 @@ function Get-InterruptedTransactionRecoveryPlan([object[]]$Actions) {
         $currentHash = if ($snapshot.Exists) { Get-BytesSha256 $snapshot.Bytes } else { "" }
         $originalHash = Get-BytesSha256 $action.Original
         $replacementHash = Get-BytesSha256 $action.Replacement
-        if ($snapshot.Exists -and $snapshot.Identity -cne $action.Identity) {
-            throw "中断事务目标已被同内容的其他文件替换：$($action.Path)"
+        $isInterruptedOriginal = $snapshot.Exists -and
+            $snapshot.Bytes.Length -le $action.Original.Length
+        if ($isInterruptedOriginal) {
+            for ($index = 0; $index -lt $snapshot.Bytes.Length; $index++) {
+                if ($snapshot.Bytes[$index] -ne $action.Original[$index]) {
+                    $isInterruptedOriginal = $false
+                    break
+                }
+            }
         }
         $isInterruptedReplacement = $action.Action -eq "write" -and
             $snapshot.Exists -and
@@ -796,9 +803,14 @@ function Get-InterruptedTransactionRecoveryPlan([object[]]$Actions) {
                 }
             }
         }
+        if ($snapshot.Exists -and $snapshot.Identity -cne $action.Identity -and
+            -not ($action.Action -eq "delete" -and $isInterruptedOriginal)) {
+            throw "中断事务目标已被同内容的其他文件替换：$($action.Path)"
+        }
         if ($action.Action -eq "write" -and $action.Existed) {
             if (-not $snapshot.Exists -or
-                ($currentHash -notin @($originalHash, $replacementHash) -and -not $isInterruptedReplacement)) {
+                ($currentHash -notin @($originalHash, $replacementHash) -and
+                    -not $isInterruptedReplacement -and -not $isInterruptedOriginal)) {
                 throw "中断事务目标有无法自动合并的新改动：$($action.Path)"
             }
             if ($currentHash -ne $originalHash) {
@@ -813,11 +825,13 @@ function Get-InterruptedTransactionRecoveryPlan([object[]]$Actions) {
                 $plan += [pscustomobject]@{ Operation = "delete"; Action = $action; Snapshot = $snapshot }
             }
         } else {
-            if ($snapshot.Exists -and $currentHash -ne $originalHash) {
+            if ($snapshot.Exists -and $currentHash -ne $originalHash -and -not $isInterruptedOriginal) {
                 throw "中断事务删除目标有无法自动合并的新改动：$($action.Path)"
             }
             if (-not $snapshot.Exists) {
                 $plan += [pscustomobject]@{ Operation = "create"; Action = $action; Snapshot = $snapshot }
+            } elseif ($currentHash -ne $originalHash) {
+                $plan += [pscustomobject]@{ Operation = "write"; Action = $action; Snapshot = $snapshot }
             }
         }
     }

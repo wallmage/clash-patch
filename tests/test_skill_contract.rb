@@ -1305,6 +1305,7 @@ class SkillContractTest < Minitest::Test
     ].sort
     expected_public_kill_markers = %w[
       CLASH_PATCH_TEST_PUBLIC_CRASH_READY
+      CLASH_PATCH_TEST_RECOVERY_CRASH_READY
       CLASH_PATCH_TEST_RESTORE_CRASH_READY
       CLASH_PATCH_TEST_UNINSTALL_CRASH_READY
     ].sort
@@ -1346,6 +1347,21 @@ class SkillContractTest < Minitest::Test
       /\} elseif \(\$action\.Action -eq "write"\) \{\n\s+if \(\$snapshot\.Exists -and\n\s+\$currentHash -ne \$replacementHash -and -not \$isInterruptedReplacement\) \{\n\s+throw "中断事务新建目标有无法自动合并的新改动/,
       recovery_plan
     )
+  end
+
+  def test_windows_interrupted_recovery_accepts_only_original_byte_prefixes
+    source = File.binread(
+      File.join(SKILL, "scripts/windows/install_windows/transaction.ps1")
+    ).force_encoding("UTF-8")
+    plan = source[/function Get-InterruptedTransactionRecoveryPlan\b.*?(?=^function |\z)/m]
+
+    refute_nil plan
+    assert_includes plan, "$isInterruptedOriginal"
+    assert_includes plan, "$snapshot.Bytes.Length -le $action.Original.Length"
+    assert_includes plan,
+                    '-not ($action.Action -eq "delete" -and $isInterruptedOriginal)'
+    assert_match(/\$action\.Action -eq "write".*\$action\.Existed.*\$isInterruptedOriginal/m, plan)
+    assert_includes plan, '@{ Operation = "write"; Action = $action; Snapshot = $snapshot }'
   end
 
   def test_macos_production_probe_runner_executes_all_cases_and_propagates_any_failure

@@ -676,6 +676,23 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_recovery_prefix_guard_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/install_windows/transaction.ps1",
+        '            -not ($action.Action -eq "delete" -and $isInterruptedOriginal)) {',
+        '            $true) {'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_windows_interrupted_recovery_accepts_only_original_byte_prefixes"
+      )
+    end
+  end
+
   def test_windows_public_uninstall_kill_probe_mutation_is_killed
     with_repo_copy do |root|
       replace_once(
