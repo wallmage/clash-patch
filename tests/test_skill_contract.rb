@@ -348,7 +348,8 @@ class SkillContractTest < Minitest::Test
       assert_includes source, "DIRECT"
     end
     assert_includes policy, "verify_routes.ps1"
-    assert_includes mac_verifier, 'return false if chains.include?("DIRECT")'
+    assert_includes mac_verifier, "NON_PROXY_TERMINALS"
+    assert_includes mac_verifier, "non_proxy_terminal?"
     assert_includes windows_verifier, '$Chains -contains "DIRECT"'
     assert_includes windows_verifier, "function Test-RouteChains"
     assert_includes windows_verifier, 'type -eq "Selector"'
@@ -879,9 +880,8 @@ class SkillContractTest < Minitest::Test
     assert_includes mac_uninstall, "com.wallny.clash-profile-patcher"
     refute_includes mac_install, "launchctl bootstrap"
     refute_includes mac_install, "WatchPaths"
-    assert_includes mac_uninstall, "restoreTunProxy"
-    assert_includes mac_uninstall, "RestoreTunPresent"
-    assert_includes mac_uninstall, "RestoreTunKnown"
+    refute_includes mac_uninstall, 'defaults write "$DEFAULTS_DOMAIN" restoreTunProxy'
+    assert_includes mac_uninstall, "旧版安装前的 TUN 偏好无法证明仍是当前选择"
     assert_operator mac_uninstall.index('ProgramArguments.0'), :<, mac_uninstall.index('launchctl bootout')
     assert_operator mac_uninstall.index('ProgramArguments.1'), :<, mac_uninstall.index('launchctl bootout')
     assert_includes patcher, "File::EXCL"

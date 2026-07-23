@@ -94,7 +94,7 @@ module ClashPatch
   def default_connectivity_healthy?
     3.times do
       _output, status = Open3.capture2e(
-        "/usr/bin/curl", "-sS", "--max-time", "8", "-o", "/dev/null",
+        "/usr/bin/curl", "-sS", "--fail", "--max-time", "8", "-o", "/dev/null",
         "https://www.google.com/generate_204"
       )
       return true if status.success?
@@ -109,20 +109,35 @@ module ClashPatch
     expected = result[:patched_digest]
     return false unless original.is_a?(String) && expected.is_a?(String)
 
-    write_path = File.realpath(result.fetch(:path))
-    File.open(write_path, "r+b") do |source|
-      source.flock(File::LOCK_EX)
-      current = source.read
-      return false unless Digest::SHA256.hexdigest(current) == expected
+    path = result.fetch(:path)
+    current = File.binread(File.realpath(path))
+    return false unless Digest::SHA256.hexdigest(current) == expected
 
-      source.rewind
-      source.write(original)
-      source.truncate(original.bytesize)
-      source.flush
-      source.fsync
-    end
-    true
+    atomic_compare_and_swap_bytes(
+      path, current, original,
+      expected_identity: result[:patched_identity],
+      expected_path: result[:patched_path]
+    )
   rescue SystemCallError, IOError, KeyError
+    false
+  end
+
+  def runtime_health_healthy?(requester, selections:, expected_tun:, connectivity_checker:)
+    caches_flushed = ["/cache/fakeip/flush", "/cache/dns/flush"].all? do |endpoint|
+      code, _body = requester.call("POST", endpoint, nil)
+      [200, 204].include?(code)
+    end
+    return false unless caches_flushed
+    return false unless expected_tun && tun_state(requester: requester) == expected_tun
+
+    after = runtime_selections(requester)
+    return false unless after.is_a?(Hash) && selections.is_a?(Hash)
+    return false unless selections.all? { |name, selected| after.key?(name) && after[name] == selected }
+    return false unless dns_runtime_healthy?(requester, "www.baidu.com")
+    return false unless dns_runtime_healthy?(requester, "www.google.com")
+
+    connectivity_checker.call
+  rescue StandardError
     false
   end
 
@@ -137,53 +152,47 @@ module ClashPatch
 
     before = runtime_selections(requester)
     return result.merge(status: rollback_after_reload_failure(result, requester, result[:path])) unless before
-    preserved_tun_state = tun_state(requester: requester) if require_tun == :preserve
-    if require_tun == :preserve && preserved_tun_state == :unknown
-      return result.merge(status: rollback_after_reload_failure(result, nil, nil))
+    preserved_tun_state = tun_state(requester: requester)
+    expected_tun = require_tun == :preserve ? preserved_tun_state : (require_tun ? :enabled : preserved_tun_state)
+    rollback = lambda do
+      rollback_after_reload_failure(
+        result, requester, result[:path], selections: before, expected_tun: expected_tun,
+        connectivity_checker: connectivity_checker
+      )
     end
+    return result.merge(status: rollback.call) if expected_tun == :unknown
 
     code, _body = requester.call(
       "PUT", "/configs?force=true", JSON.generate("path" => File.expand_path(result.fetch(:path)))
     )
-    unless code == 204
-      return result.merge(status: rollback_after_reload_failure(result, nil, nil))
-    end
+    return result.merge(status: rollback.call) unless code == 204
 
-    caches_flushed = ["/cache/fakeip/flush", "/cache/dns/flush"].all? do |endpoint|
-      cache_code, _cache_body = requester.call("POST", endpoint, nil)
-      [200, 204].include?(cache_code)
-    end
-    unless caches_flushed
-      return result.merge(status: rollback_after_reload_failure(result, requester, result[:path]))
-    end
-
-    healthy = if require_tun == :preserve
-                tun_state(requester: requester) == preserved_tun_state
-              else
-                !require_tun || tun_state(requester: requester) == :enabled
-              end
-    after = healthy ? runtime_selections(requester) : nil
-    healthy &&= after.is_a?(Hash)
-    healthy &&= before.all? { |name, selected| after.key?(name) && after[name] == selected }
-    healthy &&= dns_runtime_healthy?(requester, "www.baidu.com")
-    healthy &&= dns_runtime_healthy?(requester, "www.google.com")
-    healthy &&= connectivity_checker.call
-
+    healthy = runtime_health_healthy?(
+      requester, selections: before, expected_tun: expected_tun,
+      connectivity_checker: connectivity_checker
+    )
     return result.merge(reloaded: true) if healthy
 
-    result.merge(status: rollback_after_reload_failure(result, requester, result[:path]))
+    result.merge(status: rollback.call)
   rescue StandardError
     result.merge(status: rollback_after_reload_failure(result, requester, result[:path]))
   end
 
-  def rollback_after_reload_failure(result, requester, path)
+  def rollback_after_reload_failure(result, requester, path, selections: nil, expected_tun: nil,
+                                    connectivity_checker: nil)
     return :reload_failed_rollback_conflict unless restore_profile_bytes(result)
-    return :reload_failed_rolled_back unless requester && path
+    return :reload_failed_restore_pending unless requester && path && selections && expected_tun
+    connectivity_checker ||= method(:default_connectivity_healthy?)
 
     code, _body = requester.call(
       "PUT", "/configs?force=true", JSON.generate("path" => File.expand_path(path))
     )
-    code == 204 ? :reload_failed_rolled_back : :reload_failed_restore_pending
+    return :reload_failed_restore_pending unless code == 204
+
+    runtime_health_healthy?(
+      requester, selections: selections, expected_tun: expected_tun,
+      connectivity_checker: connectivity_checker
+    ) ? :reload_failed_rolled_back : :reload_failed_restore_pending
   rescue StandardError
     :reload_failed_restore_pending
   end

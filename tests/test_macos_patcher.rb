@@ -868,7 +868,7 @@ class MacosPatcherTest < Minitest::Test
   def test_disables_subscription_auto_update_through_defaults_and_verifies_it
     Dir.mktmpdir do |directory|
       calls = []
-      values = ["1", "0"]
+      values = ["1", "1", "0"]
       runner = lambda do |*arguments, **_options|
         calls << arguments
         if arguments[1] == "export"
@@ -900,11 +900,11 @@ class MacosPatcherTest < Minitest::Test
       state = JSON.parse(File.read(File.join(directory, "clashx-meta-kAutoUpdateEnable.state.json")))
       assert_equal(
         {
-          "Version" => 1,
+          "Version" => 2,
           "Domain" => "com.metacubex.ClashX.meta",
           "Key" => "kAutoUpdateEnable",
-          "OriginalState" => "enabled",
-          "InstalledState" => "disabled"
+          "OriginalValue" => "1",
+          "Phase" => "installed"
         },
         state
       )
@@ -1039,17 +1039,10 @@ class MacosPatcherTest < Minitest::Test
         end
       end
 
-      assert_raises(IOError) do
+      assert_raises(ClashPatch::InvalidConfigError) do
         ClashPatch.disable_subscription_auto_update(backup_root: directory, runner: runner)
       end
-      assert_includes calls, [
-        "/usr/bin/defaults", "write", "com.metacubex.ClashX.meta",
-        "kAutoUpdateEnable", "-bool", "false"
-      ]
-      assert_includes calls, [
-        "/usr/bin/defaults", "write", "com.metacubex.ClashX.meta",
-        "kAutoUpdateEnable", "-bool", "true"
-      ]
+      refute calls.any? { |arguments| arguments[1] == "write" }
       assert File.file?(state_path)
     end
   end
@@ -1335,7 +1328,7 @@ class MacosPatcherTest < Minitest::Test
         { name: name, path: path, url: "https://subscriptions.invalid/#{name}" }
       end
       originals = targets.to_h { |target| [target.fetch(:path), File.binread(target.fetch(:path))] }
-      restore = lambda do |path, bytes|
+      restore = lambda do |path, bytes, **_options|
         next false if File.basename(path) == "second.yaml"
 
         File.binwrite(path, bytes)
@@ -1823,6 +1816,23 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_route_verifier_force_reaps_a_curl_process_that_ignores_term
+    reader, writer = IO.pipe
+    pid = Process.spawn(RbConfig.ruby, "-e", 'trap("TERM") {}; STDOUT.puts("ready"); STDOUT.flush; sleep 30', out: writer)
+    writer.close
+    assert_equal "ready\n", reader.gets
+    reader.close
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    ClashRouteVerifier.terminate_process(pid, grace_seconds: 0.05)
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+    assert_operator elapsed, :<, 1
+    assert_raises(Errno::ECHILD) { Process.waitpid(pid, Process::WNOHANG) }
+  ensure
+    Process.kill("KILL", pid) rescue nil
+    Process.waitpid(pid) rescue nil
+  end
+
   def test_active_reload_fails_when_an_existing_selector_disappears
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
@@ -1834,7 +1844,7 @@ class MacosPatcherTest < Minitest::Test
         case [method, endpoint]
         when ["GET", "/proxies"]
           proxy_reads += 1
-          body = proxy_reads == 1 ? { "Main" => { "type" => "Selector", "now" => "Taiwan" } } : {}
+          body = proxy_reads == 2 ? {} : { "Main" => { "type" => "Selector", "now" => "Taiwan" } }
           [200, JSON.generate("proxies" => body)]
         when ["PUT", "/configs?force=true"], ["POST", "/cache/fakeip/flush"], ["POST", "/cache/dns/flush"]
           [204, ""]
@@ -1923,9 +1933,9 @@ class MacosPatcherTest < Minitest::Test
         connectivity_checker: -> { true }
       ).first
 
-      assert_equal :reload_failed_rolled_back, result.fetch(:status)
+      assert_equal :reload_failed_restore_pending, result.fetch(:status)
       assert_equal original.b, File.binread(profile)
-      assert_includes ClashPatch.chinese_status(result), "自动刷新失败，已恢复原配置"
+      assert_includes ClashPatch.chinese_status(result), "运行内核恢复失败"
     end
   end
 
@@ -1958,7 +1968,7 @@ class MacosPatcherTest < Minitest::Test
         connectivity_checker: -> { true }
       ).first
 
-      assert_equal :reload_failed_rolled_back, result.fetch(:status)
+      assert_equal :reload_failed_restore_pending, result.fetch(:status)
       assert_equal original.b, File.binread(profile)
       assert_equal 2, reload_bodies.length
     end

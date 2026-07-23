@@ -5,6 +5,7 @@ set -f
 CUSTOM_PROFILE_DIR="${CLASH_PATCH_PROFILE_DIR:-}"
 INSTALL_DIR="$HOME/Library/Application Support/ClashPatch"
 BACKUP_DIR="$INSTALL_DIR/backups"
+AUTO_UPDATE_OWNERSHIP_PATH="$BACKUP_DIR/clashx-meta-kAutoUpdateEnable.state.json"
 USAGE_STATE_PATH="${CLASH_PATCH_USAGE_STATE_PATH:-$INSTALL_DIR/usage-profile.plist}"
 CURRENT_LABEL="com.clashpatch.profiles"
 CURRENT_PLIST="$HOME/Library/LaunchAgents/$CURRENT_LABEL.plist"
@@ -23,6 +24,34 @@ SAFE_UPDATE=0
 JSON_OUTPUT=0
 OPERATION="install"
 AUTO_UPDATE_CHANGED=0
+PENDING_TEMPORARY=""
+
+unexpected_exit() {
+  unexpected_status=$1
+  trap - EXIT HUP INT TERM
+  [ "$unexpected_status" -ne 0 ] || return 0
+  set +e
+  [ -z "$PENDING_TEMPORARY" ] || /bin/rm -f "$PENDING_TEMPORARY"
+  if [ -e "$AUTO_UPDATE_OWNERSHIP_PATH" ] || [ -L "$AUTO_UPDATE_OWNERSHIP_PATH" ]; then
+    /usr/bin/ruby "$PATCHER_SOURCE" \
+      --backup-dir "$BACKUP_DIR" --restore-owned-subscription-auto-update >/dev/null 2>&1
+  fi
+  if [ "$JSON_OUTPUT" -eq 1 ]; then
+    if [ -x /usr/bin/ruby ] && [ -f "$RESULT_CONTRACT_SOURCE" ]; then
+      /usr/bin/ruby "$RESULT_CONTRACT_SOURCE" \
+        --command install --operation "$OPERATION" --ok false --status failed \
+        --code unexpected_exit --exit-code "$unexpected_status" --summary "安装流程意外中止。"
+    fi
+  else
+    /usr/bin/printf '%s\n' "[Clash 补丁] 安装流程意外中止；已尝试恢复订阅自动更新。"
+  fi
+  exit "$unexpected_status"
+}
+
+trap 'unexpected_exit $?' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 for argument do
   [ "$argument" = "--json" ] && JSON_OUTPUT=1
@@ -35,7 +64,9 @@ finish() {
   finish_summary=$4
   finish_operation=${5:-$OPERATION}
   finish_profile=${6:-$USAGE_PROFILE}
-  if [ "$finish_exit" -ne 0 ] && [ "$AUTO_UPDATE_CHANGED" -eq 1 ]; then
+  if [ "$finish_exit" -ne 0 ] &&
+     { [ "$AUTO_UPDATE_CHANGED" -eq 1 ] ||
+       [ -e "$AUTO_UPDATE_OWNERSHIP_PATH" ] || [ -L "$AUTO_UPDATE_OWNERSHIP_PATH" ]; }; then
     AUTO_UPDATE_CHANGED=0
     restore_result=$(/usr/bin/ruby "$PATCHER_SOURCE" \
       --backup-dir "$BACKUP_DIR" --restore-owned-subscription-auto-update 2>&1 || true)
@@ -64,6 +95,7 @@ finish() {
       /usr/bin/printf '%s\n' "{\"schema\":\"clash-patch.result\",\"version\":1,\"command\":\"install\",\"platform\":\"macos\",\"client\":\"clashx-meta\",\"operation\":\"$finish_operation\",\"ok\":false,\"status\":\"$finish_status\",\"code\":\"$finish_code\",\"exit_code\":$finish_exit,\"summary_zh\":\"$finish_summary\",\"profile\":null,\"changes\":[],\"checks\":[],\"items\":[],\"messages\":[],\"warnings\":[]}"
     fi
   fi
+  trap - EXIT HUP INT TERM
   exit "$finish_exit"
 }
 
@@ -125,13 +157,17 @@ save_profile() {
   /bin/mkdir -p "$state_dir"
   /bin/chmod 700 "$state_dir"
   temporary=$(/usr/bin/mktemp "$state_dir/.usage-profile.XXXXXX")
-  trap '/bin/rm -f "$temporary"' EXIT HUP INT TERM
+  PENDING_TEMPORARY=$temporary
+  trap '/bin/rm -f "$temporary"; exit 1' HUP INT TERM
   /usr/bin/plutil -create xml1 "$temporary"
   /usr/bin/plutil -insert Version -integer 1 "$temporary"
   /usr/bin/plutil -insert Profile -integer "$USAGE_PROFILE" "$temporary"
   /bin/chmod 600 "$temporary"
   /bin/mv -f "$temporary" "$USAGE_STATE_PATH"
-  trap - EXIT HUP INT TERM
+  PENDING_TEMPORARY=""
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 }
 
 while [ "$#" -gt 0 ]; do

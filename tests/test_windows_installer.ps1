@@ -327,6 +327,8 @@ function Get-TreeContentSnapshot([string]$Path) {
         )
         if ($_.PSIsContainer) {
             "D:$relative"
+        } elseif ($_.Name -eq ".clash-patch.lock") {
+            "F:${relative}:<locked>"
         } else {
             "F:${relative}:" + [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($_.FullName))
         }

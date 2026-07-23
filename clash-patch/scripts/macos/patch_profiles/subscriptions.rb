@@ -13,47 +13,76 @@ module ClashPatch
     return nil unless File.exist?(path) || File.symlink?(path)
     raise InvalidConfigError, "订阅自动更新所有权状态无效" if File.symlink?(path) || !File.file?(path)
 
-    state = JSON.parse(File.read(path, encoding: "UTF-8"))
-    expected_keys = %w[Domain InstalledState Key OriginalState Version]
-    valid = state.is_a?(Hash) &&
-            state.keys.sort == expected_keys &&
-            state["Version"] == 1 &&
+    snapshot = regular_file_snapshot_once(path, "订阅自动更新所有权状态")
+    state = JSON.parse(snapshot.fetch(:bytes).dup.force_encoding(Encoding::UTF_8))
+    legacy = state.is_a?(Hash) && state.keys.sort == %w[Domain InstalledState Key OriginalState Version] &&
+             state["Version"] == 1 && state["OriginalState"] == "enabled" &&
+             state["InstalledState"] == "disabled"
+    current = state.is_a?(Hash) && state.keys.sort == %w[Domain Key OriginalValue Phase Version] &&
+              state["Version"] == 2 && state["OriginalValue"].is_a?(String) &&
+              %w[prepared installed].include?(state["Phase"])
+    valid = (legacy || current) &&
             AUTO_UPDATE_DOMAINS.include?(state["Domain"]) &&
-            state["Key"] == "kAutoUpdateEnable" &&
-            state["OriginalState"] == "enabled" &&
-            state["InstalledState"] == "disabled"
+            state["Key"] == "kAutoUpdateEnable"
     raise InvalidConfigError, "订阅自动更新所有权状态无效" unless valid
 
-    state.merge("Path" => path)
+    state = state.merge("OriginalValue" => "true", "Phase" => "installed") if legacy
+    state.merge(
+      "Path" => path, "Bytes" => snapshot.fetch(:bytes),
+      "Identity" => snapshot.fetch(:identity)
+    )
   rescue JSON::ParserError, EncodingError
     raise InvalidConfigError, "订阅自动更新所有权状态无效"
   end
 
-  def create_auto_update_ownership_state(backup_root, domain)
+  def write_auto_update_ownership_state(backup_root, domain, original_value, phase, existing: nil)
     root = secure_backup_root!(backup_root)
-    existing = auto_update_ownership_state(root)
-    return existing.fetch("Path") if existing
-
     state = {
-      "Version" => 1,
+      "Version" => 2,
       "Domain" => domain,
       "Key" => "kAutoUpdateEnable",
-      "OriginalState" => "enabled",
-      "InstalledState" => "disabled"
+      "OriginalValue" => original_value,
+      "Phase" => phase
     }
     path = auto_update_ownership_path(root)
-    created = false
-    File.open(path, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
-      created = true
-      file.write(JSON.generate(state) + "\n")
-      file.flush
-      file.fsync
+    bytes = (JSON.generate(state) + "\n").b
+    if existing
+      changed = atomic_compare_and_swap_bytes(
+        path, existing.fetch("Bytes"), bytes,
+        expected_identity: existing.fetch("Identity"), expected_path: File.realpath(path)
+      )
+      raise IOError, "订阅自动更新所有权状态同时发生变化" unless changed
+    else
+      File.open(path, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+        file.write(bytes)
+        file.flush
+        file.fsync
+      end
     end
     FileUtils.chmod(0o600, path)
-    path
-  rescue StandardError
-    FileUtils.rm_f(path) if defined?(created) && created && path && File.exist?(path) && !File.symlink?(path)
-    raise
+    auto_update_ownership_state(root)
+  end
+
+  def delete_auto_update_ownership_state(state)
+    path = state.fetch("Path")
+    write_path = File.realpath(path)
+    Tempfile.create([".clash-patch-state-delete-", ".tmp"], File.dirname(write_path)) do |temporary|
+      temporary.binmode
+      temporary.flush
+      temporary.fsync
+      atomic_swap_paths(temporary.path, write_path)
+      deleted = File.binread(temporary.path) == state.fetch("Bytes") &&
+                begin
+                  stat = File.stat(temporary.path)
+                  [stat.dev, stat.ino] == state.fetch("Identity")
+                end
+      unless deleted
+        atomic_swap_paths(temporary.path, write_path)
+        raise IOError, "订阅自动更新所有权状态同时发生变化"
+      end
+      File.unlink(write_path)
+      true
+    end
   end
 
   def defaults_export_domain(runner: Open3.method(:capture3))
@@ -65,6 +94,15 @@ module ClashPatch
     rescue StandardError
       next
     end
+    nil
+  end
+
+  def defaults_export_named_domain(domain, runner: Open3.method(:capture3))
+    plist, _error, status = runner.call("/usr/bin/defaults", "export", domain, "-")
+    return nil unless status.success? && !plist.empty?
+
+    { domain: domain, plist: plist }
+  rescue StandardError
     nil
   end
 
@@ -86,6 +124,17 @@ module ClashPatch
   end
 
   def disable_subscription_auto_update(backup_root:, runner: Open3.method(:capture3))
+    ownership = auto_update_ownership_state(backup_root)
+    if ownership
+      owned_export = defaults_export_named_domain(ownership.fetch("Domain"), runner: runner)
+      owned_value = owned_export &&
+                    plist_raw_value(owned_export.fetch(:plist), "kAutoUpdateEnable", runner: runner)
+      if ownership.fetch("Phase") == "installed" &&
+         subscription_auto_update_state(owned_value) == :disabled
+        return { status: :already_disabled, domain: ownership.fetch("Domain") }
+      end
+      restore_owned_subscription_auto_update(backup_root: backup_root, runner: runner)
+    end
     exported = defaults_export_domain(runner: runner)
     raise InvalidConfigError, "无法读取 ClashX Meta 偏好设置" unless exported
 
@@ -107,27 +156,32 @@ module ClashPatch
       backup_path, backup_root, content: JSON.generate(backup) + "\n", reason: "preference"
     )
 
+    ownership = write_auto_update_ownership_state(backup_root, domain, original, "prepared")
+    before_write = defaults_export_named_domain(domain, runner: runner)
+    before_value = before_write && plist_raw_value(before_write.fetch(:plist), "kAutoUpdateEnable", runner: runner)
+    unless before_value == original
+      delete_auto_update_ownership_state(ownership)
+      raise InvalidConfigError, "订阅自动更新设置在修改前发生变化"
+    end
+
     _output, error, write_status = runner.call(
       "/usr/bin/defaults", "write", domain, "kAutoUpdateEnable", "-bool", "false"
     )
     unless write_status.success?
       begin
-        enable_subscription_auto_update(runner: runner)
+        enable_subscription_auto_update(domain: domain, runner: runner)
       rescue InvalidConfigError, SystemCallError, IOError => restore_error
         raise IOError, "无法关闭订阅自动更新，且恢复原值失败：#{restore_error.message}"
       end
       raise IOError, "无法关闭 ClashX Meta 订阅自动更新：#{error.to_s.strip}"
     end
 
-    verified_export = defaults_export_domain(runner: runner)
-    verified_value = if verified_export && verified_export.fetch(:domain) == domain
-                       plist_raw_value(verified_export.fetch(:plist), "kAutoUpdateEnable", runner: runner)
-                     else
-                       ""
-                     end
+    verified_export = defaults_export_named_domain(domain, runner: runner)
+    verified_value = verified_export &&
+                     plist_raw_value(verified_export.fetch(:plist), "kAutoUpdateEnable", runner: runner)
     unless subscription_auto_update_state(verified_value) == :disabled
       begin
-        enable_subscription_auto_update(runner: runner)
+        enable_subscription_auto_update(domain: domain, runner: runner)
       rescue InvalidConfigError, SystemCallError, IOError => restore_error
         raise IOError, "订阅自动更新设置回读失败，且恢复原值失败：#{restore_error.message}"
       end
@@ -135,21 +189,23 @@ module ClashPatch
     end
 
     begin
-      ownership_path = create_auto_update_ownership_state(backup_root, domain)
+      ownership = write_auto_update_ownership_state(
+        backup_root, domain, original, "installed", existing: auto_update_ownership_state(backup_root)
+      )
     rescue StandardError => state_error
       begin
-        enable_subscription_auto_update(runner: runner)
+        enable_subscription_auto_update(domain: domain, runner: runner)
       rescue InvalidConfigError, SystemCallError, IOError => restore_error
         raise IOError, "无法记录订阅自动更新所有权，且恢复原值失败：#{restore_error.message}"
       end
       raise IOError, "无法记录订阅自动更新所有权，已经恢复原值：#{state_error.message}"
     end
 
-    { status: :disabled, domain: domain, backup: created_backup, ownership: ownership_path }
+    { status: :disabled, domain: domain, backup: created_backup, ownership: ownership.fetch("Path") }
   end
 
-  def enable_subscription_auto_update(runner: Open3.method(:capture3))
-    exported = defaults_export_domain(runner: runner)
+  def enable_subscription_auto_update(domain: nil, runner: Open3.method(:capture3))
+    exported = domain ? defaults_export_named_domain(domain, runner: runner) : defaults_export_domain(runner: runner)
     raise InvalidConfigError, "无法读取 ClashX Meta 偏好设置" unless exported
 
     domain = exported.fetch(:domain)
@@ -163,12 +219,9 @@ module ClashPatch
     )
     raise IOError, "无法恢复 ClashX Meta 订阅自动更新：#{error.to_s.strip}" unless write_status.success?
 
-    verified_export = defaults_export_domain(runner: runner)
-    verified_value = if verified_export && verified_export.fetch(:domain) == domain
-                       plist_raw_value(verified_export.fetch(:plist), "kAutoUpdateEnable", runner: runner)
-                     else
-                       ""
-                     end
+    verified_export = defaults_export_named_domain(domain, runner: runner)
+    verified_value = verified_export &&
+                     plist_raw_value(verified_export.fetch(:plist), "kAutoUpdateEnable", runner: runner)
     raise IOError, "ClashX Meta 订阅自动更新恢复后回读失败" unless subscription_auto_update_state(verified_value) == :enabled
 
     { status: :enabled, domain: domain }
@@ -178,9 +231,8 @@ module ClashPatch
     ownership = auto_update_ownership_state(backup_root)
     return { status: :not_owned } unless ownership
 
-    exported = defaults_export_domain(runner: runner)
+    exported = defaults_export_named_domain(ownership.fetch("Domain"), runner: runner)
     raise InvalidConfigError, "无法读取 ClashX Meta 偏好设置" unless exported
-    raise InvalidConfigError, "ClashX Meta 偏好设置域与所有权状态不一致" unless exported.fetch(:domain) == ownership.fetch("Domain")
 
     current = plist_raw_value(exported.fetch(:plist), "kAutoUpdateEnable", runner: runner)
     state = subscription_auto_update_state(current)
@@ -190,12 +242,9 @@ module ClashPatch
       )
       raise IOError, "无法恢复 ClashX Meta 订阅自动更新：#{error.to_s.strip}" unless write_status.success?
 
-      verified_export = defaults_export_domain(runner: runner)
-      verified_value = if verified_export && verified_export.fetch(:domain) == ownership.fetch("Domain")
-                         plist_raw_value(verified_export.fetch(:plist), "kAutoUpdateEnable", runner: runner)
-                       else
-                         ""
-                       end
+      verified_export = defaults_export_named_domain(ownership.fetch("Domain"), runner: runner)
+      verified_value = verified_export &&
+                       plist_raw_value(verified_export.fetch(:plist), "kAutoUpdateEnable", runner: runner)
       raise IOError, "ClashX Meta 订阅自动更新恢复后回读失败" unless subscription_auto_update_state(verified_value) == :enabled
       result = :restored
     elsif state == :enabled
@@ -204,7 +253,7 @@ module ClashPatch
       raise InvalidConfigError, "无法确认 ClashX Meta 订阅自动更新状态"
     end
 
-    File.unlink(ownership.fetch("Path"))
+    delete_auto_update_ownership_state(ownership)
     { status: result, domain: ownership.fetch("Domain") }
   end
 
@@ -320,12 +369,14 @@ module ClashPatch
     output
   end
 
-  def replace_profile_bytes(path, bytes)
+  def replace_profile_bytes(path, bytes, expected_bytes: nil, expected_identity: nil, expected_path: nil)
     write_path = File.realpath(path)
-    File.open(write_path, "r+b") do |source|
-      source.flock(File::LOCK_EX)
-      write_locked_profile(source, bytes)
-    end
+    current = File.binread(write_path)
+    return false if expected_bytes && current != expected_bytes
+
+    atomic_compare_and_swap_bytes(
+      path, current, bytes, expected_identity: expected_identity, expected_path: expected_path
+    )
   end
 
   def write_locked_profile(handle, bytes)
@@ -344,13 +395,42 @@ module ClashPatch
     false
   end
 
+  def safe_update_item_committed?(item)
+    return false unless File.realpath(item.fetch(:path)) == item.fetch(:write_path)
+
+    stat = File.stat(item.fetch(:write_path))
+    [stat.dev, stat.ino] == item.fetch(:committed_identity) &&
+      File.binread(item.fetch(:write_path)) == item.fetch(:candidate)
+  rescue StandardError
+    false
+  end
+
+  def rollback_safe_update_items(items)
+    failures = []
+    items.each do |item|
+      next unless item[:committed_identity]
+
+      restored = replace_profile_bytes(
+        item.fetch(:path), item.fetch(:original),
+        expected_bytes: item.fetch(:candidate),
+        expected_identity: item.fetch(:committed_identity),
+        expected_path: item.fetch(:write_path)
+      )
+      failures << item.fetch(:name) unless restored
+    rescue StandardError
+      failures << item.fetch(:name)
+    end
+    failures
+  end
+
   def default_safe_update_activation(items, usage_profile, selected_name = selected_profile_name)
     active = items.find { |item| active_profile?(item.fetch(:path), selected_name) }
     return true unless active
 
     result = {
       path: active.fetch(:path), status: :updated, active: true,
-      rollback_bytes: active.fetch(:original), patched_digest: Digest::SHA256.hexdigest(active.fetch(:candidate))
+      rollback_bytes: active.fetch(:original), patched_digest: Digest::SHA256.hexdigest(active.fetch(:candidate)),
+      patched_identity: active[:patched_identity], patched_path: active[:patched_path]
     }
     activate_updated_profile(result, require_tun: usage_profile >= 2)
   end
@@ -379,11 +459,14 @@ module ClashPatch
     end
 
     handles = []
+    temporary_files = []
     concurrent_change = false
     begin
       items.sort_by { |item| File.expand_path(item.fetch(:path)) }.each do |item|
-        handle = File.open(File.realpath(item.fetch(:path)), "r+b")
-        handle.flock(File::LOCK_EX)
+        write_path = File.realpath(item.fetch(:path))
+        handle = File.open(write_path, "rb")
+        lock_exclusive_with_timeout(handle)
+        item[:write_path] = write_path
         handles << [item, handle]
       end
       unless handles.all? do |item, handle|
@@ -401,32 +484,38 @@ module ClashPatch
           concurrent_change = true
           raise IOError, "subscription path changed during safe update"
         end
-        write_locked_profile(handle, item.fetch(:candidate))
-        unless locked_profile_current?(handle, item.fetch(:path))
+        temporary = Tempfile.new([".clash-patch-update-swap-", ".tmp"], File.dirname(item.fetch(:write_path)))
+        temporary.binmode
+        write_locked_profile(temporary, item.fetch(:candidate))
+        temporary_files << temporary
+        item[:temporary] = temporary
+      end
+      handles.each do |item, handle|
+        unless locked_profile_current?(handle, item.fetch(:path)) &&
+               handle.rewind && handle.read == item.fetch(:original)
           concurrent_change = true
           raise IOError, "subscription path changed during safe update"
         end
-      end
-      unless handles.all? do |item, handle|
-               locked_profile_current?(handle, item.fetch(:path)) &&
-                 handle.rewind && handle.read == item.fetch(:candidate)
-             end
-        concurrent_change = true
-        raise IOError, "subscription path changed during safe update"
+        original_identity = [handle.stat.dev, handle.stat.ino]
+        atomic_swap_paths(item.fetch(:temporary).path, item.fetch(:write_path))
+        unless same_file_identity?(handle.stat, item.fetch(:temporary).path) &&
+               File.binread(item.fetch(:temporary).path) == item.fetch(:original) &&
+               File.realpath(item.fetch(:path)) == item.fetch(:write_path) &&
+               File.binread(item.fetch(:write_path)) == item.fetch(:candidate)
+          if File.exist?(item.fetch(:temporary).path) &&
+             same_file_identity?(handle.stat, item.fetch(:temporary).path) &&
+             File.binread(item.fetch(:write_path)) == item.fetch(:candidate)
+            atomic_swap_paths(item.fetch(:temporary).path, item.fetch(:write_path))
+          end
+          concurrent_change = true
+          raise IOError, "subscription path changed during safe update"
+        end
+        committed = File.stat(item.fetch(:write_path))
+        item[:committed_identity] = [committed.dev, committed.ino]
+        item[:original_identity] = original_identity
       end
     rescue StandardError
-      rollback_failures = []
-      handles.each do |item, handle|
-        begin
-          handle.rewind
-          handle.write(item.fetch(:original))
-          handle.truncate(item.fetch(:original).bytesize)
-          handle.flush
-          handle.fsync
-        rescue StandardError
-          rollback_failures << item.fetch(:name)
-        end
-      end
+      rollback_failures = rollback_safe_update_items(items)
       unless rollback_failures.empty?
         reason = concurrent_change ? :concurrent_change : :write_failed
         return { status: :rollback_failed, failed_profile: rollback_failures.first, reason: reason }
@@ -435,8 +524,21 @@ module ClashPatch
       return { status: :aborted, failed_profile: "", reason: reason }
     ensure
       handles.each { |_item, handle| handle.close rescue nil }
+      temporary_files.each { |temporary| temporary.close! rescue nil }
     end
 
+    unless items.all? { |item| safe_update_item_committed?(item) }
+      rollback_failures = rollback_safe_update_items(items)
+      return {
+        status: rollback_failures.empty? ? :aborted : :rollback_failed,
+        failed_profile: rollback_failures.first.to_s, reason: :concurrent_change
+      }
+    end
+
+    items.each do |item|
+      item[:patched_identity] = item.fetch(:committed_identity)
+      item[:patched_path] = item.fetch(:write_path)
+    end
     activation ||= ->(updated_items) { default_safe_update_activation(updated_items, usage_profile, selected_name) }
     activation_result = begin
       activation.call(items)
@@ -447,17 +549,7 @@ module ClashPatch
                 (activation_result.is_a?(Hash) && activation_result[:reloaded] == true)
     runtime_status = activation_result[:status] if activation_result.is_a?(Hash)
     unless activated
-      rollback_failures = []
-      items.each do |item|
-        restored = begin
-          current = File.binread(File.realpath(item.fetch(:path)))
-          current == item.fetch(:original) ||
-            (current == item.fetch(:candidate) && replace_profile_bytes(item.fetch(:path), item.fetch(:original)))
-        rescue StandardError
-          false
-        end
-        rollback_failures << item.fetch(:name) unless restored
-      end
+      rollback_failures = rollback_safe_update_items(items)
       unless rollback_failures.empty?
         return { status: :rollback_failed, failed_profile: rollback_failures.first, reason: :activation_failed }
       end

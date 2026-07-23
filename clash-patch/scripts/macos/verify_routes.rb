@@ -38,6 +38,7 @@ module ClashRouteVerifier
     ["Anthropic", "https://www.anthropic.com/", :ai, /(?:\A|\.)anthropic\.com\z/i],
     ["Claude", "https://claude.ai/", :ai, /(?:\A|\.)claude\.ai\z/i]
   ].freeze
+  NON_PROXY_TERMINALS = %w[DIRECT REJECT REJECT-DROP COMPATIBLE PASS].freeze
 
   def get_json(socket, endpoint)
     code, body = ClashPatch.controller_request(socket, "GET", endpoint)
@@ -68,7 +69,7 @@ module ClashRouteVerifier
     existing = Array(get_json(socket, "/connections")&.fetch("connections", [])).map { |entry| entry["id"] }
     source_port = reserve_local_port
     pid = Process.spawn(
-      "/usr/bin/curl", "--http1.1", "-L", "--max-time", "15", "--limit-rate", "2k",
+      "/usr/bin/curl", "--http1.1", "--fail", "-L", "--max-time", "15", "--limit-rate", "2k",
       "--local-port", source_port.to_s, url,
       out: File::NULL, err: File::NULL
     )
@@ -86,22 +87,30 @@ module ClashRouteVerifier
     end
     nil
   ensure
-    if pid
-      begin
-        Process.kill("TERM", pid)
-      rescue Errno::ESRCH
-        nil
-      end
-      begin
-        Process.wait(pid)
-      rescue Errno::ECHILD
-        nil
-      end
+    terminate_process(pid) if pid
+  end
+
+  def terminate_process(pid, grace_seconds: 1)
+    Process.kill("TERM", pid)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + grace_seconds
+    loop do
+      return if Process.waitpid(pid, Process::WNOHANG)
+      break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+      sleep 0.02
     end
+    Process.kill("KILL", pid)
+    Process.waitpid(pid)
+  rescue Errno::ESRCH, Errno::ECHILD
+    nil
+  end
+
+  def non_proxy_terminal?(name)
+    NON_PROXY_TERMINALS.any? { |terminal| terminal.casecmp(name.to_s).zero? }
   end
 
   def route_passes?(chains, proxies:, kind:, expected_group:, expected_selection:, ai_group:)
-    return false if chains.include?("DIRECT") || expected_selection == "DIRECT"
+    return false if chains.any? { |name| non_proxy_terminal?(name) } || non_proxy_terminal?(expected_selection)
     return chains.include?(expected_group) && chains.include?(expected_selection) if kind == :ai
     return false if chains.include?(ai_group)
     return true if chains.include?(expected_group) && chains.include?(expected_selection)
@@ -110,7 +119,7 @@ module ClashRouteVerifier
       next false unless name.match?(/google/i)
 
       selection = proxies.dig(name, "now").to_s
-      !selection.empty? && selection != "DIRECT" && chains.include?(selection)
+      !selection.empty? && !non_proxy_terminal?(selection) && chains.include?(selection)
     end
   end
 

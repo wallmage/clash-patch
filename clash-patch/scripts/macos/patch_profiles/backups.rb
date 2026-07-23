@@ -117,6 +117,31 @@ module ClashPatch
     path
   end
 
+  def regular_file_snapshot_once(path, label)
+    flags = File::RDONLY
+    flags |= File::NOFOLLOW if File.const_defined?(:NOFOLLOW)
+    File.open(path, flags) do |file|
+      lock_exclusive_with_timeout(file)
+      stat = file.stat
+      raise InvalidConfigError, "#{label}不是普通文件" unless stat.file? && stat.nlink == 1
+
+      current = File.lstat(path)
+      raise InvalidConfigError, "#{label}在读取前发生变化" unless
+        current.file? && !current.symlink? && current.dev == stat.dev && current.ino == stat.ino
+
+      bytes = file.read.b
+      after = file.stat
+      raise InvalidConfigError, "#{label}在读取期间发生变化" unless
+        after.dev == stat.dev && after.ino == stat.ino && after.size == bytes.bytesize
+
+      { bytes: bytes, identity: [stat.dev, stat.ino], path: File.expand_path(path) }
+    end
+  end
+
+  def read_regular_file_once(path, label)
+    regular_file_snapshot_once(path, label).fetch(:bytes)
+  end
+
   def find_backup_target(backup_id, directories)
     matches = directories.flat_map { |directory| profile_paths(directory) }.select do |path|
       backup_id.include?("--#{backup_key(path)}--") && backup_id.end_with?("--#{File.basename(path)}.backup")
@@ -150,7 +175,7 @@ module ClashPatch
   def compare_backup(backup_id, directories:, backup_root:)
     backup_path = resolve_backup_id(backup_id, backup_root)
     target = find_backup_target(backup_id, directories)
-    backup_bytes = File.binread(backup_path)
+    backup_bytes = read_regular_file_once(backup_path, "备份")
     current_bytes = File.binread(File.realpath(target))
     backup_config = load_yaml(backup_bytes.dup.force_encoding(Encoding::UTF_8), backup_id)
     current_config = load_yaml(current_bytes.dup.force_encoding(Encoding::UTF_8), target)
@@ -170,7 +195,7 @@ module ClashPatch
     backup_path = resolve_backup_id(backup_id, backup_root)
     target = find_backup_target(backup_id, directories)
     write_path = File.realpath(target)
-    backup_bytes = File.binread(backup_path)
+    backup_bytes = read_regular_file_once(backup_path, "备份")
     backup_text = backup_bytes.dup.force_encoding(Encoding::UTF_8)
     raise InvalidConfigError, "备份不是有效的 UTF-8" unless backup_text.valid_encoding?
 
@@ -185,7 +210,7 @@ module ClashPatch
       return { status: :validation_failed, path: target } unless validation == true
     end
 
-    current_bytes = File.binread(write_path)
+    current_bytes = read_regular_file_once(write_path, "当前配置")
     return { status: :restore_conflict, path: target } unless Digest::SHA256.hexdigest(current_bytes).casecmp(expected_current_sha256).zero?
     if current_bytes == backup_bytes
       return {
@@ -195,18 +220,8 @@ module ClashPatch
     end
 
     create_versioned_backup(target, backup_root, content: current_bytes, reason: "pre-restore")
-    File.open(write_path, "r+b") do |source|
-      source.flock(File::LOCK_EX)
-      locked_bytes = source.read
-      unless locked_source_current?(source, target, write_path) &&
-             Digest::SHA256.hexdigest(locked_bytes).casecmp(expected_current_sha256).zero?
-        return { status: :restore_conflict, path: target }
-      end
-      write_locked_bytes(source, backup_bytes, locked_bytes)
-      source.rewind
-      return { status: :restore_conflict, path: target } unless
-        locked_source_current?(source, target, write_path) && source.read == backup_bytes
-    end
+    return { status: :restore_conflict, path: target } unless
+      atomic_compare_and_swap_bytes(target, current_bytes, backup_bytes)
     {
       status: :updated,
       path: target,
