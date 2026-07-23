@@ -667,6 +667,7 @@ test('PowerShell installer uses the documented global script and app settings', 
 
 test('PowerShell safe update checks installed script and proxy-group prerequisites before acceptance', () => {
   const installer = fs.readFileSync(installerPath, 'utf8');
+  const safeUpdateModule = fs.readFileSync(path.join(installerModuleDir, 'safe_update.ps1'), 'utf8');
   const scriptCheck = installer.indexOf(
     'Assert-ClashPatchManagedScriptCurrent $scriptText $savedProfile $enginePath $targetScript'
   );
@@ -681,6 +682,11 @@ test('PowerShell safe update checks installed script and proxy-group prerequisit
   assert.ok(profileCheck > scriptCheck, 'proxy-group prerequisites are not checked after the installed script');
   assert.ok(mihomoCheck > profileCheck, 'Mihomo validation does not run after proxy-group checks');
   assert.ok(manifestRemoval > mihomoCheck, 'safe-update manifest is removed before validation finishes');
+  assert.match(
+    safeUpdateModule,
+    /\$flowLines \+= @\(\$lines\[\(\$groupsNode\.Start \+ 1\)\.\.\(\$lines\.Count - 1\)\]\)/,
+    'multi-line flow sequences stop before their top-level closing bracket'
+  );
 });
 
 test('PowerShell 5.1 keeps a single remote subscription path as an array', () => {

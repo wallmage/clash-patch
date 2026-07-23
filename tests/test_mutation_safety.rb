@@ -225,6 +225,24 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_safe_update_multiline_flow_boundary_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/install_windows/safe_update.ps1",
+        "$flowLines += @($lines[($groupsNode.Start + 1)..($lines.Count - 1)])\n",
+        "$flowLines += @($lines[($groupsNode.Start + 1)..($groupsNode.End - 1)])\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        "node", "--test",
+        "--test-name-pattern=PowerShell safe update checks installed script and proxy-group prerequisites before acceptance",
+        "tests/test_windows_patcher.js"
+      )
+    end
+  end
+
   def test_partial_write_recovery_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

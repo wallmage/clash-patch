@@ -88,8 +88,8 @@ function Assert-ClashPatchProxyGroupCollection([string]$Text, [string]$Label) {
     $inline = ([string]$groupsNode.Value).Trim()
     if ($inline -match '^\[') {
         $flowLines = @([string]$groupsNode.Value)
-        if ($groupsNode.Start + 1 -lt $groupsNode.End) {
-            $flowLines += @($lines[($groupsNode.Start + 1)..($groupsNode.End - 1)])
+        if ($groupsNode.Start + 1 -lt $lines.Count) {
+            $flowLines += @($lines[($groupsNode.Start + 1)..($lines.Count - 1)])
         }
         if (-not (Test-ClashPatchFlowSequenceHasItem ($flowLines -join "`n"))) {
             throw "$Label 的代理组为空，无法应用全局扩展脚本。"
