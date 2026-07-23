@@ -90,7 +90,7 @@ function Assert-JavaScriptDoesNotBindMain([string]$Text) {
     $declaration = '(?m)(?:^|[;{}])\s*(?:async\s+)?(?:function|class|var|let|const)\s+main\b'
     $assignment = '(?<![A-Za-z0-9_$.])main\s*='
     if ([regex]::IsMatch($code, $declaration) -or [regex]::IsMatch($code, $assignment)) {
-        throw "受管块之后不能重新定义 main；原脚本没有被修改。"
+        throw "现有脚本在允许的入口之外不能重新定义 main；原脚本没有被修改。"
     }
 }
 
@@ -106,6 +106,7 @@ function Assert-JavaScriptCanCompose([string]$Text) {
     Assert-JavaScriptReservedIdentifiers $Text
     $withoutDeclaration = $analysis.Code.Substring(0, $matches[0].Index) + (" " * $matches[0].Length) +
         $analysis.Code.Substring($matches[0].Index + $matches[0].Length)
+    Assert-JavaScriptDoesNotBindMain $withoutDeclaration
     if ([regex]::IsMatch($withoutDeclaration, '(?<![A-Za-z0-9_$.])main\s*\(')) {
         throw "现有 main 会递归调用自身，重命名后会误调用 Clash 补丁 main。原脚本没有被修改。"
     }

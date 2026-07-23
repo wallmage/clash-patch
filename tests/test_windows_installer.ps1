@@ -3517,6 +3517,7 @@ friend payload
 
     Assert-InstallerRejectsScript "reserved-symbol-case" "const clashPatchTransform = 1;`nfunction main(config) { return config; }`n" "保留标识符"
     Assert-InstallerRejectsScript "recursive-main-case" "function main(config) { return config.retry ? main(config) : config; }`n" "递归"
+    Assert-InstallerRejectsScript "reassigned-main-case" "function main(config) { return config; }`nmain = function(config) { config.override = true; return config; };`n" "重新定义 main"
 
     $invalidStateCase = Join-Path $sandbox "invalid-state-case"
     New-Item -ItemType Directory -Path $invalidStateCase -Force | Out-Null

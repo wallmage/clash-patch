@@ -1412,6 +1412,14 @@ class SkillContractTest < Minitest::Test
     assert_includes source, '(?<![A-Za-z0-9_$.])main\s*='
   end
 
+  def test_windows_existing_script_cannot_rebind_main_outside_its_declaration
+    source = File.binread(
+      File.join(SKILL, "scripts/windows/install_windows/script_js.ps1")
+    ).force_encoding("UTF-8")
+
+    assert_includes source, 'Assert-JavaScriptDoesNotBindMain $withoutDeclaration'
+  end
+
   def test_windows_default_app_home_rejects_multiple_existing_candidates
     transaction = File.binread(
       File.join(SKILL, "scripts/windows/install_windows/transaction.ps1")

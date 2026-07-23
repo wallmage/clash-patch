@@ -761,6 +761,23 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_existing_script_main_binding_guard_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/install_windows/script_js.ps1",
+        "    Assert-JavaScriptDoesNotBindMain $withoutDeclaration\n",
+        "    Assert-JavaScriptReservedIdentifiers $withoutDeclaration\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_windows_existing_script_cannot_rebind_main_outside_its_declaration"
+      )
+    end
+  end
+
   def test_windows_ambiguous_app_home_guard_mutation_is_killed
     with_repo_copy do |root|
       replace_once(
