@@ -1195,13 +1195,18 @@ class SkillContractTest < Minitest::Test
   def test_windows_test_failure_diagnostics_do_not_echo_captured_output
     source = File.read(File.join(ROOT, "tests/test_windows_installer.ps1"))
     diagnostic = source[/function Get-TestOutputDiagnostic\b.*?^}/m]
+    json_assertion = source[/function Assert-JsonResult\b.*?^}/m]
 
     refute_nil diagnostic
+    refute_nil json_assertion
     assert_includes diagnostic, '[System.Security.Cryptography.SHA256]::Create()'
     assert_includes diagnostic, 'return "output_length=$($text.Length) output_sha256=$digest"'
     refute_match(/return\s+\$text\b/, diagnostic)
     refute_match(/throw "[^"]*\$\(\$result\.Output\)/, source)
     refute_match(/Assert-True .*"[^"]*\$\(\$[A-Za-z0-9_]+\.Output\)/, source)
+    assert_operator json_assertion.index("JSON result leaked"), :<,
+                    json_assertion.index("$result.exit_code -eq $ExitCode"),
+                    "privacy must be checked before a mismatched result is printed"
   end
 
   def test_production_probe_inventory_and_ci_aggregation_are_fixed
@@ -1221,7 +1226,7 @@ class SkillContractTest < Minitest::Test
       test_production_probe_uninstall_preserves_a_file_replaced_after_staging
     ]
     expected_windows = [
-      "Mihomo candidate cleanup after caller death",
+      "Mihomo candidate privacy and cleanup after caller death",
       "Mihomo timeout terminates descendants",
       "duplicate transaction action field",
       "extended-path AppHome lock alias",
@@ -1231,8 +1236,23 @@ class SkillContractTest < Minitest::Test
       "private transaction journal ACL",
       "public restore strong-kill atomicity",
       "public restore same-byte identity replacement",
+      "strict transaction journal byte schema",
       "strict UTF-8 safe-update validation",
       "strict safe-update manifest schema"
+    ].sort
+    expected_transaction_journal_cases = %w[
+      alternate-data-stream
+      duplicate-action
+      duplicate-actions
+      duplicate-existed
+      duplicate-original-base64
+      duplicate-path
+      duplicate-replacement-base64
+      duplicate-version
+      invalid-utf8
+      reserved-device
+      trailing-dot
+      trailing-space
     ].sort
 
     assert_equal expected_macos,
@@ -1241,6 +1261,12 @@ class SkillContractTest < Minitest::Test
                  wrapper_source.scan(/^  def (test_production_probe_[a-z0-9_]+)/).flatten.sort
     assert_equal expected_windows,
                  windows_source.scan(/Invoke-DeferredProbe "([^"]+)"/).flatten.sort
+    journal_matrix = windows_source[
+      /\$transactionJournalCases = @\(.*?\n            \)\n            \$unsafeTransactionJournals/m
+    ]
+    refute_nil journal_matrix
+    assert_equal expected_transaction_journal_cases,
+                 journal_matrix.scan(/Name = "([^"]+)"/).flatten.sort
     assert_includes workflow, "/usr/bin/ruby tests/test_macos_patcher.rb --name /production_probe/"
     assert_includes workflow, "/usr/bin/ruby tests/test_macos_wrappers.rb --name /production_probe/"
     assert_match(

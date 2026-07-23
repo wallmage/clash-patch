@@ -352,6 +352,31 @@ function Get-TestOutputDiagnostic([object]$Output) {
     return "output_length=$($text.Length) output_sha256=$digest"
 }
 
+function Test-PrivateWindowsFileAcl([string]$Path) {
+    $security = Get-Acl -LiteralPath $Path
+    $allowedSids = @(
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+        "S-1-5-18",
+        "S-1-5-32-544"
+    )
+    $unsafeRules = @(
+        foreach ($accessRule in @($security.Access)) {
+            if ($accessRule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+                continue
+            }
+            try {
+                $accessRuleSid = $accessRule.IdentityReference.Translate(
+                    [System.Security.Principal.SecurityIdentifier]
+                ).Value
+            } catch {
+                $accessRuleSid = $accessRule.IdentityReference.Value
+            }
+            if ($accessRuleSid -notin $allowedSids) { $accessRule }
+        }
+    )
+    return $security.AreAccessRulesProtected -and $unsafeRules.Count -eq 0
+}
+
 function Assert-JsonResult([object]$Invocation, [string]$Command, [int]$ExitCode) {
     $text = $Invocation.Output.Trim()
     $diagnostic = Get-TestOutputDiagnostic $text
@@ -365,13 +390,15 @@ function Assert-JsonResult([object]$Invocation, [string]$Command, [int]$ExitCode
     Assert-True ($result.command -eq $Command) "JSON result command mismatch"
     Assert-True ($result.platform -eq "windows") "JSON result platform mismatch"
     Assert-True ($result.client -eq "clash-verge-rev") "JSON result client mismatch"
+    Assert-True (
+        $text -notmatch '(?i)https?://|Bearer\s+|password\s*[:=]|secret\s*[:=]|token\s*[:=]|uuid\s*[:=]|private[_-]?key\s*[:=]|[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}'
+    ) "JSON result leaked a secret, credential, identifier, or URL"
     Assert-True ([int]$result.exit_code -eq $ExitCode) (
-        "JSON result exit_code mismatch for ${Command}: expected $ExitCode, JSON reported $($result.exit_code), process exited $($Invocation.ExitCode), status=$($result.status), code=$($result.code)"
+        "JSON result exit_code mismatch for ${Command}: expected $ExitCode, JSON reported $($result.exit_code), process exited $($Invocation.ExitCode), status=$($result.status), code=$($result.code), summary=$($result.summary_zh)"
     )
     Assert-True ($Invocation.ExitCode -eq $ExitCode) (
-        "process exit mismatch for ${Command}: expected $ExitCode, process exited $($Invocation.ExitCode), JSON reported $($result.exit_code), status=$($result.status), code=$($result.code)"
+        "process exit mismatch for ${Command}: expected $ExitCode, process exited $($Invocation.ExitCode), JSON reported $($result.exit_code), status=$($result.status), code=$($result.code), summary=$($result.summary_zh)"
     )
-    Assert-True ($text -notmatch '(?i)https?://|Bearer\s+|password\s*[:=]|secret\s*[:=]') "JSON result leaked a secret or URL"
     return $result
 }
 
@@ -619,6 +646,97 @@ fs.writeFileSync(process.argv[4], JSON.stringify(output));
             } finally {
                 Exit-AppHomeMutationLock $duplicateJournalLock
             }
+        }
+
+        Invoke-DeferredProbe "strict transaction journal byte schema" {
+            $validJournalPrefix = '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt","Existed":false,"OriginalBase64":"","ReplacementBase64":"bmV3"}]}'
+            $transactionJournalCases = @(
+                [pscustomobject]@{
+                    Name = "invalid-utf8"
+                    Bytes = [byte[]](
+                        [System.Text.Encoding]::UTF8.GetBytes($validJournalPrefix) +
+                        @(0xff)
+                    )
+                },
+                [pscustomobject]@{
+                    Name = "duplicate-version"
+                    Text = '{"Version":1,"Version":1,"Actions":[{"Action":"write","Path":"target.txt","Existed":false,"OriginalBase64":"","ReplacementBase64":"bmV3"}]}'
+                },
+                [pscustomobject]@{
+                    Name = "duplicate-actions"
+                    Text = '{"Version":1,"Actions":[],"Actions":[{"Action":"write","Path":"target.txt","Existed":false,"OriginalBase64":"","ReplacementBase64":"bmV3"}]}'
+                },
+                [pscustomobject]@{
+                    Name = "duplicate-action"
+                    Text = '{"Version":1,"Actions":[{"Action":"delete","Action":"write","Path":"target.txt","Existed":false,"OriginalBase64":"","ReplacementBase64":"bmV3"}]}'
+                },
+                [pscustomobject]@{
+                    Name = "duplicate-path"
+                    Text = '{"Version":1,"Actions":[{"Action":"write","Path":"other.txt","Path":"target.txt","Existed":false,"OriginalBase64":"","ReplacementBase64":"bmV3"}]}'
+                },
+                [pscustomobject]@{
+                    Name = "duplicate-existed"
+                    Text = '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt","Existed":true,"Existed":false,"OriginalBase64":"","ReplacementBase64":"bmV3"}]}'
+                },
+                [pscustomobject]@{
+                    Name = "duplicate-original-base64"
+                    Text = '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt","Existed":false,"OriginalBase64":"b2xk","OriginalBase64":"","ReplacementBase64":"bmV3"}]}'
+                },
+                [pscustomobject]@{
+                    Name = "duplicate-replacement-base64"
+                    Text = '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt","Existed":false,"OriginalBase64":"","ReplacementBase64":"b2xk","ReplacementBase64":"bmV3"}]}'
+                },
+                [pscustomobject]@{
+                    Name = "alternate-data-stream"
+                    Text = '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt:stream","Existed":false,"OriginalBase64":"","ReplacementBase64":"bmV3"}]}'
+                },
+                [pscustomobject]@{
+                    Name = "reserved-device"
+                    Text = '{"Version":1,"Actions":[{"Action":"write","Path":"CON","Existed":false,"OriginalBase64":"","ReplacementBase64":"bmV3"}]}'
+                },
+                [pscustomobject]@{
+                    Name = "trailing-dot"
+                    Text = '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt.","Existed":false,"OriginalBase64":"","ReplacementBase64":"bmV3"}]}'
+                },
+                [pscustomobject]@{
+                    Name = "trailing-space"
+                    Text = '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt ","Existed":false,"OriginalBase64":"","ReplacementBase64":"bmV3"}]}'
+                }
+            )
+            $unsafeTransactionJournals = New-Object System.Collections.ArrayList
+            foreach ($transactionJournalCase in $transactionJournalCases) {
+                $transactionJournalHome = Join-Path $sandbox (
+                    "transaction-journal-" + $transactionJournalCase.Name
+                )
+                New-Item -ItemType Directory -Path $transactionJournalHome -Force | Out-Null
+                $transactionJournalSentinel = Join-Path $transactionJournalHome "sentinel.txt"
+                [System.IO.File]::WriteAllText($transactionJournalSentinel, "sentinel")
+                $transactionJournalLock = Enter-AppHomeMutationLock $transactionJournalHome
+                Exit-AppHomeMutationLock $transactionJournalLock
+                $transactionJournalPath = Join-Path $transactionJournalHome ".clash-patch-transaction.json"
+                $transactionJournalBytes = if ($null -ne $transactionJournalCase.Bytes) {
+                    [byte[]]$transactionJournalCase.Bytes
+                } else {
+                    [System.Text.Encoding]::UTF8.GetBytes([string]$transactionJournalCase.Text)
+                }
+                [System.IO.File]::WriteAllBytes($transactionJournalPath, $transactionJournalBytes)
+                $transactionJournalBefore = Get-TreeContentSnapshot $transactionJournalHome
+                $transactionJournalResult = Invoke-TestPowerShell $installer @(
+                    "-AppHome", $transactionJournalHome,
+                    "-ShowUsageProfile",
+                    "-Json"
+                )
+                $transactionJournalAfter = Get-TreeContentSnapshot $transactionJournalHome
+                if ($transactionJournalResult.ExitCode -ne 1 -or
+                    -not (Test-Path -LiteralPath $transactionJournalPath -PathType Leaf) -or
+                    $transactionJournalAfter -cne $transactionJournalBefore -or
+                    (Get-Content -LiteralPath $transactionJournalSentinel -Raw) -cne "sentinel") {
+                    [void]$unsafeTransactionJournals.Add($transactionJournalCase.Name)
+                }
+            }
+            Assert-True (
+                $unsafeTransactionJournals.Count -eq 0
+            ) "public entry accepted or changed malformed transaction journals: $($unsafeTransactionJournals -join ', ')"
         }
     }
     if ($onWindows) {
@@ -876,6 +994,7 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
     if ($onWindows) {
         $controllerReadyPath = Join-Path $sandbox "route-controller-ready"
         $fakeCurlArgsPath = Join-Path $sandbox "fake-curl-args.txt"
+        $fakeCurlPidsPath = Join-Path $sandbox "fake-curl-pids.txt"
         $portProbe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
         $portProbe.Start()
         $routeControllerPort = ([System.Net.IPEndPoint]$portProbe.LocalEndpoint).Port
@@ -959,6 +1078,7 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
         $fakeCurlPath = Join-Path $fakeCurlDirectory "curl.exe"
         $fakeCurlSource = @'
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Threading;
 public static class FakeCurl {
@@ -966,6 +1086,10 @@ public static class FakeCurl {
         File.WriteAllText(
             Environment.GetEnvironmentVariable("CLASH_PATCH_TEST_CURL_ARGS_PATH"),
             String.Join(" ", args)
+        );
+        File.AppendAllText(
+            Environment.GetEnvironmentVariable("CLASH_PATCH_TEST_CURL_PIDS_PATH"),
+            Process.GetCurrentProcess().Id.ToString() + Environment.NewLine
         );
         Thread.Sleep(10000);
         return 0;
@@ -994,6 +1118,8 @@ public static class FakeCurl {
         }
         $previousPath = $env:PATH
         $previousCurlArgsPath = $env:CLASH_PATCH_TEST_CURL_ARGS_PATH
+        $previousCurlPidsPath = $env:CLASH_PATCH_TEST_CURL_PIDS_PATH
+        $fakeCurlPids = @()
         try {
             $readyDeadline = [DateTime]::UtcNow.AddSeconds(10)
             while (-not (Test-Path -LiteralPath $controllerReadyPath) -and [DateTime]::UtcNow -lt $readyDeadline) {
@@ -1002,6 +1128,7 @@ public static class FakeCurl {
             Assert-True (Test-Path -LiteralPath $controllerReadyPath) "route success controller did not start: $(Receive-Job $routeControllerJob -Keep | Out-String)"
             $env:PATH = $fakeCurlDirectory + [System.IO.Path]::PathSeparator + $previousPath
             $env:CLASH_PATCH_TEST_CURL_ARGS_PATH = $fakeCurlArgsPath
+            $env:CLASH_PATCH_TEST_CURL_PIDS_PATH = $fakeCurlPidsPath
             $routeSuccess = Invoke-TestPowerShell $routeVerifier @(
                 "-ControllerUrl", "http://127.0.0.1:$routeControllerPort",
                 "-Secret", "fixture-secret",
@@ -1012,9 +1139,33 @@ public static class FakeCurl {
             Assert-True ($routeSuccessResult.code -eq "routes_verified") "route verifier success code mismatch"
             Assert-True (@($routeSuccessResult.checks).Count -eq 4) "route verifier did not report all four route checks"
             Assert-True (@($routeSuccessResult.checks | Where-Object { -not [bool]$_.ok }).Count -eq 0) "route verifier reported a failed check on its success path"
+            Assert-True (Test-Path -LiteralPath $fakeCurlPidsPath -PathType Leaf) "route verifier did not start the hanging curl fixture"
+            $fakeCurlPids = @(
+                Get-Content -LiteralPath $fakeCurlPidsPath |
+                    Where-Object { $_ -match '^\d+$' } |
+                    ForEach-Object { [int]$_ }
+            )
+            Assert-True ($fakeCurlPids.Count -eq 4) "route verifier did not create one isolated curl process per route"
+            $curlExitDeadline = [DateTime]::UtcNow.AddSeconds(5)
+            do {
+                $survivingCurlPids = @(
+                    $fakeCurlPids |
+                        Where-Object { $null -ne (Get-Process -Id $_ -ErrorAction SilentlyContinue) }
+                )
+                if ($survivingCurlPids.Count -gt 0) { Start-Sleep -Milliseconds 25 }
+            } while ($survivingCurlPids.Count -gt 0 -and [DateTime]::UtcNow -lt $curlExitDeadline)
+            Assert-True ($survivingCurlPids.Count -eq 0) "route verifier left hanging curl processes after observation"
         } finally {
             $env:PATH = $previousPath
             $env:CLASH_PATCH_TEST_CURL_ARGS_PATH = $previousCurlArgsPath
+            $env:CLASH_PATCH_TEST_CURL_PIDS_PATH = $previousCurlPidsPath
+            foreach ($fakeCurlPid in $fakeCurlPids) {
+                $fakeCurlProcess = Get-Process -Id $fakeCurlPid -ErrorAction SilentlyContinue
+                if ($null -ne $fakeCurlProcess) {
+                    Stop-Process -Id $fakeCurlPid -Force
+                    [void]$fakeCurlProcess.WaitForExit(5000)
+                }
+            }
             if ($null -ne $routeControllerJob) {
                 Stop-Job $routeControllerJob -ErrorAction SilentlyContinue
                 Remove-Job $routeControllerJob -Force -ErrorAction SilentlyContinue
@@ -1645,7 +1796,7 @@ $child.WaitForExit()
             Assert-True (-not $treeChildAlive) "Mihomo timeout left a descendant process running"
         }
 
-        Invoke-DeferredProbe "Mihomo candidate cleanup after caller death" {
+        Invoke-DeferredProbe "Mihomo candidate privacy and cleanup after caller death" {
             $candidateDirectory = Join-Path $sandbox "candidate-process-death"
             $candidateChildPath = Join-Path $sandbox "candidate-process-death.ps1"
             New-Item -ItemType Directory -Path $candidateDirectory -Force | Out-Null
@@ -1682,6 +1833,8 @@ Test-MihomoCandidate $CorePath "proxies:`n  - name: fixture-private-marker" $Dir
                 $candidateFiles = @(Get-ChildItem -LiteralPath $candidateDirectory -Filter ".clash-patch-validate-*.yaml" -File)
             }
             $candidateAppeared = $candidateFiles.Count -eq 1
+            $candidateAclIsPrivate = $candidateAppeared -and
+                (Test-PrivateWindowsFileAcl $candidateFiles[0].FullName)
             if (-not $candidateChild.HasExited) {
                 Stop-Process -Id $candidateChild.Id -Force
                 $candidateChild.WaitForExit()
@@ -1693,6 +1846,7 @@ Test-MihomoCandidate $CorePath "proxies:`n  - name: fixture-private-marker" $Dir
                 Remove-Item -LiteralPath $candidateFile.FullName -Force
             }
             Assert-True $candidateAppeared "candidate cleanup fixture never created its validation file"
+            Assert-True $candidateAclIsPrivate "Mihomo candidate inherited access for unrelated accounts"
             Assert-True (-not $candidateLeftBehind) "caller death left a Mihomo candidate file behind"
         }
     }
@@ -2015,32 +2169,7 @@ try {
         Assert-True ((Get-Content -LiteralPath $crashWriteFirstPath -Raw) -eq "first-new") "crash-write fixture did not leave a partial transaction"
         Assert-True ((Get-Content -LiteralPath $crashWriteSecondPath -Raw) -eq "second-original") "crash-write fixture unexpectedly completed the transaction"
         $crashWriteJournalPath = Join-Path $crashWriteHome ".clash-patch-transaction.json"
-        $crashWriteJournalAcl = Get-Acl -LiteralPath $crashWriteJournalPath
-        $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-        $allowedJournalSids = @(
-            $currentUserSid,
-            "S-1-5-18",
-            "S-1-5-32-544"
-        )
-        $unsafeJournalRules = @(
-            foreach ($accessRule in @($crashWriteJournalAcl.Access)) {
-                if ($accessRule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
-                    continue
-                }
-                try {
-                    $accessRuleSid = $accessRule.IdentityReference.Translate(
-                        [System.Security.Principal.SecurityIdentifier]
-                    ).Value
-                } catch {
-                    $accessRuleSid = $accessRule.IdentityReference.Value
-                }
-                if ($accessRuleSid -notin $allowedJournalSids) {
-                    $accessRule
-                }
-            }
-        )
-        $crashWriteJournalIsPrivate = $crashWriteJournalAcl.AreAccessRulesProtected -and
-            $unsafeJournalRules.Count -eq 0
+        $crashWriteJournalIsPrivate = Test-PrivateWindowsFileAcl $crashWriteJournalPath
         Invoke-DeferredProbe "private transaction journal ACL" {
             Assert-True $crashWriteJournalIsPrivate "transaction journal inherited access for unrelated accounts"
         }
