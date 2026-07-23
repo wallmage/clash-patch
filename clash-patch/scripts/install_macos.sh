@@ -32,7 +32,8 @@ unexpected_exit() {
   [ "$unexpected_status" -ne 0 ] || return 0
   set +e
   [ -z "$PENDING_TEMPORARY" ] || /bin/rm -f "$PENDING_TEMPORARY"
-  if [ -e "$AUTO_UPDATE_OWNERSHIP_PATH" ] || [ -L "$AUTO_UPDATE_OWNERSHIP_PATH" ]; then
+  if [ "$AUTO_UPDATE_CHANGED" -eq 1 ]; then
+    AUTO_UPDATE_CHANGED=0
     /usr/bin/ruby "$PATCHER_SOURCE" \
       --backup-dir "$BACKUP_DIR" --restore-owned-subscription-auto-update >/dev/null 2>&1
   fi
@@ -64,9 +65,7 @@ finish() {
   finish_summary=$4
   finish_operation=${5:-$OPERATION}
   finish_profile=${6:-$USAGE_PROFILE}
-  if [ "$finish_exit" -ne 0 ] &&
-     { [ "$AUTO_UPDATE_CHANGED" -eq 1 ] ||
-       [ -e "$AUTO_UPDATE_OWNERSHIP_PATH" ] || [ -L "$AUTO_UPDATE_OWNERSHIP_PATH" ]; }; then
+  if [ "$finish_exit" -ne 0 ] && [ "$AUTO_UPDATE_CHANGED" -eq 1 ]; then
     AUTO_UPDATE_CHANGED=0
     restore_result=$(/usr/bin/ruby "$PATCHER_SOURCE" \
       --backup-dir "$BACKUP_DIR" --restore-owned-subscription-auto-update 2>&1 || true)

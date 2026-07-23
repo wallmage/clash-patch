@@ -20,6 +20,7 @@ MINIMUM_TRANSFORM_LINE_COVERAGE = 100.0
 MINIMUM_PRODUCTION_BRANCH_COVERAGE = 75.0
 CHILD_COVERAGE_DIRECTORY = Dir.mktmpdir("clash-patch-ruby-coverage-")
 ENV["CLASH_PATCH_CHILD_COVERAGE_DIRECTORY"] = CHILD_COVERAGE_DIRECTORY
+ENV["CLASH_PATCH_RUN_PRODUCTION_PROBES"] = "1"
 
 def uncovered_line_ranges(lines)
   missing = lines.each_index.select { |index| lines[index] == 0 }.map { |index| index + 1 }
@@ -137,6 +138,7 @@ Minitest.after_run do
     abort "Ruby production coverage is below its required threshold" unless failures.empty?
   ensure
     ENV.delete("CLASH_PATCH_CHILD_COVERAGE_DIRECTORY")
+    ENV.delete("CLASH_PATCH_RUN_PRODUCTION_PROBES")
     FileUtils.remove_entry(CHILD_COVERAGE_DIRECTORY)
   end
 end

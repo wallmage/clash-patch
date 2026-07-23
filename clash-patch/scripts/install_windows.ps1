@@ -142,8 +142,16 @@ if ($SnapshotProfiles) {
 if ($VerifySafeUpdate) {
     $manifestSnapshot = Get-OptionalFileSnapshot $safeUpdateStatePath "安全更新准备记录"
     if (-not $manifestSnapshot.Exists) { throw "没有找到本次安全更新的准备记录。" }
-    $manifest = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($manifestSnapshot.Bytes) | ConvertFrom-Json
-    if ([int]$manifest.Version -ne 1 -or @($manifest.Profiles).Count -eq 0) { throw "安全更新准备记录无效。" }
+    $manifestText = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($manifestSnapshot.Bytes)
+    $manifest = $manifestText | ConvertFrom-Json
+    $manifestProperties = @($manifest.PSObject.Properties.Name | Sort-Object)
+    if (($manifestProperties -join ",") -cne "CreatedAt,Profiles,Version" -or
+        -not ($manifest.Version -is [int] -or $manifest.Version -is [long]) -or
+        [long]$manifest.Version -ne 1 -or
+        -not ($manifest.CreatedAt -is [string]) -or
+        @($manifest.Profiles).Count -eq 0) {
+        throw "安全更新准备记录无效。"
+    }
     $recoveryItems = @(Get-SafeUpdateRecoveryItems $manifest $profilesDirectory $backupRoot)
     $validated = @()
     $observedCurrentHashes = @{}
@@ -163,7 +171,7 @@ if ($VerifySafeUpdate) {
             if ($target.Count -ne 1) { throw "远程订阅清单在更新期间发生变化。" }
             $validatedBytes = [System.IO.File]::ReadAllBytes($target[0].Path)
             $validatedHash = Get-BytesSha256 $validatedBytes
-            $text = [System.Text.Encoding]::UTF8.GetString($validatedBytes)
+            $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($validatedBytes)
             Test-GeneratedYaml $text ([string]$item.File) | Out-Null
             Test-MihomoCandidate $core $text $profilesDirectory
             if ((Get-FileSha256 $target[0].Path) -ne $validatedHash) {
@@ -265,31 +273,22 @@ if (-not [string]::IsNullOrWhiteSpace($RestoreBackup)) {
     if (Test-ClashVergeRunning) { throw "Clash Verge Rev 正在运行，不能安全恢复配置；未修改任何文件。" }
     if ($ExpectedCurrentSha256 -notmatch '^[0-9a-fA-F]{64}$') { throw "恢复时必须提供预期 SHA-256。" }
     $resolved = Get-BackupTarget $RestoreBackup
-    $currentHash = (Get-FileHash -LiteralPath $resolved.TargetPath -Algorithm SHA256).Hash
-    if ($currentHash -ne $ExpectedCurrentSha256) { throw "当前配置已变化，拒绝覆盖。" }
+    $currentSnapshot = Get-OptionalFileSnapshot $resolved.TargetPath "当前配置"
+    if (-not $currentSnapshot.Exists) { throw "当前配置不存在，拒绝恢复。" }
+    $currentHash = Get-BytesSha256 $currentSnapshot.Bytes
+    if ($currentHash -ne $ExpectedCurrentSha256.ToLowerInvariant()) { throw "当前配置已变化，拒绝覆盖。" }
     $restoreBytes = [System.IO.File]::ReadAllBytes($resolved.BackupPath)
     Test-RestoreCandidate $resolved.TargetPath $restoreBytes
-    $restoreStream = [System.IO.File]::Open(
-        $resolved.TargetPath,
-        [System.IO.FileMode]::Open,
-        [System.IO.FileAccess]::ReadWrite,
-        [System.IO.FileShare]::Read
+    Backup-Versioned $resolved.TargetPath $backupRoot "pre-restore" | Out-Null
+    Invoke-VerifiedFileTransaction @(
+        [pscustomobject]@{
+            Path = $resolved.TargetPath
+            Bytes = $restoreBytes
+            Existed = $true
+            OriginalBytes = $currentSnapshot.Bytes
+            OriginalIdentity = $currentSnapshot.Identity
+        }
     )
-    try {
-        $currentBytes = Get-StreamBytes $restoreStream
-        if ((Get-BytesSha256 $currentBytes) -ne $currentHash.ToLowerInvariant()) {
-            throw "当前配置在检查期间发生变化，拒绝覆盖。"
-        }
-        Backup-Versioned $resolved.TargetPath $backupRoot "pre-restore" | Out-Null
-        Write-LockedStreamBytes $restoreStream $restoreBytes $currentBytes
-        if ((Get-BytesSha256 (Get-StreamBytes $restoreStream)) -ne (Get-BytesSha256 $restoreBytes)) {
-            throw "恢复后的文件与已验证备份不一致。"
-        }
-    } catch {
-        throw
-    } finally {
-        $restoreStream.Dispose()
-    }
     Write-Info "备份已恢复；恢复前版本已经另行备份。"
     Complete-InstallResult 0 "ok" "backup_restored" "备份已恢复；恢复前版本已经另行备份。" @("configuration")
 }

@@ -210,7 +210,8 @@ module ClashPatch
       return { status: :validation_failed, path: target } unless validation == true
     end
 
-    current_bytes = read_regular_file_once(write_path, "当前配置")
+    current_snapshot = regular_file_snapshot_once(write_path, "当前配置")
+    current_bytes = current_snapshot.fetch(:bytes)
     return { status: :restore_conflict, path: target } unless Digest::SHA256.hexdigest(current_bytes).casecmp(expected_current_sha256).zero?
     if current_bytes == backup_bytes
       return {
@@ -221,7 +222,10 @@ module ClashPatch
 
     create_versioned_backup(target, backup_root, content: current_bytes, reason: "pre-restore")
     return { status: :restore_conflict, path: target } unless
-      atomic_compare_and_swap_bytes(target, current_bytes, backup_bytes)
+      atomic_compare_and_swap_bytes(
+        target, current_bytes, backup_bytes,
+        expected_identity: current_snapshot.fetch(:identity), expected_path: write_path
+      )
     {
       status: :updated,
       path: target,

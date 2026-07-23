@@ -3,6 +3,8 @@ module ClashPatch
 
   LOCK_TIMEOUT_SECONDS = 5
   RENAME_SWAP = 0x00000002
+  PROFILE_TRANSACTION_BASENAME = ".clash-patch-profile-transaction.json".freeze
+  PROFILE_OPERATION_LOCK_BASENAME = ".clash-patch-operation.lock".freeze
 
   module DarwinRename
     extend Fiddle::Importer
@@ -122,6 +124,122 @@ module ClashPatch
     false
   end
 
+  def profile_operation_lock(backup_root)
+    root = secure_backup_root!(backup_root)
+    path = File.join(root, PROFILE_OPERATION_LOCK_BASENAME)
+    handle = File.open(path, File::RDWR | File::CREAT, 0o600)
+    lock_exclusive_with_timeout(handle)
+    FileUtils.chmod(0o600, path)
+    handle
+  rescue StandardError
+    handle&.close
+    raise
+  end
+
+  def profile_transaction_path(backup_root)
+    File.join(File.expand_path(backup_root), PROFILE_TRANSACTION_BASENAME)
+  end
+
+  def profile_path_allowed?(path, roots)
+    expanded = File.expand_path(path)
+    roots.any? do |root|
+      prefix = File.expand_path(root) + File::SEPARATOR
+      expanded.start_with?(prefix)
+    end
+  end
+
+  def remove_profile_transaction(snapshot)
+    path = snapshot.fetch(:path)
+    flags = File::RDONLY
+    flags |= File::NOFOLLOW if File.const_defined?(:NOFOLLOW)
+    File.open(path, flags) do |handle|
+      lock_exclusive_with_timeout(handle)
+      stat = handle.stat
+      current = File.lstat(path)
+      raise IOError, "配置事务记录同时发生变化" unless
+        current.file? && !current.symlink? &&
+        [stat.dev, stat.ino] == snapshot.fetch(:identity) &&
+        [current.dev, current.ino] == snapshot.fetch(:identity) &&
+        handle.read.b == snapshot.fetch(:bytes)
+
+      File.unlink(path)
+    end
+    true
+  end
+
+  def recover_profile_transaction(backup_root, roots:)
+    path = profile_transaction_path(backup_root)
+    return true unless File.exist?(path) || File.symlink?(path)
+
+    snapshot = regular_file_snapshot_once(path, "配置事务记录")
+    text = snapshot.fetch(:bytes).dup.force_encoding(Encoding::UTF_8)
+    raise InvalidConfigError, "配置事务记录无效" unless text.valid_encoding?
+
+    state = JSON.parse(text)
+    valid_state = state.is_a?(Hash) && state.keys.sort == %w[Items Version] &&
+                  state["Version"] == 1 && state["Items"].is_a?(Array) &&
+                  !state["Items"].empty?
+    raise InvalidConfigError, "配置事务记录无效" unless valid_state
+
+    seen = {}
+    state.fetch("Items").each do |item|
+      valid_item = item.is_a?(Hash) &&
+                   item.keys.sort == %w[CandidateSha256 OriginalBase64 Path WritePath] &&
+                   item["Path"].is_a?(String) && item["WritePath"].is_a?(String) &&
+                   item["OriginalBase64"].is_a?(String) &&
+                   item["CandidateSha256"].to_s.match?(/\A[0-9a-f]{64}\z/)
+      raise InvalidConfigError, "配置事务记录无效" unless valid_item
+      raise InvalidConfigError, "配置事务记录路径无效" unless
+        profile_path_allowed?(item.fetch("Path"), roots) &&
+        File.realpath(item.fetch("Path")) == item.fetch("WritePath")
+      raise InvalidConfigError, "配置事务记录包含重复目标" if seen[item.fetch("WritePath")]
+
+      seen[item.fetch("WritePath")] = true
+      original = Base64.strict_decode64(item.fetch("OriginalBase64"))
+      current = File.binread(item.fetch("WritePath"))
+      current_digest = Digest::SHA256.hexdigest(current)
+      original_digest = Digest::SHA256.hexdigest(original)
+      next if current_digest == original_digest
+      raise InvalidConfigError, "配置事务目标包含新的并发修改" unless
+        current_digest == item.fetch("CandidateSha256")
+      restored = atomic_compare_and_swap_bytes(
+        item.fetch("Path"), current, original, expected_path: item.fetch("WritePath")
+      )
+      raise IOError, "配置事务恢复失败" unless restored
+    end
+    remove_profile_transaction(snapshot)
+  rescue ArgumentError, JSON::ParserError
+    raise InvalidConfigError, "配置事务记录无效"
+  end
+
+  def prepare_profile_transaction(items, backup_root)
+    root = secure_backup_root!(backup_root)
+    path = profile_transaction_path(root)
+    raise IOError, "发现尚未恢复的配置事务记录" if File.exist?(path) || File.symlink?(path)
+
+    records = items.map do |item|
+      {
+        "Path" => File.expand_path(item.fetch(:path)),
+        "WritePath" => File.realpath(item.fetch(:path)),
+        "OriginalBase64" => Base64.strict_encode64(item.fetch(:original).b),
+        "CandidateSha256" => Digest::SHA256.hexdigest(item.fetch(:candidate).b)
+      }
+    end
+    raise InvalidConfigError, "配置事务包含重复目标" unless
+      records.map { |record| record.fetch("WritePath") }.uniq.length == records.length
+
+    bytes = (JSON.generate("Version" => 1, "Items" => records) + "\n").b
+    Tempfile.create([".clash-patch-profile-transaction-", ".tmp"], root) do |temporary|
+      temporary.binmode
+      temporary.write(bytes)
+      temporary.flush
+      temporary.fsync
+      File.chmod(0o600, temporary.path)
+      File.rename(temporary.path, path)
+    end
+    regular_file_snapshot_once(path, "配置事务记录")
+  end
+
   def patch_path_once(path, policy, dry_run:, backup_root:, validator:, usage_profile: 3)
     write_path = File.realpath(path)
     outcome = nil
@@ -214,41 +332,66 @@ module ClashPatch
     selected = selected_name.nil? ? selected_profile_name : selected_name
     roots = directories || (directory ? [directory] : default_profile_directories)
     active_root = active_directory || active_profile_root(roots, selected, directory)
+    operation_lock = profile_operation_lock(backup_root) if !dry_run && backup_root
+    begin
+      recover_profile_transaction(backup_root, roots: roots) if !dry_run && backup_root
 
-    work_items = roots.flat_map do |root|
-      paths = profile_paths(root)
-      unless active_profile?(File.join(root, "config.yaml"), selected)
-        paths = paths.reject { |path| File.basename(path).casecmp("config.yaml").zero? }
+      work_items = roots.flat_map do |root|
+        paths = profile_paths(root)
+        unless active_profile?(File.join(root, "config.yaml"), selected)
+          paths = paths.reject { |path| File.basename(path).casecmp("config.yaml").zero? }
+        end
+        paths.map do |path|
+          {
+            path: path,
+            active: active_root &&
+              File.expand_path(File.dirname(path)) == File.expand_path(active_root) &&
+              active_profile?(path, selected)
+          }
+        end
       end
-      paths.map do |path|
-        {
-          path: path,
-          active: active_root &&
-            File.expand_path(File.dirname(path)) == File.expand_path(active_root) &&
-            active_profile?(path, selected)
-        }
+      identities = work_items.map do |item|
+        stat = File.stat(File.realpath(item.fetch(:path)))
+        [stat.dev, stat.ino]
       end
-    end
-
-    preflight = work_items.map do |item|
-      result = patch_path(
-        item.fetch(:path), policy, dry_run: true, backup_root: nil,
-        validator: validator, usage_profile: usage_profile
-      )
-      result[:active] = item.fetch(:active)
-      result
-    end
-    return preflight if dry_run
-
-    unless preflight.all? { |result| %i[updated unchanged].include?(result[:status]) }
-      return preflight.map do |result|
-        result[:status] == :updated ? result.merge(status: :batch_aborted, dry_run: false) : result
+      if identities.uniq.length != identities.length
+        return work_items.map do |item|
+          base_result(nil, :duplicate_target).merge(path: item.fetch(:path), active: item.fetch(:active))
+        end
       end
-    end
 
-    results = []
-    work_items.sort_by { |item| item.fetch(:active) ? 1 : 0 }.each do |item|
-      path = item.fetch(:path)
+      preflight = work_items.map do |item|
+        result = patch_path(
+          item.fetch(:path), policy, dry_run: true, backup_root: nil,
+          validator: validator, usage_profile: usage_profile
+        )
+        result[:active] = item.fetch(:active)
+        result
+      end
+      return preflight if dry_run
+
+      unless preflight.all? { |result| %i[updated unchanged].include?(result[:status]) }
+        return preflight.map do |result|
+          result[:status] == :updated ? result.merge(status: :batch_aborted, dry_run: false) : result
+        end
+      end
+
+      transaction = nil
+      if backup_root
+        transaction_items = work_items.zip(preflight).each_with_object([]) do |(item, preview), output|
+          next unless preview.fetch(:status) == :updated
+          output << {
+            path: item.fetch(:path),
+            original: File.binread(File.realpath(item.fetch(:path))),
+            candidate: dump_config(preview.fetch(:config)).b
+          }
+        end
+        transaction = prepare_profile_transaction(transaction_items, backup_root) unless transaction_items.empty?
+      end
+
+      results = []
+      work_items.sort_by { |item| item.fetch(:active) ? 1 : 0 }.each do |item|
+        path = item.fetch(:path)
         result = patch_path(
           path, policy, dry_run: dry_run, backup_root: backup_root,
           validator: validator, usage_profile: usage_profile
@@ -272,9 +415,20 @@ module ClashPatch
           prior[:status] = restore_profile_bytes(prior) ? :batch_rolled_back : :batch_rollback_failed
         end
         break
-    end
+      end
 
-    results
+      if transaction
+        if results.length == work_items.length &&
+           results.all? { |result| %i[updated unchanged].include?(result.fetch(:status)) }
+          remove_profile_transaction(transaction)
+        else
+          recover_profile_transaction(backup_root, roots: roots)
+        end
+      end
+      results
+    ensure
+      operation_lock&.close
+    end
   end
 
 end

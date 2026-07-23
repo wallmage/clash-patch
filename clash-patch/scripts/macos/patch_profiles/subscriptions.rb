@@ -319,7 +319,7 @@ module ClashPatch
   def curl_config_value(value)
     raise InvalidConfigError, "远程订阅地址无效" if value.include?("\r") || value.include?("\n")
 
-    value.gsub("\\", "\\\\").gsub('"', '\\"')
+    value.gsub("\\") { "\\\\" }.gsub('"', '\\"')
   end
 
   def fetch_remote_subscription(target, timeout_seconds: VALIDATION_TIMEOUT_SECONDS)
@@ -423,6 +423,25 @@ module ClashPatch
     failures
   end
 
+  def finish_safe_update_rollback(items, transaction, backup_root, roots)
+    failures = rollback_safe_update_items(items)
+    return failures unless failures.empty?
+
+    candidate_remains = items.any? do |item|
+      File.binread(File.realpath(item.fetch(:path))) == item.fetch(:candidate)
+    rescue StandardError
+      true
+    end
+    if candidate_remains
+      recover_profile_transaction(backup_root, roots: roots)
+    else
+      remove_profile_transaction(transaction)
+    end
+    []
+  rescue StandardError
+    [""]
+  end
+
   def default_safe_update_activation(items, usage_profile, selected_name = selected_profile_name)
     active = items.find { |item| active_profile?(item.fetch(:path), selected_name) }
     return true unless active
@@ -437,8 +456,14 @@ module ClashPatch
 
   def safe_update_all(targets:, policy:, backup_root:, usage_profile:, fetcher: method(:fetch_remote_subscription),
                       validator: method(:validate_with_mihomo), activation: nil, selected_name: nil)
+    operation_lock = nil
     raise InvalidConfigError, "用途档位无效" unless [1, 2, 3].include?(usage_profile)
     raise InvalidConfigError, "没有可更新的远程订阅" unless targets.is_a?(Array) && !targets.empty?
+    roots = targets.map { |target| File.dirname(File.expand_path(target.fetch(:path))) }.uniq
+    if Dir.exist?(backup_root)
+      operation_lock = profile_operation_lock(backup_root)
+      recover_profile_transaction(backup_root, roots: roots)
+    end
 
     items = targets.map do |target|
       path = target.fetch(:path)
@@ -449,6 +474,8 @@ module ClashPatch
     rescue StandardError
       return { status: :aborted, failed_profile: target[:name].to_s, reason: :download_or_validation_failed }
     end
+    operation_lock ||= profile_operation_lock(backup_root)
+    recover_profile_transaction(backup_root, roots: roots)
 
     identities = items.map do |item|
       stat = File.stat(File.realpath(item.fetch(:path)))
@@ -457,6 +484,7 @@ module ClashPatch
     if identities.uniq.length != identities.length
       return { status: :aborted, failed_profile: "", reason: :duplicate_target }
     end
+    transaction = prepare_profile_transaction(items, backup_root)
 
     handles = []
     temporary_files = []
@@ -515,12 +543,13 @@ module ClashPatch
         item[:original_identity] = original_identity
       end
     rescue StandardError
-      rollback_failures = rollback_safe_update_items(items)
-      unless rollback_failures.empty?
-        reason = concurrent_change ? :concurrent_change : :write_failed
-        return { status: :rollback_failed, failed_profile: rollback_failures.first, reason: reason }
-      end
       reason = concurrent_change ? :concurrent_change : :write_failed
+      failures = finish_safe_update_rollback(items, transaction, backup_root, roots)
+      unless failures.empty?
+        return {
+          status: :rollback_failed, failed_profile: failures.reject(&:empty?).first.to_s, reason: reason
+        }
+      end
       return { status: :aborted, failed_profile: "", reason: reason }
     ensure
       handles.each { |_item, handle| handle.close rescue nil }
@@ -528,10 +557,10 @@ module ClashPatch
     end
 
     unless items.all? { |item| safe_update_item_committed?(item) }
-      rollback_failures = rollback_safe_update_items(items)
+      rollback_failed = !finish_safe_update_rollback(items, transaction, backup_root, roots).empty?
       return {
-        status: rollback_failures.empty? ? :aborted : :rollback_failed,
-        failed_profile: rollback_failures.first.to_s, reason: :concurrent_change
+        status: rollback_failed ? :rollback_failed : :aborted,
+        failed_profile: "", reason: :concurrent_change
       }
     end
 
@@ -549,9 +578,9 @@ module ClashPatch
                 (activation_result.is_a?(Hash) && activation_result[:reloaded] == true)
     runtime_status = activation_result[:status] if activation_result.is_a?(Hash)
     unless activated
-      rollback_failures = rollback_safe_update_items(items)
-      unless rollback_failures.empty?
-        return { status: :rollback_failed, failed_profile: rollback_failures.first, reason: :activation_failed }
+      failures = finish_safe_update_rollback(items, transaction, backup_root, roots)
+      unless failures.empty?
+        return { status: :rollback_failed, failed_profile: "", reason: :activation_failed }
       end
       if %i[reload_failed_restore_pending reload_failed_rollback_conflict].include?(runtime_status)
         return {
@@ -562,11 +591,14 @@ module ClashPatch
       return { status: :aborted, failed_profile: "", reason: :activation_failed }
     end
 
+    remove_profile_transaction(transaction)
     { status: :updated, count: items.length, profiles: items.map { |item| item.fetch(:name) } }
   rescue InvalidConfigError
     raise
   rescue StandardError
     { status: :aborted, failed_profile: "", reason: :unexpected_error }
+  ensure
+    operation_lock&.close
   end
 
   def clashx_app_paths
@@ -609,6 +641,7 @@ module ClashPatch
     matching = existing_clouds.select do |root|
       profile_paths(root).any? { |path| active_profile?(path, selected) }
     end
+    return [] if matching.length > 1
     return [] if matching.empty? && existing_clouds.length > 1
 
     candidates = matching.empty? ? existing_clouds : matching

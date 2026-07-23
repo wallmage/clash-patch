@@ -1071,7 +1071,8 @@ test('Windows installer is split into side-effect-free modules with stable funct
     ],
     'mihomo.ps1': [
       'ConvertTo-NativeArgument', 'Invoke-Mihomo', 'Test-ClashVergeRunning', 'Test-MihomoVersionText',
-      'Test-MihomoVersion', 'Find-MihomoCore', 'Test-MihomoCandidate'
+      'Test-MihomoVersion', 'Find-MihomoCore', 'Start-MihomoCandidateCleanupWatcher',
+      'Test-MihomoCandidate'
     ],
     'script_js.ps1': [
       'Get-JavaScriptAnalysis', 'Rename-JavaScriptMain', 'Assert-JavaScriptReservedIdentifiers',

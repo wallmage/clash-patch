@@ -620,11 +620,13 @@ function Write-FileTransactionJournal([object[]]$Entries) {
     }
     $journalActions = @()
     foreach ($entry in $Entries) {
+        $originalBytes = if ($null -eq $entry.Original) { [byte[]]@() } else { [byte[]]$entry.Original }
         $journalActions += [ordered]@{
             Action = [string]$entry.Action
             Path = Get-AppHomeRelativePath ([string]$entry.Target.Path)
             Existed = (-not [bool]$entry.Created)
-            OriginalBase64 = [Convert]::ToBase64String([byte[]]$entry.Original)
+            Identity = [ClashPatch.VerifiedDeleteNative]::GetIdentity($entry.Stream.SafeFileHandle)
+            OriginalBase64 = [Convert]::ToBase64String($originalBytes)
             ReplacementBase64 = if ($entry.Action -eq "write") {
                 [Convert]::ToBase64String([byte[]]$entry.Target.Bytes)
             } else {
@@ -654,6 +656,7 @@ function Write-FileTransactionJournal([object[]]$Entries) {
         $stream.Dispose()
         $stream = $null
         [System.IO.File]::Move($temporary, $script:ClashPatchTransactionJournalPath)
+        Protect-BackupAcl $script:ClashPatchTransactionJournalPath
         $moved = $true
         return $bytes
     } finally {
@@ -709,9 +712,11 @@ function Get-ValidatedFileTransactionJournal([object]$Journal) {
     $validated = @()
     foreach ($action in $actions) {
         $actionProperties = @($action.PSObject.Properties.Name | Sort-Object)
-        if (($actionProperties -join ",") -cne "Action,Existed,OriginalBase64,Path,ReplacementBase64" -or
+        if (($actionProperties -join ",") -cne "Action,Existed,Identity,OriginalBase64,Path,ReplacementBase64" -or
             [string]$action.Action -notin @("write", "delete") -or
             -not ($action.Existed -is [bool]) -or
+            -not ($action.Identity -is [string]) -or
+            [string]::IsNullOrWhiteSpace([string]$action.Identity) -or
             -not ($action.OriginalBase64 -is [string]) -or
             -not ($action.ReplacementBase64 -is [string])) {
             throw "文件事务记录操作项无效。"
@@ -749,6 +754,7 @@ function Get-ValidatedFileTransactionJournal([object]$Journal) {
             Action = [string]$action.Action
             Path = $absolute
             Existed = [bool]$action.Existed
+            Identity = [string]$action.Identity
             Original = $original
             Replacement = $replacement
         }
@@ -763,6 +769,9 @@ function Get-InterruptedTransactionRecoveryPlan([object[]]$Actions) {
         $currentHash = if ($snapshot.Exists) { Get-BytesSha256 $snapshot.Bytes } else { "" }
         $originalHash = Get-BytesSha256 $action.Original
         $replacementHash = Get-BytesSha256 $action.Replacement
+        if ($snapshot.Exists -and $snapshot.Identity -cne $action.Identity) {
+            throw "中断事务目标已被同内容的其他文件替换：$($action.Path)"
+        }
         if ($action.Action -eq "write" -and $action.Existed) {
             if (-not $snapshot.Exists -or $currentHash -notin @($originalHash, $replacementHash)) {
                 throw "中断事务目标有无法自动合并的新改动：$($action.Path)"

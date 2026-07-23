@@ -149,10 +149,34 @@ restore_slot() {
 stage_slot() {
   source=$1
   slot=$2
-  [ -e "$source" ] || return 0
+  if [ ! -e "$source" ] && [ ! -L "$source" ]; then
+    /usr/bin/printf '%s\n' absent >"$UNINSTALL_STAGING/$slot.meta"
+    return 0
+  fi
   [ -f "$source" ] && [ ! -L "$source" ] ||
     finish 1 failed uninstall_target_unsafe "卸载目标不是安全的普通文件；未删除。"
+  source_identity=$(/usr/bin/stat -f '%d:%i' "$source")
+  /usr/bin/printf 'present:%s\n' "$source_identity" >"$UNINSTALL_STAGING/$slot.meta"
   /bin/cp -p "$source" "$UNINSTALL_STAGING/$slot"
+}
+
+verify_staged_slot() {
+  source=$1
+  slot=$2
+  metadata=$(/bin/cat "$UNINSTALL_STAGING/$slot.meta")
+  case "$metadata" in
+    absent)
+      [ ! -e "$source" ] && [ ! -L "$source" ]
+      ;;
+    present:*)
+      [ -f "$source" ] && [ ! -L "$source" ] &&
+        [ "$(/usr/bin/stat -f '%d:%i' "$source")" = "${metadata#present:}" ] &&
+        /usr/bin/cmp -s "$UNINSTALL_STAGING/$slot" "$source"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 delete_staged_install_files() {
@@ -168,6 +192,16 @@ delete_staged_install_files() {
   stage_slot "$INSTALL_DIR/patch.log" log
   stage_slot "$INSTALL_DIR/patch-error.log" error-log
   /usr/bin/touch "$UNINSTALL_STAGING/READY"
+
+  if ! verify_staged_slot "$INSTALL_DIR/patch_profiles.rb" patcher ||
+     ! verify_staged_slot "$INSTALL_DIR/policy.json" policy ||
+     ! verify_staged_slot "$STATE_PATH" state ||
+     ! verify_staged_slot "$USAGE_STATE_PATH" usage ||
+     ! verify_staged_slot "$INSTALL_DIR/patch.log" log ||
+     ! verify_staged_slot "$INSTALL_DIR/patch-error.log" error-log; then
+    /bin/rm -rf "$UNINSTALL_STAGING"
+    finish 1 failed uninstall_state_conflict "卸载目标在暂存后被替换；未删除新文件。"
+  fi
 
   /bin/rm -f \
     "$INSTALL_DIR/patch_profiles.rb" \

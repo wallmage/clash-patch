@@ -23,7 +23,7 @@
 function Test-RestoreCandidate([string]$TargetPath, [byte[]]$Bytes) {
     $leaf = Split-Path -Leaf $TargetPath
     $extension = [System.IO.Path]::GetExtension($TargetPath).ToLowerInvariant()
-    $text = [System.Text.Encoding]::UTF8.GetString($Bytes)
+    $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($Bytes)
     if ($extension -eq ".json") {
         throw "内部状态文件不能通过单文件备份恢复。"
     }
@@ -38,6 +38,14 @@ function Test-RestoreCandidate([string]$TargetPath, [byte[]]$Bytes) {
 function Get-SafeUpdateRecoveryItems([object]$Manifest, [string]$Directory, [string]$BackupDirectory) {
     $items = @()
     foreach ($item in @($Manifest.Profiles)) {
+        $properties = @($item.PSObject.Properties.Name | Sort-Object)
+        if (($properties -join ",") -cne "Backup,BeforeSha256,File,Uid" -or
+            -not ($item.Uid -is [string]) -or
+            -not ($item.File -is [string]) -or
+            -not ($item.Backup -is [string]) -or
+            -not ($item.BeforeSha256 -is [string])) {
+            throw "安全更新准备记录包含无效订阅项。"
+        }
         $uid = [string]$item.Uid
         $file = [string]$item.File
         $backup = [string]$item.Backup

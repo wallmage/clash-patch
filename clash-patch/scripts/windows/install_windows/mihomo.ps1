@@ -47,7 +47,19 @@ function Invoke-Mihomo(
         $stdout = $process.StandardOutput.ReadToEndAsync()
         $stderr = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            $process.Kill()
+            if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+                $terminateTree = {
+                    param([int]$ProcessId)
+                    $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $ProcessId")
+                    foreach ($child in $children) { & $terminateTree ([int]$child.ProcessId) }
+                    $target = [System.Diagnostics.Process]::GetProcessById($ProcessId)
+                    $target.Kill()
+                    $target.Dispose()
+                }
+                try { & $terminateTree $process.Id } catch { $process.Kill() }
+            } else {
+                $process.Kill()
+            }
             $process.WaitForExit()
             throw "Mihomo 校验超过 $TimeoutSeconds 秒；候选配置无效，原文件保持不变。"
         }
@@ -119,11 +131,37 @@ function Find-MihomoCore([string]$RequestedPath) {
     return $null
 }
 
+function Start-MihomoCandidateCleanupWatcher([string]$CandidatePath) {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return }
+    $ownerId = [System.Diagnostics.Process]::GetCurrentProcess().Id
+    $pathBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($CandidatePath))
+    $watcherSource = @"
+`$ownerId = $ownerId
+`$candidate = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("$pathBase64"))
+try { Wait-Process -Id `$ownerId -ErrorAction SilentlyContinue } catch {}
+if ([System.IO.Path]::GetFileName(`$candidate) -like ".clash-patch-validate-*.yaml") {
+    Remove-Item -LiteralPath `$candidate -Force -ErrorAction SilentlyContinue
+}
+"@
+    $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($watcherSource))
+    $executable = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = $executable
+    $start.Arguments = "-NoLogo -NoProfile -NonInteractive -EncodedCommand $encodedCommand"
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $watcher = [System.Diagnostics.Process]::Start($start)
+    if ($null -eq $watcher) { throw "无法启动候选配置清理进程。" }
+    $watcher.Dispose()
+}
+
 function Test-MihomoCandidate([string]$CorePath, [string]$Text, [string]$Directory) {
     Test-MihomoVersion $CorePath | Out-Null
     $temporary = Join-Path $Directory (".clash-patch-validate-" + [System.IO.Path]::GetRandomFileName() + ".yaml")
     try {
         [System.IO.File]::WriteAllText($temporary, $Text, (New-Object System.Text.UTF8Encoding($false)))
+        Protect-BackupAcl $temporary
+        Start-MihomoCandidateCleanupWatcher $temporary
         $result = Invoke-Mihomo $CorePath @("-d", $Directory, "-t", "-f", $temporary)
         if ($result.ExitCode -ne 0) { throw "Mihomo 拒绝了生成的 config.yaml。原文件没有被修改。" }
     } finally {

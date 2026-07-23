@@ -128,7 +128,7 @@ module ClashPatch
       [200, 204].include?(code)
     end
     return false unless caches_flushed
-    return false unless expected_tun && tun_state(requester: requester) == expected_tun
+    return false if expected_tun != :ignore && tun_state(requester: requester) != expected_tun
 
     after = runtime_selections(requester)
     return false unless after.is_a?(Hash) && selections.is_a?(Hash)
@@ -152,8 +152,13 @@ module ClashPatch
 
     before = runtime_selections(requester)
     return result.merge(status: rollback_after_reload_failure(result, requester, result[:path])) unless before
-    preserved_tun_state = tun_state(requester: requester)
-    expected_tun = require_tun == :preserve ? preserved_tun_state : (require_tun ? :enabled : preserved_tun_state)
+    expected_tun = if require_tun == :preserve
+                     tun_state(requester: requester)
+                   elsif require_tun
+                     :enabled
+                   else
+                     :ignore
+                   end
     rollback = lambda do
       rollback_after_reload_failure(
         result, requester, result[:path], selections: before, expected_tun: expected_tun,

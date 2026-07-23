@@ -1240,6 +1240,37 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_restore_backup_rejects_a_retargeted_profile_symlink
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      first = File.join(directory, "first-target")
+      second = File.join(directory, "second-target")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config)
+      changed = YAML.dump(base_config.merge("subscription-marker" => "changed"))
+      File.binwrite(first, changed)
+      File.binwrite(second, changed)
+      File.symlink(first, profile)
+      backup = ClashPatch.create_versioned_backup(
+        profile, backup_root, content: original, reason: "prewrite"
+      )
+
+      result = ClashPatch.restore_backup(
+        File.basename(backup), directories: [directory], backup_root: backup_root,
+        expected_current_sha256: Digest::SHA256.hexdigest(changed.b),
+        validator: lambda { |_candidate|
+          File.unlink(profile)
+          File.symlink(second, profile)
+          true
+        }
+      )
+
+      assert_equal :restore_conflict, result.fetch(:status)
+      assert_equal changed.b, File.binread(first)
+      assert_equal changed.b, File.binread(second)
+    end
+  end
+
   def test_subscription_auto_update_state_is_explicit
     assert_equal :disabled, ClashPatch.subscription_auto_update_state("0")
     assert_equal :disabled, ClashPatch.subscription_auto_update_state("false")
@@ -1825,6 +1856,113 @@ class MacosPatcherTest < Minitest::Test
       assert_equal 3, targets.length
       assert_equal %w[Express MESL Yue], targets.map { |target| File.basename(target.fetch(:path), ".yaml") }.sort
       refute_includes JSON.generate(targets.map { |target| target.reject { |key, _value| key == :url } }), "subscriptions.invalid"
+    end
+  end
+
+  def test_remote_subscription_manifest_rejects_unsafe_and_ambiguous_records
+    encode = ->(records) { Base64.strict_encode64(JSON.generate(records)) }
+    invalid_records = [
+      {},
+      [],
+      [nil],
+      [{ "name" => "", "url" => "https://example.invalid/subscription" }],
+      [{ "name" => "friend", "url" => "" }],
+      [{ "name" => "friend", "url" => "http://example.invalid/subscription" }],
+      [{ "name" => "nested/friend", "url" => "https://example.invalid/subscription" }],
+      [{ "name" => "nested\\friend", "url" => "https://example.invalid/subscription" }],
+      [{ "name" => "friend\0hidden", "url" => "https://example.invalid/subscription" }]
+    ]
+    invalid_records.each do |records|
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.remote_subscription_records(encode.call(records))
+      end
+    end
+
+    Dir.mktmpdir do |directory|
+      record = { name: "friend", url: "https://example.invalid/subscription" }
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.remote_subscription_targets([directory], [record])
+      end
+
+      File.write(File.join(directory, "friend.yaml"), YAML.dump(base_config))
+      File.write(File.join(directory, "friend.yml"), YAML.dump(base_config))
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.remote_subscription_targets([directory], [record])
+      end
+    end
+
+    Dir.mktmpdir do |directory|
+      File.write(File.join(directory, "friend.yaml"), YAML.dump(base_config))
+      duplicate = { name: "friend", url: "https://example.invalid/subscription" }
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.remote_subscription_targets([directory], [duplicate, duplicate])
+      end
+    end
+  end
+
+  def test_remote_subscription_curl_input_rejects_injection_and_empty_downloads
+    assert_raises(ClashPatch::InvalidConfigError) { ClashPatch.curl_config_value("safe\rnext") }
+    assert_raises(ClashPatch::InvalidConfigError) { ClashPatch.curl_config_value("safe\nnext") }
+    assert_equal "a\\\\b\\\"c", ClashPatch.curl_config_value("a\\b\"c")
+
+    failure = Struct.new(:success?).new(false)
+    success = Struct.new(:success?).new(true)
+    [[failure, "body"], [success, ""]].each do |status, body|
+      Open3.stub(:capture3, [body, "", status]) do
+        assert_raises(ClashPatch::InvalidConfigError) do
+          ClashPatch.fetch_remote_subscription(
+            { name: "friend", url: "https://example.invalid/subscription" }
+          )
+        end
+      end
+    end
+  end
+
+  def test_update_candidate_rejects_encoding_transform_and_validation_failures
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "friend.yaml")
+      File.write(path, YAML.dump(base_config))
+      target = { name: "friend", path: path }
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.build_update_candidate(target, "\xFF".b, @policy, 3, ->(_path) { true })
+      end
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.build_update_candidate(target, YAML.dump({}), @policy, 3, ->(_path) { true })
+      end
+
+      ClashPatch.stub(:patch, { status: :error }) do
+        assert_raises(ClashPatch::InvalidConfigError) do
+          ClashPatch.build_update_candidate(
+            target, YAML.dump(base_config), @policy, 3, ->(_path) { true }
+          )
+        end
+      end
+
+      [
+        { status: :updated, changed: true, config: base_config },
+        { status: :updated, changed: false, config: base_config.merge("unexpected" => true) }
+      ].each do |second_result|
+        results = [
+          { status: :updated, changed: true, config: base_config },
+          second_result
+        ]
+        ClashPatch.stub(:patch, ->(*_args, **_options) { results.shift }) do
+          assert_raises(ClashPatch::InvalidConfigError) do
+            ClashPatch.build_update_candidate(
+              target, YAML.dump(base_config), @policy, 3, ->(_path) { true }
+            )
+          end
+        end
+        assert_empty results
+      end
+
+      [:timeout, false].each do |validation|
+        assert_raises(ClashPatch::InvalidConfigError) do
+          ClashPatch.build_update_candidate(
+            target, YAML.dump(base_config), @policy, 3, ->(_path) { validation }
+          )
+        end
+      end
     end
   end
 
@@ -2755,6 +2893,82 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_profile_one_activation_does_not_query_or_gate_on_tun
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      candidate = YAML.dump(base_config.merge("changed" => true))
+      File.binwrite(profile, candidate)
+      requester = lambda do |method, endpoint, _body|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          [200, JSON.generate("proxies" => {
+            "Main" => { "type" => "Selector", "now" => "Taiwan" }
+          })]
+        when ["GET", "/configs"]
+          flunk "profile 1 must not inspect TUN"
+        when ["PUT", "/configs?force=true"], ["POST", "/cache/fakeip/flush"], ["POST", "/cache/dns/flush"]
+          [204, ""]
+        else
+          if method == "GET" && endpoint.start_with?("/dns/query?")
+            [200, JSON.generate("Status" => 0, "Answer" => ["203.0.113.1"])]
+          else
+            [404, ""]
+          end
+        end
+      end
+
+      result = ClashPatch.activate_updated_profile(
+        {
+          path: profile, rollback_bytes: "original",
+          patched_digest: Digest::SHA256.hexdigest(candidate.b)
+        },
+        requester: requester, connectivity_checker: -> { true }, require_tun: false
+      )
+
+      assert_equal true, result.fetch(:reloaded)
+      assert_equal candidate.b, File.binread(profile)
+    end
+  end
+
+  def test_activation_restores_profile_when_tun_state_is_unknown
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config)
+      candidate = YAML.dump(base_config.merge("changed" => true))
+      File.binwrite(profile, candidate)
+      reloads = 0
+      requester = lambda do |method, endpoint, _body|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          [200, JSON.generate("proxies" => {
+            "Main" => { "type" => "Selector", "now" => "Taiwan" }
+          })]
+        when ["GET", "/configs"]
+          [200, JSON.generate("tun" => { "enable" => nil })]
+        when ["PUT", "/configs?force=true"]
+          reloads += 1
+          [204, ""]
+        when ["POST", "/cache/fakeip/flush"], ["POST", "/cache/dns/flush"]
+          [204, ""]
+        else
+          [404, ""]
+        end
+      end
+
+      result = ClashPatch.activate_updated_profile(
+        {
+          path: profile, rollback_bytes: original.b,
+          patched_digest: Digest::SHA256.hexdigest(candidate.b)
+        },
+        requester: requester, connectivity_checker: -> { true }, require_tun: :preserve
+      )
+
+      assert_equal :reload_failed_restore_pending, result.fetch(:status)
+      assert_equal original.b, File.binread(profile)
+      assert_equal 1, reloads
+    end
+  end
+
   def test_failed_active_reload_restores_the_exact_original_profile
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
@@ -3422,6 +3636,23 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_profile_discovery_refuses_two_icloud_roots_with_the_selected_profile
+    Dir.mktmpdir do |home|
+      current = File.join(home, "Library", "Mobile Documents", "iCloud~com~metacubex~ClashX", "Documents")
+      legacy = File.join(home, "Library", "Mobile Documents", "iCloud~com~west2online~ClashX", "Documents")
+      [current, legacy].each do |path|
+        FileUtils.mkdir_p(path)
+        File.write(File.join(path, "friend.yaml"), YAML.dump(base_config))
+      end
+
+      directories = ClashPatch.default_profile_directories(
+        home: home, app_paths: [], cloud_enabled: true, selected: "friend"
+      )
+
+      assert_empty directories
+    end
+  end
+
   def test_profile_discovery_refuses_unknown_storage_mode
     Dir.mktmpdir do |home|
       local = File.join(home, ".config", "clash.meta")
@@ -3742,6 +3973,24 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_controller_request_sends_json_body_with_the_reload_request
+    success = Object.new
+    success.define_singleton_method(:success?) { true }
+    arguments = nil
+
+    Open3.stub(:capture2e, ->(*items) { arguments = items; ["\n204", success] }) do
+      assert_equal(
+        [204, ""],
+        ClashPatch.controller_request(
+          "/tmp/controller.sock", "PUT", "/configs?force=true", '{"path":"profile.yaml"}'
+        )
+      )
+    end
+    assert_includes arguments, "Content-Type: application/json"
+    assert_includes arguments, "--data"
+    assert_includes arguments, '{"path":"profile.yaml"}'
+  end
+
   def test_mihomo_validation_uses_the_profile_directory_and_fails_closed
     success = Object.new
     success.define_singleton_method(:success?) { true }
@@ -3782,6 +4031,99 @@ class MacosPatcherTest < Minitest::Test
     refute ClashPatch.dns_runtime_healthy?(requester, "example.invalid")
   end
 
+  def test_runtime_parsers_reject_http_and_proxy_shape_failures
+    assert_nil ClashPatch.runtime_selections(
+      ->(*_args) { [200, JSON.generate("proxies" => [])] }
+    )
+    assert_equal(
+      {},
+      ClashPatch.runtime_selections(
+        ->(*_args) {
+          [200, JSON.generate("proxies" => {
+            "not-a-map" => [],
+            "missing-selection" => { "type" => "Selector" },
+            "automatic" => { "type" => "URLTest", "now" => "Taiwan" }
+          })]
+        }
+      )
+    )
+    refute ClashPatch.dns_runtime_healthy?(
+      ->(*_args) { [503, JSON.generate("Status" => 0, "Answer" => ["203.0.113.1"])] },
+      "example.invalid"
+    )
+  end
+
+  def test_runtime_health_rejects_every_partial_health_failure
+    requester_for = lambda do |failure|
+      lambda do |method, endpoint, _body|
+        case [method, endpoint]
+        when ["POST", "/cache/fakeip/flush"]
+          [failure == :fakeip_flush ? 503 : 204, ""]
+        when ["POST", "/cache/dns/flush"]
+          [failure == :dns_flush ? 503 : 204, ""]
+        when ["GET", "/configs"]
+          tun = failure == :tun ? nil : true
+          [200, JSON.generate("tun" => { "enable" => tun })]
+        when ["GET", "/proxies"]
+          proxies = if failure == :proxy_shape
+                      []
+                    else
+                      selected = failure == :selection ? "Japan" : "Taiwan"
+                      { "Main" => { "type" => "Selector", "now" => selected } }
+                    end
+          [200, JSON.generate("proxies" => proxies)]
+        else
+          if method == "GET" && endpoint.start_with?("/dns/query?")
+            failed_dns = (failure == :baidu_dns && endpoint.include?("www.baidu.com")) ||
+                         (failure == :google_dns && endpoint.include?("www.google.com"))
+            [failed_dns ? 503 : 200, JSON.generate("Status" => 0, "Answer" => ["203.0.113.1"])]
+          else
+            [404, ""]
+          end
+        end
+      end
+    end
+    selections = { "Main" => "Taiwan" }
+    checker = -> { true }
+
+    assert ClashPatch.runtime_health_healthy?(
+      requester_for.call(nil), selections: selections, expected_tun: :enabled,
+      connectivity_checker: checker
+    )
+    %i[fakeip_flush dns_flush tun proxy_shape selection baidu_dns google_dns].each do |failure|
+      refute ClashPatch.runtime_health_healthy?(
+        requester_for.call(failure), selections: selections, expected_tun: :enabled,
+        connectivity_checker: checker
+      ), "runtime health accepted #{failure}"
+    end
+    refute ClashPatch.runtime_health_healthy?(
+      requester_for.call(nil), selections: selections, expected_tun: nil,
+      connectivity_checker: checker
+    )
+    refute ClashPatch.runtime_health_healthy?(
+      requester_for.call(nil), selections: [], expected_tun: :enabled,
+      connectivity_checker: checker
+    )
+    refute ClashPatch.runtime_health_healthy?(
+      requester_for.call(nil), selections: selections, expected_tun: :enabled,
+      connectivity_checker: -> { false }
+    )
+  end
+
+  def test_profile_restore_refuses_incomplete_metadata_and_digest_conflicts
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "profile.yaml")
+      File.binwrite(path, "current")
+
+      refute ClashPatch.restore_profile_bytes(path: path, rollback_bytes: nil, patched_digest: "digest")
+      refute ClashPatch.restore_profile_bytes(
+        path: path, rollback_bytes: "original",
+        patched_digest: Digest::SHA256.hexdigest("different")
+      )
+      assert_equal "current", File.binread(path)
+    end
+  end
+
   def test_process_timeout_helpers_cover_normal_exit_and_kill_fallbacks
     output, status, timed_out = ClashPatch.run_process_with_timeout(
       RbConfig.ruby, "-e", "STDOUT.write('fixture-output')", timeout_seconds: 2
@@ -3801,6 +4143,95 @@ class MacosPatcherTest < Minitest::Test
       end
     end
     assert_equal [["TERM", -12_345], ["KILL", 12_345]], signals
+  end
+
+  def test_process_owner_watchdog_covers_completion_and_owner_death
+    output_class = Struct.new(:closed, :removed) do
+      def close
+        self.closed = true
+      end
+
+      def close!
+        self.removed = true
+      end
+    end
+
+    completed_output = output_class.new(false, false)
+    ClashPatch.watch_process_owner(StringIO.new("D"), 12_345, completed_output)
+    assert completed_output.closed
+    refute completed_output.removed
+
+    abandoned_output = output_class.new(false, false)
+    signals = []
+    Process.stub(:kill, lambda { |signal, pid|
+      signals << [signal, pid]
+      raise Errno::ESRCH if signal == "TERM"
+    }) do
+      ClashPatch.watch_process_owner(StringIO.new, 12_345, abandoned_output)
+    end
+    assert abandoned_output.removed
+    assert_equal [["TERM", -12_345], ["KILL", 12_345]], signals
+
+    terminated_output = output_class.new(false, false)
+    signals = []
+    Process.stub(:kill, ->(signal, pid) { signals << [signal, pid] }) do
+      ClashPatch.watch_process_owner(StringIO.new, 12_345, terminated_output)
+    end
+    assert terminated_output.removed
+    assert_equal [["TERM", -12_345], ["KILL", -12_345]], signals
+
+    writer = Object.new
+    writer.define_singleton_method(:write) { |_value| raise Errno::EPIPE }
+    writer.define_singleton_method(:close) { true }
+    finished_output = output_class.new(false, false)
+    Process.stub(:waitpid, ->(_pid) { raise Errno::ECHILD }) do
+      ClashPatch.finish_process_watchdog(writer, 12_345, finished_output)
+    end
+    assert finished_output.removed
+  end
+
+  def test_profile_operation_lock_closes_after_lock_failure
+    Dir.mktmpdir do |directory|
+      ClashPatch.stub(:lock_exclusive_with_timeout, ->(_handle) { raise IOError, "injected lock failure" }) do
+        assert_raises(IOError) { ClashPatch.profile_operation_lock(File.join(directory, "backups")) }
+      end
+    end
+  end
+
+  def test_profile_transaction_recovery_normalizes_invalid_base64
+    Dir.mktmpdir do |directory|
+      root = File.join(directory, "backups")
+      FileUtils.mkdir_p(root)
+      File.chmod(0o700, root)
+      profile = File.join(directory, "friend.yaml")
+      File.binwrite(profile, "original")
+      transaction = {
+        "Version" => 1,
+        "Items" => [{
+          "Path" => profile,
+          "WritePath" => File.realpath(profile),
+          "OriginalBase64" => "!",
+          "CandidateSha256" => Digest::SHA256.hexdigest("candidate")
+        }]
+      }
+      File.binwrite(
+        File.join(root, ClashPatch::PROFILE_TRANSACTION_BASENAME),
+        JSON.generate(transaction)
+      )
+
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.recover_profile_transaction(root, roots: [directory])
+      end
+    end
+  end
+
+  def test_safe_update_rollback_reports_unreadable_candidate_recovery_failure
+    item = { name: "friend", path: "/missing/profile.yaml", candidate: "candidate" }
+    ClashPatch.stub(:rollback_safe_update_items, []) do
+      ClashPatch.stub(:recover_profile_transaction, ->(*_args, **_kwargs) { raise IOError }) do
+        assert_equal [""], ClashPatch.finish_safe_update_rollback([item], {}, "/backups", ["/missing"])
+      end
+    end
   end
 
   def test_mihomo_core_status_covers_supported_old_and_unreadable_results
@@ -3976,11 +4407,41 @@ class MacosPatcherTest < Minitest::Test
       end
     end
     ClashPatch.stub(:restore_profile_bytes, true) do
+      assert_equal(
+        :reload_failed_restore_pending,
+        ClashPatch.rollback_after_reload_failure(missing_result, nil, nil)
+      )
       status = ClashPatch.rollback_after_reload_failure(
         missing_result, ->(*_args) { raise IOError }, missing_result.fetch(:path),
         selections: {}, expected_tun: :enabled
       )
       assert_equal :reload_failed_restore_pending, status
+    end
+    ClashPatch.stub(:restore_profile_bytes, false) do
+      assert_equal(
+        :reload_failed_rollback_conflict,
+        ClashPatch.rollback_after_reload_failure(missing_result, nil, nil)
+      )
+    end
+  end
+
+  def test_controller_socket_ignores_wrong_shapes_and_regular_files
+    Dir.mktmpdir do |home|
+      old_home = ENV["HOME"]
+      ENV["HOME"] = home
+      cache = File.join(home, "Library", "Caches", "com.MetaCubeX.ClashX.meta", "cacheConfigs")
+      FileUtils.mkdir_p(cache)
+      regular_file = File.join(home, "not-a-socket")
+      File.write(regular_file, "")
+      File.write(File.join(cache, "array.yaml"), YAML.dump(["wrong shape"]))
+      File.write(
+        File.join(cache, "regular-file.yaml"),
+        YAML.dump("external-controller-unix" => regular_file)
+      )
+
+      assert_nil ClashPatch.controller_socket
+    ensure
+      ENV["HOME"] = old_home
     end
   end
 

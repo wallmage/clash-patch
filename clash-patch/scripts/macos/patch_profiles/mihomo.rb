@@ -29,9 +29,45 @@ module ClashPatch
     end
   end
 
+  def watch_process_owner(reader, pid, output)
+    completed = reader.read(1) == "D"
+    unless completed
+      begin
+        Process.kill("TERM", -pid)
+        sleep 0.05
+        Process.kill("KILL", -pid)
+      rescue Errno::ESRCH, Errno::EPERM
+        Process.kill("KILL", pid) rescue nil
+      end
+      output.close!
+    else
+      output.close
+    end
+  ensure
+    reader.close rescue nil
+  end
+
+  def finish_process_watchdog(writer, watchdog_pid, output)
+    begin
+      writer&.write("D")
+    rescue Errno::EPIPE, IOError
+      nil
+    end
+    writer&.close
+    begin
+      Process.waitpid(watchdog_pid) if watchdog_pid
+    rescue Errno::ECHILD
+      nil
+    end
+    output.close! if output
+  end
+
   def run_process_with_timeout(command, *arguments, timeout_seconds: VALIDATION_TIMEOUT_SECONDS)
     output = Tempfile.new("clash-patch-command")
     pid = Process.spawn(command, *arguments, out: output, err: output, pgroup: true)
+    watchdog_reader, watchdog_writer = IO.pipe
+    watchdog_pid = fork { watchdog_writer.close; watch_process_owner(watchdog_reader, pid, output); exit! 0 }
+    watchdog_reader.close
     deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout_seconds
 
     loop do
@@ -50,7 +86,7 @@ module ClashPatch
       sleep 0.05
     end
   ensure
-    output.close! if output
+    finish_process_watchdog(watchdog_writer, watchdog_pid, output)
   end
 
   def mihomo_core_status(core_path = AUTO_CORE, timeout_seconds: VALIDATION_TIMEOUT_SECONDS)
@@ -95,4 +131,3 @@ module ClashPatch
   end
 
 end
-

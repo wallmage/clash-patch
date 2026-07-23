@@ -128,15 +128,16 @@ class MutationSafetyTest < Minitest::Test
     with_repo_copy do |root|
       replace_once(
         root,
-        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
-        "        item.fetch(:path), item.fetch(:original),\n",
-        "        item.fetch(:path), item.fetch(:candidate),\n"
+        "clash-patch/scripts/macos/patch_profiles/profile_writer.rb",
+        "        item.fetch(\"Path\"), current, original, expected_path: item.fetch(\"WritePath\")\n",
+        "        item.fetch(\"Path\"), current, current, expected_path: item.fetch(\"WritePath\")\n"
       )
 
       assert_mutation_is_killed(
         root,
+        { "CLASH_PATCH_RUN_PRODUCTION_PROBES" => "1" },
         RbConfig.ruby, "tests/test_macos_patcher.rb",
-        "--name", "test_safe_update_all_restores_every_profile_when_a_later_write_fails"
+        "--name", "test_production_probe_next_safe_update_recovers_batch_killed_after_first_swap"
       )
     end
   end
@@ -187,23 +188,16 @@ class MutationSafetyTest < Minitest::Test
     with_repo_copy do |root|
       replace_once(
         root,
-        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
-        "          if File.exist?(item.fetch(:temporary).path) &&\n" \
-          "             same_file_identity?(handle.stat, item.fetch(:temporary).path) &&\n" \
-          "             File.binread(item.fetch(:write_path)) == item.fetch(:candidate)\n" \
-          "            atomic_swap_paths(item.fetch(:temporary).path, item.fetch(:write_path))\n" \
-          "          end\n",
-        "          if File.exist?(item.fetch(:temporary).path) &&\n" \
-          "             same_file_identity?(handle.stat, item.fetch(:temporary).path) &&\n" \
-          "             File.binread(item.fetch(:write_path)) == item.fetch(:candidate)\n" \
-          "            false\n" \
-          "          end\n"
+        "clash-patch/scripts/macos/patch_profiles/mihomo.rb",
+        "    unless completed\n",
+        "    if completed\n"
       )
 
       assert_mutation_is_killed(
         root,
+        { "CLASH_PATCH_RUN_PRODUCTION_PROBES" => "1" },
         RbConfig.ruby, "tests/test_macos_patcher.rb",
-        "--name", "test_safe_update_detects_lock_time_and_post_swap_identity_changes"
+        "--name", "test_production_probe_mihomo_does_not_survive_a_killed_validator"
       )
     end
   end
@@ -384,6 +378,40 @@ class MutationSafetyTest < Minitest::Test
         root,
         RbConfig.ruby, "tests/test_macos_patcher.rb",
         "--name", "test_mihomo_default_core_is_resolved_before_status_and_validation"
+      )
+    end
+  end
+
+  def test_runtime_google_dns_health_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/runtime.rb",
+        '    return false unless dns_runtime_healthy?(requester, "www.google.com")',
+        '    true'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_runtime_health_rejects_every_partial_health_failure"
+      )
+    end
+  end
+
+  def test_remote_subscription_https_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        '      raise InvalidConfigError, "远程订阅地址不是 HTTPS" unless url.start_with?("https://")',
+        '      true'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_remote_subscription_manifest_rejects_unsafe_and_ambiguous_records"
       )
     end
   end

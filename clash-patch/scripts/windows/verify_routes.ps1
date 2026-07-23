@@ -104,6 +104,11 @@ function Test-RouteChains(
     [bool]$AllowExplicitProxyGroup
 ) {
     if ($Chains -contains "DIRECT" -or $ExpectedSelection -eq "DIRECT") { return $false }
+    $nonProxyTermini = @("REJECT", "REJECT-DROP", "PASS", "COMPATIBLE")
+    if (@($Chains | Where-Object { $_ -in $nonProxyTermini }).Count -gt 0 -or
+        $ExpectedSelection -in $nonProxyTermini) {
+        return $false
+    }
     if (-not $AllowExplicitProxyGroup) {
         return ($Chains -contains $ExpectedGroup) -and ($Chains -contains $ExpectedSelection)
     }
@@ -114,7 +119,9 @@ function Test-RouteChains(
         $property = $Proxies.PSObject.Properties[$name]
         if ($null -eq $property) { continue }
         $selection = [string]$property.Value.now
-        if (-not [string]::IsNullOrWhiteSpace($selection) -and $selection -ne "DIRECT" -and $Chains -contains $selection) {
+        if (-not [string]::IsNullOrWhiteSpace($selection) -and
+            $selection -notin $nonProxyTermini -and
+            $Chains -contains $selection) {
             return $true
         }
     }
