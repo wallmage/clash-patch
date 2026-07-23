@@ -471,6 +471,25 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_candidate_cleanup_publish_order_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/install_windows/mihomo.ps1",
+        "        Start-MihomoCandidateCleanupWatcher $temporary\n" +
+          "        [System.IO.File]::Move($staging, $temporary)",
+        "        [System.IO.File]::Move($staging, $temporary)\n" +
+          "        Start-MihomoCandidateCleanupWatcher $temporary"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_windows_candidate_cleanup_watcher_is_armed_before_publish"
+      )
+    end
+  end
+
   def test_macos_production_probe_ci_gate_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

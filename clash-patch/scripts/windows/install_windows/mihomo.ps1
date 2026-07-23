@@ -162,8 +162,8 @@ function Test-MihomoCandidate([string]$CorePath, [string]$Text, [string]$Directo
     try {
         [System.IO.File]::WriteAllText($staging, $Text, (New-Object System.Text.UTF8Encoding($false)))
         Protect-BackupAcl $staging
-        [System.IO.File]::Move($staging, $temporary)
         Start-MihomoCandidateCleanupWatcher $temporary
+        [System.IO.File]::Move($staging, $temporary)
         $result = Invoke-Mihomo $CorePath @("-d", $Directory, "-t", "-f", $temporary)
         if ($result.ExitCode -ne 0) { throw "Mihomo 拒绝了生成的 config.yaml。原文件没有被修改。" }
     } finally {

@@ -1218,6 +1218,23 @@ class SkillContractTest < Minitest::Test
     assert_includes source, "incomplete release changed AppHome"
   end
 
+  def test_windows_candidate_cleanup_watcher_is_armed_before_publish
+    source = File.binread(
+      File.join(SKILL, "scripts/windows/install_windows/mihomo.ps1")
+    ).force_encoding("UTF-8")
+    function_source = source[
+      /function Test-MihomoCandidate\b.*?(?=^function |\z)/m
+    ]
+
+    refute_nil function_source
+    watcher = function_source.index("Start-MihomoCandidateCleanupWatcher $temporary")
+    publish = function_source.index("[System.IO.File]::Move($staging, $temporary)")
+    refute_nil watcher
+    refute_nil publish
+    assert_operator watcher, :<, publish,
+                    "candidate must never become visible before caller-death cleanup is armed"
+  end
+
   def test_windows_test_failure_diagnostics_do_not_echo_captured_output
     source = File.read(File.join(ROOT, "tests/test_windows_installer.ps1"))
     diagnostic = source[/function Get-TestOutputDiagnostic\b.*?^}/m]
