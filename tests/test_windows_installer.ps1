@@ -279,7 +279,8 @@ $uninstallerSource = Get-Content -LiteralPath $uninstaller -Raw
 foreach ($stateBinding in @(
     [pscustomobject]@{ Variable = "statePath"; Label = "install state" },
     [pscustomobject]@{ Variable = "autoUpdateStatePath"; Label = "auto-update state" },
-    [pscustomobject]@{ Variable = "usageStatePath"; Label = "usage state" }
+    [pscustomobject]@{ Variable = "usageStatePath"; Label = "usage state" },
+    [pscustomobject]@{ Variable = "safeUpdateStatePath"; Label = "safe-update state" }
 )) {
     $escapedVariable = [regex]::Escape($stateBinding.Variable)
     if ([regex]::Matches($uninstallerSource, "Get-OptionalFileSnapshot\s+\`$$escapedVariable\b").Count -ne 1) {
@@ -1645,6 +1646,22 @@ items:
     Assert-True ($snapshotResult.ExitCode -eq 0) "safe update snapshot failed; $(Get-TestOutputDiagnostic $snapshotResult.Output)"
     $safeBackups = @(Get-ChildItem -LiteralPath (Join-Path $safeUpdateCase "clash-patch-backups") -File | Where-Object { $_.Name -like "*--pre-update--*" })
     Assert-True ($safeBackups.Count -eq 2) "snapshot did not back up exactly the two remote subscriptions"
+    $pendingSafeUpdateBeforeUninstall = Get-TreeContentSnapshot $safeUpdateCase
+    $pendingSafeUpdateUninstall = Invoke-TestPowerShell $uninstaller @(
+        "-AppHome", $safeUpdateCase,
+        "-Json"
+    )
+    $pendingSafeUpdateUninstallJson = Assert-JsonResult $pendingSafeUpdateUninstall "uninstall" 1
+    Assert-True (
+        $pendingSafeUpdateUninstallJson.status -eq "partial" -and
+        $pendingSafeUpdateUninstallJson.code -eq "safe_update_pending"
+    ) "pending safe update uninstall did not return a retryable result"
+    Assert-True (
+        @($pendingSafeUpdateUninstallJson.changes).Count -eq 0
+    ) "pending safe update uninstall reported committed changes"
+    Assert-True (
+        (Get-TreeContentSnapshot $safeUpdateCase) -ceq $pendingSafeUpdateBeforeUninstall
+    ) "pending safe update uninstall changed AppHome"
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), "changed: true`n")
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), "first: true`n---`nsecond: true`n")
     $verifyResult = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-VerifySafeUpdate", "-MihomoPath", $fakeCore)

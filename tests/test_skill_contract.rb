@@ -1179,6 +1179,49 @@ class SkillContractTest < Minitest::Test
     documents.each { |document| assert_includes document, "提交条件" }
   end
 
+  def test_windows_uninstall_preserves_a_pending_safe_update
+    uninstaller = File.binread(
+      File.join(SKILL, "scripts/uninstall_windows.ps1")
+    ).force_encoding("UTF-8")
+    windows_tests = File.binread(
+      File.join(ROOT, "tests/test_windows_installer.ps1")
+    ).force_encoding("UTF-8")
+
+    lock = uninstaller.index("$mutationLock = Enter-AppHomeMutationLock $AppHome")
+    pending_snapshot = uninstaller.index(
+      'Get-OptionalFileSnapshot $safeUpdateStatePath "安全更新准备记录"'
+    )
+    install_state_snapshot = uninstaller.index(
+      'Get-OptionalFileSnapshot $statePath "安装状态"'
+    )
+    refute_nil lock
+    refute_nil pending_snapshot
+    refute_nil install_state_snapshot
+    assert_operator lock, :<, pending_snapshot
+    assert_operator pending_snapshot, :<, install_state_snapshot
+    assert_includes uninstaller,
+                    "if ($safeUpdateStateSnapshot.Exists) {\n" \
+                    "        Complete-PendingSafeUpdateUninstall\n" \
+                    "    }"
+    assert_includes uninstaller, '"partial" "safe_update_pending"'
+    assert_includes windows_tests,
+                    "pending safe update uninstall changed AppHome"
+
+    documents = [
+      File.read(File.join(ROOT, "README.md")),
+      File.read(File.join(SKILL, "SKILL.md")),
+      File.read(File.join(SKILL, "references/patch-policy.md")),
+      File.read(
+        File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md")
+      ),
+      File.read(File.join(ROOT, "tests/baseline.md"))
+    ]
+    documents.each do |document|
+      assert_includes document, "尚未验收"
+      assert_includes document, "safe_update_pending"
+    end
+  end
+
   def test_installers_preflight_and_uninstallers_restore_owned_settings
     mac_install = File.read(File.join(SKILL, "scripts/install_macos.sh"))
     mac_uninstall = File.read(File.join(SKILL, "scripts/uninstall_macos.sh"))

@@ -613,6 +613,28 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_uninstall_pending_safe_update_guard_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/uninstall_windows.ps1",
+        "    if ($safeUpdateStateSnapshot.Exists) {\n" \
+          "        Complete-PendingSafeUpdateUninstall\n" \
+          "    }\n",
+        "    if ($false) {\n" \
+          "        Complete-PendingSafeUpdateUninstall\n" \
+          "    }\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name",
+        "test_windows_uninstall_preserves_a_pending_safe_update"
+      )
+    end
+  end
+
   def test_ruby_automatic_route_group_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

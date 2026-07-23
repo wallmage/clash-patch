@@ -55,6 +55,11 @@ function Complete-RunningClientUninstall {
     Complete-UninstallResult 1 "partial" "client_running" "客户端保持运行，本次卸载未修改受保护文件或状态。" @() @("以后检测到客户端未运行时，可再次执行安全卸载。")
 }
 
+function Complete-PendingSafeUpdateUninstall {
+    Write-Info "发现尚未验收的安全更新；本次没有修改任何文件。请先完成安全更新验收或恢复，再重试卸载。"
+    Complete-UninstallResult 1 "partial" "safe_update_pending" "发现尚未验收的安全更新，本次卸载未修改任何文件。" @() @("请先运行安全更新验收，完成或恢复整批订阅后再重试卸载。")
+}
+
 function New-UninstallBackup([string]$Path) {
     $backupRoot = $script:ClashPatchUninstallBackupRoot
     if ([string]::IsNullOrWhiteSpace([string]$backupRoot)) {
@@ -143,6 +148,7 @@ $configPath = Join-Path $AppHome "config.yaml"
 $statePath = Join-Path $AppHome "clash-patch-install-state.json"
 $autoUpdateStatePath = Join-Path $AppHome "clash-patch-auto-update-state.json"
 $usageStatePath = Join-Path $AppHome "clash-patch-usage-profile.json"
+$safeUpdateStatePath = Join-Path $AppHome "clash-patch-safe-update.json"
 $script:ClashPatchUninstallBackupRoot = Join-Path $AppHome "clash-patch-backups"
 $state = $null
 
@@ -155,6 +161,10 @@ try {
 
 try {
 try {
+    $safeUpdateStateSnapshot = Get-OptionalFileSnapshot $safeUpdateStatePath "安全更新准备记录"
+    if ($safeUpdateStateSnapshot.Exists) {
+        Complete-PendingSafeUpdateUninstall
+    }
     $clientRunning = Test-ClashVergeRunning
     $stateSnapshot = Get-OptionalFileSnapshot $statePath "安装状态"
     $autoUpdateStateSnapshot = Get-OptionalFileSnapshot $autoUpdateStatePath "订阅自动更新所有权状态"
