@@ -1,9 +1,26 @@
 ﻿param(
     [Parameter(Mandatory = $true)]
-    [string]$PowerShellPath
+    [string]$PowerShellPath,
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("Desktop", "Core")]
+    [string]$ExpectedPSEdition,
+    [Parameter(Mandatory = $true)]
+    [ValidateSet(5, 7)]
+    [int]$ExpectedPSMajor
 )
 
 $ErrorActionPreference = "Stop"
+if ($PSVersionTable.PSEdition -ne $ExpectedPSEdition -or
+    $PSVersionTable.PSVersion.Major -ne $ExpectedPSMajor) {
+    throw "test host runtime mismatch: expected $ExpectedPSEdition $ExpectedPSMajor, got $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)"
+}
+$childVersionOutput = & $PowerShellPath -NoLogo -NoProfile -Command '[pscustomobject]@{ PSEdition = $PSVersionTable.PSEdition; Major = $PSVersionTable.PSVersion.Major } | ConvertTo-Json -Compress'
+if ($LASTEXITCODE -ne 0) { throw "PowerShellPath version probe failed" }
+$childVersion = $childVersionOutput | ConvertFrom-Json
+if ([string]$childVersion.PSEdition -ne $ExpectedPSEdition -or
+    [int]$childVersion.Major -ne $ExpectedPSMajor) {
+    throw "PowerShellPath runtime mismatch: expected $ExpectedPSEdition $ExpectedPSMajor"
+}
 $root = Split-Path -Parent $PSScriptRoot
 $installer = Join-Path (Join-Path $root "clash-patch/scripts") "install_windows.ps1"
 $uninstaller = Join-Path (Join-Path $root "clash-patch/scripts") "uninstall_windows.ps1"
@@ -15,6 +32,9 @@ $installerModuleRoot = Join-Path (Join-Path $root "clash-patch/scripts/windows")
 $installerModules = @(
     "common.ps1", "yaml.ps1", "profiles.ps1", "mihomo.ps1",
     "transaction.ps1", "script_js.ps1", "safe_update.ps1"
+) | ForEach-Object { Join-Path $installerModuleRoot $_ }
+$uninstallerModules = @(
+    "yaml.ps1", "profiles.ps1", "transaction.ps1", "script_js.ps1"
 ) | ForEach-Object { Join-Path $installerModuleRoot $_ }
 $sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("clash-patch-windows-test-" + [System.Guid]::NewGuid().ToString("N"))
 $onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
@@ -248,6 +268,42 @@ $uninstallTokens = $null
 $uninstallParseErrors = $null
 $uninstallAst = [System.Management.Automation.Language.Parser]::ParseFile($uninstaller, [ref]$uninstallTokens, [ref]$uninstallParseErrors)
 if ($uninstallParseErrors.Count -gt 0) { throw ($uninstallParseErrors | Out-String) }
+$uninstallerSource = Get-Content -LiteralPath $uninstaller -Raw
+foreach ($stateBinding in @(
+    [pscustomobject]@{ Variable = "statePath"; Label = "install state" },
+    [pscustomobject]@{ Variable = "autoUpdateStatePath"; Label = "auto-update state" },
+    [pscustomobject]@{ Variable = "usageStatePath"; Label = "usage state" }
+)) {
+    $escapedVariable = [regex]::Escape($stateBinding.Variable)
+    if ([regex]::Matches($uninstallerSource, "Get-OptionalFileSnapshot\s+\`$$escapedVariable\b").Count -ne 1) {
+        throw "uninstaller does not bind $($stateBinding.Label) parsing and deletion to one snapshot"
+    }
+    if ($uninstallerSource -match "(?m)Get-Content[^\r\n]*\`$$escapedVariable\b|ReadAllBytes\(\`$$escapedVariable\)") {
+        throw "uninstaller reads $($stateBinding.Label) again after taking its snapshot"
+    }
+}
+$uninstallerEntryFunctionNames = @($uninstallAst.FindAll({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+}, $true) | ForEach-Object { $_.Name })
+foreach ($uninstallerModule in $uninstallerModules) {
+    $uninstallerModuleTokens = $null
+    $uninstallerModuleErrors = $null
+    $uninstallerModuleAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $uninstallerModule,
+        [ref]$uninstallerModuleTokens,
+        [ref]$uninstallerModuleErrors
+    )
+    if ($uninstallerModuleErrors.Count -gt 0) { throw ($uninstallerModuleErrors | Out-String) }
+    foreach ($moduleFunction in @($uninstallerModuleAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+    }, $true))) {
+        if ($uninstallerEntryFunctionNames -contains $moduleFunction.Name) {
+            throw "uninstaller duplicates imported module function: $($moduleFunction.Name)"
+        }
+    }
+}
 $uninstallAst.FindAll({
     param($node)
     $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "New-UninstallBackup"
@@ -257,6 +313,24 @@ $uninstallAst.FindAll({
 
 function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
+}
+
+function Get-TreeContentSnapshot([string]$Path) {
+    $rootPath = [System.IO.Path]::GetFullPath($Path).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    return (@(Get-ChildItem -LiteralPath $rootPath -Force -Recurse | Sort-Object FullName | ForEach-Object {
+        $relative = $_.FullName.Substring($rootPath.Length).TrimStart(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        )
+        if ($_.PSIsContainer) {
+            "D:$relative"
+        } else {
+            "F:${relative}:" + [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($_.FullName))
+        }
+    })) -join "`n")
 }
 
 function Assert-JsonResult([object]$Invocation, [string]$Command, [int]$ExitCode) {
@@ -357,6 +431,62 @@ try {
         $uninstallWrapperOutput = & $uninstallWrapper -AppHome $wrapperCase 2>&1 | Out-String
         Assert-True ($LASTEXITCODE -eq 0) "uninstall_windows.cmd did not propagate a successful exit: $uninstallWrapperOutput"
         Assert-True (Test-Path -LiteralPath $wrapperBackup -PathType Leaf) "uninstall_windows.cmd deleted configuration history"
+
+        $mutexCase = Join-Path $sandbox "app-home-mutex-case"
+        $mutexReadyPath = Join-Path $sandbox "app-home-mutex.ready"
+        $mutexHolderPath = Join-Path $sandbox "app-home-mutex-holder.ps1"
+        New-Item -ItemType Directory -Path $mutexCase -Force | Out-Null
+        [System.IO.File]::WriteAllText(
+            (Join-Path $mutexCase "profiles.yaml"),
+            "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n"
+        )
+        $mutexHolderSource = @'
+param(
+    [string]$ModulePath,
+    [string]$AppHome,
+    [string]$ReadyPath
+)
+. $ModulePath
+$held = Enter-AppHomeMutationLock $AppHome
+try {
+    [System.IO.File]::WriteAllText($ReadyPath, "ready")
+    Start-Sleep -Seconds 10
+} finally {
+    Exit-AppHomeMutationLock $held
+}
+'@
+        [System.IO.File]::WriteAllText($mutexHolderPath, $mutexHolderSource, [System.Text.Encoding]::ASCII)
+        $mutexHolder = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+            "-NoLogo", "-NoProfile", "-File", $mutexHolderPath,
+            "-ModulePath", (Join-Path $installerModuleRoot "transaction.ps1"),
+            "-AppHome", $mutexCase,
+            "-ReadyPath", $mutexReadyPath
+        ) -PassThru
+        try {
+            $mutexDeadline = [DateTime]::UtcNow.AddSeconds(5)
+            while (-not (Test-Path -LiteralPath $mutexReadyPath -PathType Leaf) -and
+                [DateTime]::UtcNow -lt $mutexDeadline) {
+                Start-Sleep -Milliseconds 25
+            }
+            Assert-True (Test-Path -LiteralPath $mutexReadyPath -PathType Leaf) "mutex holder did not acquire the AppHome lock"
+            $mutexBefore = Get-TreeContentSnapshot $mutexCase
+            $mutexInstall = Invoke-TestPowerShell $installer @(
+                "-AppHome", $mutexCase,
+                "-UsageProfile", "1",
+                "-MihomoPath", $fakeCore,
+                "-Json"
+            )
+            $mutexInstallJson = Assert-JsonResult $mutexInstall "install" 1
+            Assert-True ($mutexInstallJson.code -eq "operation_in_progress") "parallel install did not report the shared AppHome lock"
+            Assert-True ((Get-TreeContentSnapshot $mutexCase) -ceq $mutexBefore) "rejected parallel install changed AppHome"
+
+            $mutexUninstall = Invoke-TestPowerShell $uninstaller @("-AppHome", $mutexCase, "-Json")
+            $mutexUninstallJson = Assert-JsonResult $mutexUninstall "uninstall" 1
+            Assert-True ($mutexUninstallJson.code -eq "operation_in_progress") "parallel uninstall did not share the installer AppHome lock"
+            Assert-True ((Get-TreeContentSnapshot $mutexCase) -ceq $mutexBefore) "rejected parallel uninstall changed AppHome"
+        } finally {
+            if (-not $mutexHolder.HasExited) { Stop-Process -Id $mutexHolder.Id -Force }
+        }
     }
     [System.IO.File]::WriteAllText($hangingCore, $hangingCoreText, [System.Text.Encoding]::ASCII)
     if (-not $onWindows) { & /bin/chmod 700 $hangingCore }
@@ -549,7 +679,26 @@ public static class FakeCurl {
     }
 }
 '@
-        Add-Type -TypeDefinition $fakeCurlSource -Language CSharp -OutputAssembly $fakeCurlPath -OutputType ConsoleApplication
+        $fakeCurlSourcePath = Join-Path $fakeCurlDirectory "FakeCurl.cs"
+        [System.IO.File]::WriteAllText(
+            $fakeCurlSourcePath,
+            $fakeCurlSource,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $compilerCandidates = @(
+            (Join-Path $env:WINDIR "Microsoft.NET/Framework64/v4.0.30319/csc.exe"),
+            (Join-Path $env:WINDIR "Microsoft.NET/Framework/v4.0.30319/csc.exe")
+        )
+        $csharpCompiler = $compilerCandidates |
+            Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+            Select-Object -First 1
+        if ([string]::IsNullOrWhiteSpace($csharpCompiler)) {
+            throw "Windows C# compiler was not found"
+        }
+        & $csharpCompiler /nologo /target:exe "/out:$fakeCurlPath" $fakeCurlSourcePath
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $fakeCurlPath -PathType Leaf)) {
+            throw "failed to compile fake curl.exe"
+        }
         $previousPath = $env:PATH
         $previousCurlArgsPath = $env:CLASH_PATCH_TEST_CURL_ARGS_PATH
         try {
@@ -697,6 +846,128 @@ items:
     Assert-True ((Set-RemoteSubscriptionAutoUpdateDisabled $profilesIndexOutput) -eq $profilesIndexOutput) "profiles.yaml transform is not idempotent"
     Assert-RemoteSubscriptionAutoUpdateDisabled $profilesIndexOutput
 
+    $ownershipInput = @'
+current: R-a
+items:
+- uid: R-a
+  type: remote
+  option:
+    allow_auto_update: true
+- uid: R-b
+  type: remote
+  option:
+    allow_auto_update: false
+- uid: R-c
+  type: remote
+  name: Third
+- uid: L-local
+  type: local
+  option:
+    allow_auto_update: true
+'@
+    $autoUpdateOwnership = @(Get-RemoteSubscriptionAutoUpdateOwnership $ownershipInput)
+    Assert-True ($autoUpdateOwnership.Count -eq 2) "auto-update ownership included an unchanged remote item"
+    Assert-True (($autoUpdateOwnership | Where-Object { $_.Uid -eq "R-a" }).OriginalState -eq "true") "auto-update ownership lost an originally enabled item"
+    Assert-True (($autoUpdateOwnership | Where-Object { $_.Uid -eq "R-c" }).OriginalState -eq "missing") "auto-update ownership lost an originally missing field"
+    $ownershipDisabled = Set-RemoteSubscriptionAutoUpdateDisabled $ownershipInput
+    $ownershipCurrent = $ownershipDisabled.Replace("current: R-a", "current: R-a`nlast_update: 12345")
+    $ownershipRestored = Restore-RemoteSubscriptionAutoUpdate $ownershipCurrent $autoUpdateOwnership
+    $restoredStates = @(Get-RemoteSubscriptionAutoUpdateStateRecords $ownershipRestored)
+    Assert-True (($restoredStates | Where-Object { $_.Uid -eq "R-a" }).State -eq "true") "owned auto-update did not restore an originally enabled item"
+    Assert-True (($restoredStates | Where-Object { $_.Uid -eq "R-b" }).State -eq "false") "owned auto-update changed an item that was already disabled"
+    Assert-True (($restoredStates | Where-Object { $_.Uid -eq "R-c" }).State -eq "missing") "owned auto-update did not remove its inserted field"
+    Assert-True ($ownershipRestored.Contains("last_update: 12345")) "owned auto-update restore discarded unrelated client metadata"
+    Assert-True (($restoredStates | Where-Object { $_.Uid -eq "L-local" }).State -eq "true") "owned auto-update restore changed a local profile"
+
+    $ownershipShapeInput = @'
+items:
+- uid: R-absent
+  type: remote
+- uid: R-null
+  type: remote
+  option: null # keep null
+- uid: R-tilde
+  type: remote
+  option: ~
+- uid: R-empty
+  type: remote
+  option: {}
+- uid: R-block
+  type: remote
+  option: # keep block
+    update_interval: 60
+'@
+    $ownershipShapeRecords = @(Get-RemoteSubscriptionAutoUpdateOwnership $ownershipShapeInput)
+    Assert-True ($ownershipShapeRecords.Count -eq 5) "auto-update ownership missed a supported missing-field shape"
+    $ownershipShapeDisabled = Set-RemoteSubscriptionAutoUpdateDisabled $ownershipShapeInput
+    $ownershipShapeRestored = Restore-RemoteSubscriptionAutoUpdate $ownershipShapeDisabled $ownershipShapeRecords
+    $ownershipShapeExpected = Join-YamlLines -Lines @(Split-YamlLines $ownershipShapeInput)
+    Assert-True ($ownershipShapeRestored -ceq $ownershipShapeExpected) "auto-update restore did not reconstruct the original absent/null/tilde/empty-map shapes"
+
+    $corruptOwnershipInput = "items:`n- uid: R-corrupt`n  type: remote`n  option: null`n"
+    $corruptOwnershipDisabled = Set-RemoteSubscriptionAutoUpdateDisabled $corruptOwnershipInput
+    foreach ($corruptOptionLine in @(
+        "option: null",
+        " option: null",
+        "      option: null",
+        "  option:`tnull",
+        "  wrong: null",
+        "  option: null`0"
+    )) {
+        $corruptOwnership = @(
+            [pscustomobject]@{
+                Uid = "R-corrupt"
+                OriginalState = "missing"
+                OriginalOptionBase64 = [Convert]::ToBase64String(
+                    [System.Text.Encoding]::UTF8.GetBytes($corruptOptionLine)
+                )
+            }
+        )
+        $corruptOwnershipRejected = $false
+        try {
+            Restore-RemoteSubscriptionAutoUpdate $corruptOwnershipDisabled $corruptOwnership | Out-Null
+        } catch {
+            $corruptOwnershipRejected = $true
+        }
+        Assert-True $corruptOwnershipRejected "auto-update restore trusted a corrupt original option line: $corruptOptionLine"
+        Assert-True (
+            $corruptOwnershipDisabled -ceq (Set-RemoteSubscriptionAutoUpdateDisabled $corruptOwnershipInput)
+        ) "corrupt auto-update ownership mutated the input before rejection"
+    }
+
+    $ownershipMetadataInput = "items:`n- uid: R-metadata`n  type: remote`n"
+    $ownershipMetadataRecords = @(Get-RemoteSubscriptionAutoUpdateOwnership $ownershipMetadataInput)
+    $ownershipMetadataDisabled = Set-RemoteSubscriptionAutoUpdateDisabled $ownershipMetadataInput
+    $ownershipMetadataCurrent = $ownershipMetadataDisabled.Replace(
+        "    allow_auto_update: false",
+        "    last_update: 67890`r`n    allow_auto_update: false"
+    )
+    $ownershipMetadataRestored = Restore-RemoteSubscriptionAutoUpdate $ownershipMetadataCurrent $ownershipMetadataRecords
+    Assert-True ($ownershipMetadataRestored.Contains("last_update: 67890")) "auto-update restore discarded metadata added beneath a managed option block"
+    Assert-True ($ownershipMetadataRestored -notmatch '(?m)^\s+allow_auto_update:') "auto-update restore retained its inserted field after client metadata appeared"
+
+    $aliasOwnershipRejected = $false
+    try {
+        Get-RemoteSubscriptionAutoUpdateOwnership @'
+items:
+- uid: Case-Alias
+  type: remote
+- uid: case-alias
+  type: remote
+'@ | Out-Null
+    } catch { $aliasOwnershipRejected = $true }
+    Assert-True $aliasOwnershipRejected "case-colliding remote subscription uids produced ambiguous ownership"
+
+    $aliasMergeRejected = $false
+    try {
+        Merge-RemoteSubscriptionAutoUpdateOwnership @(
+            [pscustomobject]@{ Uid = "Case-Alias"; OriginalState = "true"; OriginalOptionBase64 = "b3B0aW9uOg==" }
+        ) @(
+            [pscustomobject]@{ Uid = "case-alias"; OriginalState = "missing"; OriginalOptionBase64 = "" }
+        ) | Out-Null
+    } catch { $aliasMergeRejected = $true }
+    Assert-True $aliasMergeRejected "ownership merge silently collapsed case-colliding subscription uids"
+
     $nestedProfilesInput = @'
 items:
 - uid: R-nested
@@ -807,6 +1078,73 @@ items:
     Assert-True ($concurrentRestore.Conflicts.Count -eq 1) "safe update rollback did not detect a concurrent subscription change"
     Assert-True ((Get-Content -LiteralPath $concurrentTarget -Raw) -eq "newer: true`n") "safe update rollback overwrote a concurrent subscription change"
 
+    $batchFirstTarget = Join-Path $safeUpdateProfiles "batch-first.yaml"
+    $batchFirstBackup = Join-Path $safeUpdateProfiles "batch-first.backup"
+    $batchSecondTarget = Join-Path $safeUpdateProfiles "batch-second.yaml"
+    $batchSecondBackup = Join-Path $safeUpdateProfiles "batch-second.backup"
+    [System.IO.File]::WriteAllText($batchFirstTarget, "first-updated: true`n")
+    [System.IO.File]::WriteAllText($batchFirstBackup, "first-before: true`n")
+    [System.IO.File]::WriteAllText($batchSecondTarget, "second-concurrent: true`n")
+    [System.IO.File]::WriteAllText($batchSecondBackup, "second-before: true`n")
+    $batchRecoveryItems = @(
+        [pscustomobject]@{
+            File = "batch-first.yaml"
+            TargetPath = $batchFirstTarget
+            BackupPath = $batchFirstBackup
+            BeforeSha256 = Get-FileSha256 $batchFirstBackup
+        },
+        [pscustomobject]@{
+            File = "batch-second.yaml"
+            TargetPath = $batchSecondTarget
+            BackupPath = $batchSecondBackup
+            BeforeSha256 = Get-FileSha256 $batchSecondBackup
+        }
+    )
+    $batchObservedHashes = @{
+        $batchFirstTarget = Get-FileSha256 $batchFirstTarget
+        $batchSecondTarget = Get-BytesSha256 ([System.Text.Encoding]::UTF8.GetBytes("second-observed: true`n"))
+    }
+    $batchRestore = Restore-SafeUpdateFiles $batchRecoveryItems $batchObservedHashes
+    Assert-True ($batchRestore.Conflicts.Count -eq 1) "safe update rollback missed a conflict in the second item"
+    Assert-True ((Get-Content -LiteralPath $batchFirstTarget -Raw) -eq "first-updated: true`n") "safe update rollback partially restored the first item before finding a later conflict"
+    Assert-True ((Get-Content -LiteralPath $batchSecondTarget -Raw) -eq "second-concurrent: true`n") "safe update rollback changed the conflicting second item"
+
+    $badBackupTarget = Join-Path $safeUpdateProfiles "bad-backup-target.yaml"
+    $badBackupPath = Join-Path $safeUpdateProfiles "bad-backup.backup"
+    [System.IO.File]::WriteAllText($badBackupTarget, "still-valid: true`n")
+    [System.IO.File]::WriteAllText($badBackupPath, "original: true`n")
+    $badBackupExpectedSha = Get-FileSha256 $badBackupPath
+    $badBackupObservedHashes = @{ $badBackupTarget = (Get-FileSha256 $badBackupTarget) }
+    [System.IO.File]::WriteAllText($badBackupPath, "corrupt: true`n")
+    $badBackupRecovery = [pscustomobject]@{
+        File = "bad-backup-target.yaml"
+        TargetPath = $badBackupTarget
+        BackupPath = $badBackupPath
+        BeforeSha256 = $badBackupExpectedSha
+    }
+    $badBackupRestore = Restore-SafeUpdateFiles @($badBackupRecovery) $badBackupObservedHashes
+    Assert-True ($badBackupRestore.Failures.Count -eq 1) "safe update rollback accepted backup bytes that changed after validation"
+    Assert-True ((Get-Content -LiteralPath $badBackupTarget -Raw) -eq "still-valid: true`n") "corrupt backup overwrote a still-valid subscription before rejection"
+
+    $internalRestoreCase = Join-Path $sandbox "internal-state-restore-case"
+    $internalRestoreBackupRoot = Join-Path $internalRestoreCase "clash-patch-backups"
+    $internalUsagePath = Join-Path $internalRestoreCase "clash-patch-usage-profile.json"
+    New-Item -ItemType Directory -Path $internalRestoreCase -Force | Out-Null
+    [System.IO.File]::WriteAllText($internalUsagePath, '{"Version":1,"Profile":3}')
+    $internalUsageBackup = Backup-Versioned $internalUsagePath $internalRestoreBackupRoot "prewrite"
+    [System.IO.File]::WriteAllText($internalUsagePath, '{"Version":1,"Profile":2}')
+    $internalUsageBeforeRestore = [System.IO.File]::ReadAllBytes($internalUsagePath)
+    $internalRestoreResult = Invoke-TestPowerShell $installer @(
+        "-AppHome", $internalRestoreCase,
+        "-RestoreBackup", (Split-Path -Leaf $internalUsageBackup),
+        "-MihomoPath", $fakeCore
+    )
+    Assert-True ($internalRestoreResult.ExitCode -eq 1) "public backup restore accepted an internal state file"
+    Assert-True (
+        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($internalUsagePath)) -eq
+        [Convert]::ToBase64String($internalUsageBeforeRestore)
+    ) "rejected internal state restore changed the current state"
+
     $beforeComparison = "dns:`n  nameserver:`n    - https://old-secret.invalid/dns-query`nrules:`n  - MATCH,OldSecret`nipv6: true`n"
     $afterComparison = "dns:`n  nameserver:`n    - https://new-secret.invalid/dns-query`nrules:`n  - MATCH,NewSecret`n  - GEOSITE,CN,DIRECT`ninvalid-key: kept`n"
     $changedFields = @(Get-RedactedYamlChangedPaths $beforeComparison $afterComparison)
@@ -895,39 +1233,160 @@ items:
 
     $transactionDir = Join-Path $sandbox "transaction"
     New-Item -ItemType Directory -Path $transactionDir -Force | Out-Null
-    $existingPath = Join-Path $transactionDir "existing.txt"
-    $newPath = Join-Path $transactionDir "new.txt"
-    $originalBytes = [byte[]](0xEF, 0xBB, 0xBF, 0x6F, 0x72, 0x69, 0x67, 0x69, 0x6E, 0x61, 0x6C)
-    [System.IO.File]::WriteAllBytes($existingPath, $originalBytes)
-    [System.IO.File]::WriteAllText($existingPath, "changed")
-    [System.IO.File]::WriteAllText($newPath, "created")
-    Restore-Transaction @(
-        [pscustomobject]@{ Path = $existingPath; Existed = $true; OriginalBytes = $originalBytes },
-        [pscustomobject]@{ Path = $newPath; Existed = $false; OriginalBytes = $null }
-    )
-    Assert-True (([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($existingPath))) -eq ([Convert]::ToBase64String($originalBytes))) "transaction did not restore exact original bytes"
-    Assert-True (-not (Test-Path -LiteralPath $newPath)) "transaction did not remove newly created file"
-
-    $continuePath = Join-Path $transactionDir "continue.txt"
-    [System.IO.File]::WriteAllText($continuePath, "changed")
-    $restoreFailed = $false
+    $stateSnapshotPath = Join-Path $transactionDir "state-snapshot.json"
+    $stateSnapshotBytes = [System.Text.Encoding]::UTF8.GetBytes('{"Version":1}')
+    [System.IO.File]::WriteAllBytes($stateSnapshotPath, $stateSnapshotBytes)
+    $stateSnapshot = Get-OptionalFileSnapshot $stateSnapshotPath "test state"
+    [System.IO.File]::WriteAllText($stateSnapshotPath, "changed-after-read")
+    Assert-True $stateSnapshot.Exists "optional state snapshot missed an existing file"
+    Assert-True (
+        [Convert]::ToBase64String($stateSnapshot.Bytes) -eq [Convert]::ToBase64String($stateSnapshotBytes)
+    ) "optional state snapshot did not retain the exact bytes it parsed"
+    $missingStateSnapshot = Get-OptionalFileSnapshot (Join-Path $transactionDir "missing-state.json") "missing state"
+    Assert-True (-not $missingStateSnapshot.Exists) "optional state snapshot invented a missing file"
+    $stateDirectoryPath = Join-Path $transactionDir "state-directory"
+    New-Item -ItemType Directory -Path $stateDirectoryPath -Force | Out-Null
+    $stateDirectoryRejected = $false
+    try { Get-OptionalFileSnapshot $stateDirectoryPath "directory state" | Out-Null } catch { $stateDirectoryRejected = $true }
+    Assert-True $stateDirectoryRejected "optional state snapshot treated a directory as missing state"
+    $stateBindingEntry = [pscustomobject]@{
+        Existed = $true
+        OriginalBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes("pre-install"))
+        InstalledSha256 = Get-BytesSha256 ([System.Text.Encoding]::UTF8.GetBytes("installed-a"))
+    }
+    $stateBindingSnapshot = [pscustomobject]@{
+        Exists = $true
+        Bytes = [System.Text.Encoding]::UTF8.GetBytes("installed-b")
+    }
+    $stateBindingRejected = $false
+    try { Assert-StateSnapshotUnchanged $stateBindingEntry $stateBindingSnapshot "state binding" } catch {
+        $stateBindingRejected = $true
+    }
+    Assert-True $stateBindingRejected "reinstall accepted a snapshot that did not match the saved installed version"
+    $stateSnapshotWritePath = Join-Path $transactionDir "state-snapshot-write.txt"
+    $stateSnapshotWriteOriginal = [System.Text.Encoding]::UTF8.GetBytes("state-write-original")
+    [System.IO.File]::WriteAllBytes($stateSnapshotWritePath, $stateSnapshotWriteOriginal)
+    $stateSnapshotWriteIdentity = (Get-OptionalFileSnapshot $stateSnapshotWritePath "state snapshot write").Identity
+    $staleStateSnapshotRejected = $false
     try {
-        Restore-Transaction @(
-            [pscustomobject]@{ Path = $continuePath; Existed = $true; OriginalBytes = [System.Text.Encoding]::UTF8.GetBytes("restored") },
-            [pscustomobject]@{ Path = $transactionDir; Existed = $true; OriginalBytes = [byte[]](1, 2, 3) }
+        Invoke-VerifiedWriteDeleteTransaction @(
+            [pscustomobject]@{
+                Path = $stateSnapshotWritePath
+                Bytes = [System.Text.Encoding]::UTF8.GetBytes("state-write-new")
+                Existed = $true
+                OriginalBytes = $stateSnapshotWriteOriginal
+                OriginalIdentity = $stateSnapshotWriteIdentity
+            }
+        ) @(
+            [pscustomobject]@{
+                Path = $stateSnapshotPath
+                Existed = $true
+                OriginalBytes = $stateSnapshot.Bytes
+                OriginalIdentity = $stateSnapshot.Identity
+            }
         )
-    } catch { $restoreFailed = $true }
-    Assert-True $restoreFailed "rollback did not report a restore failure"
-    Assert-True ((Get-Content -LiteralPath $continuePath -Raw) -eq "restored") "rollback stopped before restoring earlier targets"
+    } catch { $staleStateSnapshotRejected = $true }
+    Assert-True $staleStateSnapshotRejected "transaction deleted a newer state file using an older parsed snapshot"
+    Assert-True ((Get-Content -LiteralPath $stateSnapshotPath -Raw) -eq "changed-after-read") "stale state rejection changed the newer state file"
+    Assert-True ((Get-Content -LiteralPath $stateSnapshotWritePath -Raw) -eq "state-write-original") "stale state rejection changed an unrelated write target"
+
+    if ($onWindows) {
+        $outsideTransactionDir = Join-Path $sandbox "outside-transaction"
+        $junctionPath = Join-Path $transactionDir "junction"
+        $outsideSentinelPath = Join-Path $outsideTransactionDir "sentinel.txt"
+        New-Item -ItemType Directory -Path $outsideTransactionDir -Force | Out-Null
+        [System.IO.File]::WriteAllText($outsideSentinelPath, "outside-original")
+        New-Item -ItemType Junction -Path $junctionPath -Target $outsideTransactionDir | Out-Null
+        $junctionRejected = $false
+        try {
+            Invoke-VerifiedFileTransaction @(
+                [pscustomobject]@{
+                    Path = Join-Path $junctionPath "sentinel.txt"
+                    Bytes = [System.Text.Encoding]::UTF8.GetBytes("outside-overwritten")
+                    Existed = $true
+                    OriginalBytes = [System.Text.Encoding]::UTF8.GetBytes("outside-original")
+                }
+            )
+        } catch { $junctionRejected = $true }
+        Assert-True $junctionRejected "transaction followed a directory junction outside its expected tree"
+        Assert-True ((Get-Content -LiteralPath $outsideSentinelPath -Raw) -eq "outside-original") "junction rejection did not preserve the outside sentinel"
+
+        $hardLinkSourcePath = Join-Path $transactionDir "hardlink-source.txt"
+        $hardLinkAliasPath = Join-Path $transactionDir "hardlink-alias.txt"
+        [System.IO.File]::WriteAllText($hardLinkSourcePath, "hardlink-original")
+        New-Item -ItemType HardLink -Path $hardLinkAliasPath -Target $hardLinkSourcePath | Out-Null
+        $hardLinkRejected = $false
+        try {
+            Invoke-VerifiedFileTransaction @(
+                [pscustomobject]@{
+                    Path = $hardLinkAliasPath
+                    Bytes = [System.Text.Encoding]::UTF8.GetBytes("hardlink-overwritten")
+                    Existed = $true
+                    OriginalBytes = [System.Text.Encoding]::UTF8.GetBytes("hardlink-original")
+                }
+            )
+        } catch { $hardLinkRejected = $true }
+        Assert-True $hardLinkRejected "transaction modified a file with a hard-link alias"
+        Assert-True ((Get-Content -LiteralPath $hardLinkSourcePath -Raw) -eq "hardlink-original") "hard-link rejection changed the aliased source"
+        Assert-True ((Get-Content -LiteralPath $hardLinkAliasPath -Raw) -eq "hardlink-original") "hard-link rejection changed the target alias"
+
+        $sameBytesWritePath = Join-Path $transactionDir "same-bytes-write.txt"
+        $sameBytesWriteReplacement = Join-Path $transactionDir "same-bytes-write-replacement.txt"
+        $sameBytes = [System.Text.Encoding]::UTF8.GetBytes("same-bytes")
+        [System.IO.File]::WriteAllBytes($sameBytesWritePath, $sameBytes)
+        $sameBytesWriteSnapshot = Get-OptionalFileSnapshot $sameBytesWritePath "same-bytes write"
+        [System.IO.File]::WriteAllBytes($sameBytesWriteReplacement, $sameBytes)
+        [System.IO.File]::Replace($sameBytesWriteReplacement, $sameBytesWritePath, $null)
+        $sameBytesWriteCurrent = Get-OptionalFileSnapshot $sameBytesWritePath "same-bytes replaced write"
+        Assert-True ($sameBytesWriteCurrent.Identity -cne $sameBytesWriteSnapshot.Identity) "same-bytes write fixture did not replace the file identity"
+        $sameBytesWriteRejected = $false
+        try {
+            Invoke-VerifiedFileTransaction @(
+                [pscustomobject]@{
+                    Path = $sameBytesWritePath
+                    Bytes = [System.Text.Encoding]::UTF8.GetBytes("must-not-write")
+                    Existed = $true
+                    OriginalBytes = $sameBytesWriteSnapshot.Bytes
+                    OriginalIdentity = $sameBytesWriteSnapshot.Identity
+                }
+            )
+        } catch { $sameBytesWriteRejected = $true }
+        Assert-True $sameBytesWriteRejected "transaction overwrote a same-content replacement with a different file identity"
+        Assert-True ((Get-Content -LiteralPath $sameBytesWritePath -Raw) -eq "same-bytes") "identity rejection changed the replacement write target"
+
+        $sameBytesDeletePath = Join-Path $transactionDir "same-bytes-delete.txt"
+        $sameBytesDeleteReplacement = Join-Path $transactionDir "same-bytes-delete-replacement.txt"
+        [System.IO.File]::WriteAllBytes($sameBytesDeletePath, $sameBytes)
+        $sameBytesDeleteSnapshot = Get-OptionalFileSnapshot $sameBytesDeletePath "same-bytes delete"
+        [System.IO.File]::WriteAllBytes($sameBytesDeleteReplacement, $sameBytes)
+        [System.IO.File]::Replace($sameBytesDeleteReplacement, $sameBytesDeletePath, $null)
+        $sameBytesDeleteCurrent = Get-OptionalFileSnapshot $sameBytesDeletePath "same-bytes replaced delete"
+        Assert-True ($sameBytesDeleteCurrent.Identity -cne $sameBytesDeleteSnapshot.Identity) "same-bytes delete fixture did not replace the file identity"
+        $sameBytesDeleteRejected = $false
+        try {
+            Invoke-VerifiedWriteDeleteTransaction @() @(
+                [pscustomobject]@{
+                    Path = $sameBytesDeletePath
+                    Existed = $true
+                    OriginalBytes = $sameBytesDeleteSnapshot.Bytes
+                    OriginalIdentity = $sameBytesDeleteSnapshot.Identity
+                }
+            )
+        } catch { $sameBytesDeleteRejected = $true }
+        Assert-True $sameBytesDeleteRejected "transaction deleted a same-content replacement with a different file identity"
+        Assert-True ((Get-Content -LiteralPath $sameBytesDeletePath -Raw) -eq "same-bytes") "identity rejection removed the replacement delete target"
+    }
 
     $verifiedTargetPath = Join-Path $transactionDir "verified-target.txt"
     $verifiedOriginal = [System.Text.Encoding]::UTF8.GetBytes("original")
     [System.IO.File]::WriteAllBytes($verifiedTargetPath, $verifiedOriginal)
+    $verifiedOriginalIdentity = (Get-OptionalFileSnapshot $verifiedTargetPath "verified target").Identity
     $verifiedTarget = [pscustomobject]@{
         Path = $verifiedTargetPath
         Bytes = [System.Text.Encoding]::UTF8.GetBytes("replacement")
         Existed = $true
         OriginalBytes = $verifiedOriginal
+        OriginalIdentity = $verifiedOriginalIdentity
     }
     [System.IO.File]::WriteAllText($verifiedTargetPath, "concurrent")
     $verifiedTransactionRejected = $false
@@ -941,6 +1400,8 @@ items:
     $rollbackTwoOriginal = [System.Text.Encoding]::UTF8.GetBytes("two-original")
     [System.IO.File]::WriteAllBytes($rollbackOnePath, $rollbackOneOriginal)
     [System.IO.File]::WriteAllBytes($rollbackTwoPath, $rollbackTwoOriginal)
+    $rollbackOneIdentity = (Get-OptionalFileSnapshot $rollbackOnePath "rollback one").Identity
+    $rollbackTwoIdentity = (Get-OptionalFileSnapshot $rollbackTwoPath "rollback two").Identity
     $savedWriteLockedStreamBytes = ${function:Write-LockedStreamBytes}
     $script:transactionWriteCallCount = 0
     try {
@@ -960,8 +1421,8 @@ items:
         $rollbackFailureMessage = ""
         try {
             Invoke-VerifiedFileTransaction @(
-                [pscustomobject]@{ Path = $rollbackOnePath; Bytes = [System.Text.Encoding]::UTF8.GetBytes("one-new"); Existed = $true; OriginalBytes = $rollbackOneOriginal },
-                [pscustomobject]@{ Path = $rollbackTwoPath; Bytes = [System.Text.Encoding]::UTF8.GetBytes("two-new"); Existed = $true; OriginalBytes = $rollbackTwoOriginal }
+                [pscustomobject]@{ Path = $rollbackOnePath; Bytes = [System.Text.Encoding]::UTF8.GetBytes("one-new"); Existed = $true; OriginalBytes = $rollbackOneOriginal; OriginalIdentity = $rollbackOneIdentity },
+                [pscustomobject]@{ Path = $rollbackTwoPath; Bytes = [System.Text.Encoding]::UTF8.GetBytes("two-new"); Existed = $true; OriginalBytes = $rollbackTwoOriginal; OriginalIdentity = $rollbackTwoIdentity }
             )
         } catch {
             $rollbackFailureMessage = $_.Exception.Message
@@ -972,6 +1433,242 @@ items:
     } finally {
         Set-Item -Path Function:\Write-LockedStreamBytes -Value $savedWriteLockedStreamBytes
         Remove-Variable -Name transactionWriteCallCount -Scope Script -ErrorAction SilentlyContinue
+    }
+
+    $deletePreflightWritePath = Join-Path $transactionDir "delete-preflight-write.txt"
+    $deletePreflightTargetPath = Join-Path $transactionDir "delete-preflight-target.txt"
+    $deletePreflightWriteBytes = [System.Text.Encoding]::UTF8.GetBytes("write-original")
+    $deletePreflightTargetBytes = [System.Text.Encoding]::UTF8.GetBytes("delete-original")
+    [System.IO.File]::WriteAllBytes($deletePreflightWritePath, $deletePreflightWriteBytes)
+    [System.IO.File]::WriteAllBytes($deletePreflightTargetPath, $deletePreflightTargetBytes)
+    $deletePreflightWriteIdentity = (Get-OptionalFileSnapshot $deletePreflightWritePath "delete preflight write").Identity
+    $deletePreflightTargetIdentity = (Get-OptionalFileSnapshot $deletePreflightTargetPath "delete preflight target").Identity
+    [System.IO.File]::WriteAllText($deletePreflightTargetPath, "delete-concurrent")
+    $deletePreflightRejected = $false
+    try {
+        Invoke-VerifiedWriteDeleteTransaction @(
+            [pscustomobject]@{
+                Path = $deletePreflightWritePath
+                Bytes = [System.Text.Encoding]::UTF8.GetBytes("write-replacement")
+                Existed = $true
+                OriginalBytes = $deletePreflightWriteBytes
+                OriginalIdentity = $deletePreflightWriteIdentity
+            }
+        ) @(
+            [pscustomobject]@{
+                Path = $deletePreflightTargetPath
+                Existed = $true
+                OriginalBytes = $deletePreflightTargetBytes
+                OriginalIdentity = $deletePreflightTargetIdentity
+            }
+        )
+    } catch { $deletePreflightRejected = $true }
+    Assert-True $deletePreflightRejected "write/delete transaction wrote files before validating every delete target"
+    Assert-True ((Get-Content -LiteralPath $deletePreflightWritePath -Raw) -eq "write-original") "delete preflight conflict changed a write target"
+    Assert-True ((Get-Content -LiteralPath $deletePreflightTargetPath -Raw) -eq "delete-concurrent") "delete preflight conflict changed its delete target"
+
+    $overlapPath = Join-Path $transactionDir "write-delete-overlap.txt"
+    $overlapOriginal = [System.Text.Encoding]::UTF8.GetBytes("overlap-original")
+    [System.IO.File]::WriteAllBytes($overlapPath, $overlapOriginal)
+    $overlapRejected = $false
+    try {
+        Invoke-VerifiedWriteDeleteTransaction @(
+            [pscustomobject]@{
+                Path = $overlapPath
+                Bytes = [byte[]]@()
+                Existed = $true
+                OriginalBytes = $overlapOriginal
+            }
+        ) @(
+            [pscustomobject]@{
+                Path = $overlapPath
+                Existed = $true
+                OriginalBytes = $overlapOriginal
+            }
+        )
+    } catch { $overlapRejected = $true }
+    Assert-True $overlapRejected "write/delete transaction accepted an ambiguous overlapping target"
+    Assert-True ((Get-Content -LiteralPath $overlapPath -Raw) -eq "overlap-original") "overlap rejection changed the target"
+
+    $visibilityExistingPath = Join-Path $transactionDir "visibility-existing.txt"
+    $visibilityNewPath = Join-Path $transactionDir "visibility-new.txt"
+    $visibilityDeletePath = Join-Path $transactionDir "visibility-delete.txt"
+    $visibilityMovedPath = Join-Path $transactionDir "visibility-delete-moved.txt"
+    $visibilityExistingOriginal = [System.Text.Encoding]::UTF8.GetBytes("visibility-old")
+    $visibilityDeleteOriginal = [System.Text.Encoding]::UTF8.GetBytes("visibility-delete")
+    [System.IO.File]::WriteAllBytes($visibilityExistingPath, $visibilityExistingOriginal)
+    [System.IO.File]::WriteAllBytes($visibilityDeletePath, $visibilityDeleteOriginal)
+    $visibilityExistingIdentity = (Get-OptionalFileSnapshot $visibilityExistingPath "visibility existing").Identity
+    $visibilityDeleteIdentity = (Get-OptionalFileSnapshot $visibilityDeletePath "visibility delete").Identity
+    $savedVisibilityWriter = ${function:Write-LockedStreamBytes}
+    $script:visibilityProbeRan = $false
+    $script:visibilityExistingReadBlocked = $false
+    $script:visibilityNewReadBlocked = $false
+    $script:visibilityDeleteMoveBlocked = $false
+    try {
+        function Write-LockedStreamBytes(
+            [System.IO.FileStream]$Stream,
+            [byte[]]$Replacement,
+            [byte[]]$Original
+        ) {
+            if (-not $script:visibilityProbeRan) {
+                $script:visibilityProbeRan = $true
+                try { [System.IO.File]::ReadAllText($visibilityExistingPath) | Out-Null } catch {
+                    $script:visibilityExistingReadBlocked = $true
+                }
+                try { [System.IO.File]::ReadAllText($visibilityNewPath) | Out-Null } catch {
+                    $script:visibilityNewReadBlocked = $true
+                }
+                try { [System.IO.File]::Move($visibilityDeletePath, $visibilityMovedPath) } catch {
+                    $script:visibilityDeleteMoveBlocked = $true
+                }
+            }
+            & $savedVisibilityWriter $Stream $Replacement $Original
+        }
+        Invoke-VerifiedWriteDeleteTransaction @(
+            [pscustomobject]@{
+                Path = $visibilityExistingPath
+                Bytes = [System.Text.Encoding]::UTF8.GetBytes("visibility-new")
+                Existed = $true
+                OriginalBytes = $visibilityExistingOriginal
+                OriginalIdentity = $visibilityExistingIdentity
+            },
+            [pscustomobject]@{
+                Path = $visibilityNewPath
+                Bytes = [System.Text.Encoding]::UTF8.GetBytes("visibility-created")
+                Existed = $false
+                OriginalBytes = $null
+                OriginalIdentity = $null
+            }
+        ) @(
+            [pscustomobject]@{
+                Path = $visibilityDeletePath
+                Existed = $true
+                OriginalBytes = $visibilityDeleteOriginal
+                OriginalIdentity = $visibilityDeleteIdentity
+            }
+        )
+        Assert-True $script:visibilityProbeRan "transaction never exercised its visibility probe"
+        Assert-True $script:visibilityExistingReadBlocked "transaction exposed an existing file while it was being rewritten"
+        Assert-True $script:visibilityNewReadBlocked "transaction exposed a zero-byte new file before the batch committed"
+        Assert-True $script:visibilityDeleteMoveBlocked "transaction started writing before every delete target was locked"
+        Assert-True ((Get-Content -LiteralPath $visibilityExistingPath -Raw) -eq "visibility-new") "visibility transaction did not update its existing target"
+        Assert-True ((Get-Content -LiteralPath $visibilityNewPath -Raw) -eq "visibility-created") "visibility transaction did not create its new target"
+        Assert-True (-not (Test-Path -LiteralPath $visibilityDeletePath)) "visibility transaction did not delete its target"
+        Assert-True (-not (Test-Path -LiteralPath $visibilityMovedPath)) "visibility transaction allowed its delete target to move"
+    } finally {
+        Set-Item -Path Function:\Write-LockedStreamBytes -Value $savedVisibilityWriter
+        Remove-Variable -Name visibilityProbeRan -Scope Script -ErrorAction SilentlyContinue
+        Remove-Variable -Name visibilityExistingReadBlocked -Scope Script -ErrorAction SilentlyContinue
+        Remove-Variable -Name visibilityNewReadBlocked -Scope Script -ErrorAction SilentlyContinue
+        Remove-Variable -Name visibilityDeleteMoveBlocked -Scope Script -ErrorAction SilentlyContinue
+    }
+
+    $lockedDeletePath = Join-Path $transactionDir "locked-delete-target.txt"
+    $lockedDeleteMovedPath = Join-Path $transactionDir "locked-delete-moved.txt"
+    $lockedDeleteBytes = [System.Text.Encoding]::UTF8.GetBytes("locked-delete-original")
+    [System.IO.File]::WriteAllBytes($lockedDeletePath, $lockedDeleteBytes)
+    $lockedDeleteIdentity = (Get-OptionalFileSnapshot $lockedDeletePath "locked delete").Identity
+    $savedGetStreamBytes = ${function:Get-StreamBytes}
+    $script:lockedDeleteWriteAttempted = $false
+    $script:lockedDeleteWriteBlocked = $false
+    $script:lockedDeleteReplaceAttempted = $false
+    $script:lockedDeleteReplaceBlocked = $false
+    try {
+        function Get-StreamBytes([System.IO.FileStream]$Stream) {
+            if (-not $script:lockedDeleteWriteAttempted) {
+                $script:lockedDeleteWriteAttempted = $true
+                try {
+                    [System.IO.File]::WriteAllText($lockedDeletePath, "friend-concurrent")
+                } catch {
+                    $script:lockedDeleteWriteBlocked = $true
+                }
+                $script:lockedDeleteReplaceAttempted = $true
+                try {
+                    [System.IO.File]::Move($lockedDeletePath, $lockedDeleteMovedPath)
+                    [System.IO.File]::WriteAllText($lockedDeletePath, "friend-replacement")
+                } catch {
+                    $script:lockedDeleteReplaceBlocked = $true
+                }
+            }
+            return (& $savedGetStreamBytes $Stream)
+        }
+        Invoke-VerifiedWriteDeleteTransaction @() @(
+            [pscustomobject]@{
+                Path = $lockedDeletePath
+                Existed = $true
+                OriginalBytes = $lockedDeleteBytes
+                OriginalIdentity = $lockedDeleteIdentity
+            }
+        )
+        Assert-True $script:lockedDeleteWriteAttempted "delete transaction did not verify through a held file handle"
+        Assert-True $script:lockedDeleteWriteBlocked "delete transaction allowed a same-target write between verification and deletion"
+        Assert-True $script:lockedDeleteReplaceAttempted "delete transaction did not exercise an atomic replacement attempt"
+        Assert-True $script:lockedDeleteReplaceBlocked "delete transaction allowed the verified file to be moved and replaced"
+        Assert-True (-not (Test-Path -LiteralPath $lockedDeletePath)) "locked delete transaction did not remove the verified version"
+        Assert-True (-not (Test-Path -LiteralPath $lockedDeleteMovedPath)) "locked delete transaction left the verified version under a moved path"
+    } finally {
+        Set-Item -Path Function:\Get-StreamBytes -Value $savedGetStreamBytes
+        Remove-Variable -Name lockedDeleteWriteAttempted -Scope Script -ErrorAction SilentlyContinue
+        Remove-Variable -Name lockedDeleteWriteBlocked -Scope Script -ErrorAction SilentlyContinue
+        Remove-Variable -Name lockedDeleteReplaceAttempted -Scope Script -ErrorAction SilentlyContinue
+        Remove-Variable -Name lockedDeleteReplaceBlocked -Scope Script -ErrorAction SilentlyContinue
+    }
+
+    $deleteRaceWritePath = Join-Path $transactionDir "delete-race-write.txt"
+    $deleteRaceFirstPath = Join-Path $transactionDir "delete-race-first.txt"
+    $deleteRaceSecondPath = Join-Path $transactionDir "delete-race-second.txt"
+    $deleteRaceWriteOriginal = [System.Text.Encoding]::UTF8.GetBytes("race-original")
+    $deleteRaceFirstOriginal = [System.Text.Encoding]::UTF8.GetBytes("first-original")
+    $deleteRaceSecondOriginal = [System.Text.Encoding]::UTF8.GetBytes("second-original")
+    [System.IO.File]::WriteAllBytes($deleteRaceWritePath, $deleteRaceWriteOriginal)
+    [System.IO.File]::WriteAllBytes($deleteRaceFirstPath, $deleteRaceFirstOriginal)
+    [System.IO.File]::WriteAllBytes($deleteRaceSecondPath, $deleteRaceSecondOriginal)
+    $deleteRaceWriteIdentity = (Get-OptionalFileSnapshot $deleteRaceWritePath "delete race write").Identity
+    $deleteRaceFirstIdentity = (Get-OptionalFileSnapshot $deleteRaceFirstPath "delete race first").Identity
+    $deleteRaceSecondIdentity = (Get-OptionalFileSnapshot $deleteRaceSecondPath "delete race second").Identity
+    $savedSetVerifiedDeleteDisposition = ${function:Set-VerifiedDeleteDisposition}
+    $script:deleteRaceCallCount = 0
+    try {
+        function Set-VerifiedDeleteDisposition([System.IO.FileStream]$Stream, [bool]$DeleteFile) {
+            if ($DeleteFile) {
+                $script:deleteRaceCallCount++
+                if ($script:deleteRaceCallCount -eq 2) { throw "injected delete failure" }
+            }
+            & $savedSetVerifiedDeleteDisposition $Stream $DeleteFile
+        }
+        $deleteRaceRejected = $false
+        try {
+            Invoke-VerifiedWriteDeleteTransaction @(
+                [pscustomobject]@{
+                    Path = $deleteRaceWritePath
+                    Bytes = [System.Text.Encoding]::UTF8.GetBytes("race-replacement")
+                    Existed = $true
+                    OriginalBytes = $deleteRaceWriteOriginal
+                    OriginalIdentity = $deleteRaceWriteIdentity
+                }
+            ) @(
+                [pscustomobject]@{
+                    Path = $deleteRaceFirstPath
+                    Existed = $true
+                    OriginalBytes = $deleteRaceFirstOriginal
+                    OriginalIdentity = $deleteRaceFirstIdentity
+                },
+                [pscustomobject]@{
+                    Path = $deleteRaceSecondPath
+                    Existed = $true
+                    OriginalBytes = $deleteRaceSecondOriginal
+                    OriginalIdentity = $deleteRaceSecondIdentity
+                }
+            )
+        } catch { $deleteRaceRejected = $true }
+        Assert-True $deleteRaceRejected "write/delete transaction hid an injected delete failure"
+        Assert-True ((Get-Content -LiteralPath $deleteRaceWritePath -Raw) -eq "race-original") "delete rollback did not restore its write target"
+        Assert-True ((Get-Content -LiteralPath $deleteRaceFirstPath -Raw) -eq "first-original") "delete rollback did not cancel an earlier delete mark"
+        Assert-True ((Get-Content -LiteralPath $deleteRaceSecondPath -Raw) -eq "second-original") "delete failure changed a later delete target"
+    } finally {
+        Set-Item -Path Function:\Set-VerifiedDeleteDisposition -Value $savedSetVerifiedDeleteDisposition
+        Remove-Variable -Name deleteRaceCallCount -Scope Script -ErrorAction SilentlyContinue
     }
 
     if ($onWindows) {
@@ -998,6 +1695,7 @@ items:
         Assert-True ((Get-Content -LiteralPath (Join-Path $validationFailureCase "verge.yaml") -Raw) -eq $validationVerge) "failed Mihomo validation changed verge.yaml"
         Assert-True ((Get-Content -LiteralPath (Join-Path $validationFailureCase "profiles.yaml") -Raw) -eq $validationProfiles) "failed Mihomo validation changed profiles.yaml"
         Assert-True ((Get-Content -LiteralPath (Join-Path $validationFailureCase "clash-patch-usage-profile.json") -Raw) -eq $validationUsage) "failed Mihomo validation changed the usage profile"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $validationFailureCase "clash-patch-auto-update-state.json"))) "failed Mihomo validation created auto-update ownership"
         Assert-True (-not (Test-Path -LiteralPath (Join-Path (Join-Path $validationFailureCase "profiles") "Script.js"))) "failed Mihomo validation created Script.js"
 
         $concurrentInstallCase = Join-Path $sandbox "concurrent-install-case"
@@ -1015,6 +1713,7 @@ items:
         }
         Assert-True ($concurrentInstall.ExitCode -eq 1) "installer overwrote a config change made while the candidate was being validated"
         Assert-True ((Get-Content -LiteralPath (Join-Path $concurrentInstallCase "config.yaml") -Raw).Contains("friend_concurrent: true")) "installer did not preserve concurrent config content"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $concurrentInstallCase "clash-patch-auto-update-state.json"))) "rejected concurrent install created auto-update ownership"
     }
 
     $nullCase = Join-Path $sandbox "null-case"
@@ -1029,12 +1728,18 @@ items:
     Assert-True ($nullOutput.Contains("dns-hijack:`n") -or $nullOutput.Contains("dns-hijack:`r`n")) "dns-hijack block missing"
     $nullProfilesIndex = Get-Content -LiteralPath (Join-Path $nullCase "profiles.yaml") -Raw
     Assert-True ($nullProfilesIndex -match '(?m)^\s+allow_auto_update:\s+false\s*$') "profile 3 did not disable subscription auto-update"
+    $nullAutoUpdateStatePath = Join-Path $nullCase "clash-patch-auto-update-state.json"
+    Assert-True (Test-Path -LiteralPath $nullAutoUpdateStatePath -PathType Leaf) "profile 3 did not save auto-update ownership"
+    $nullAutoUpdateStateBeforeReinstall = [System.IO.File]::ReadAllBytes($nullAutoUpdateStatePath)
     $profilesBackups = @(Get-ChildItem -LiteralPath (Join-Path $nullCase "clash-patch-backups") -File | Where-Object { $_.Name -like "*--profiles.yaml.backup" })
     Assert-True ($profilesBackups.Count -ge 1) "profiles.yaml was changed without a dated backup"
     $nullCaseJson = Invoke-TestPowerShell $installer @("-AppHome", $nullCase, "-MihomoPath", $fakeCore, "-Json")
     Assert-JsonResult $nullCaseJson "install" 0 | Out-Null
+    Assert-True (([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($nullAutoUpdateStatePath))) -eq ([Convert]::ToBase64String($nullAutoUpdateStateBeforeReinstall))) "reinstall replaced the original auto-update ownership with the already-disabled state"
     Invoke-Uninstaller $nullCase
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $nullCase "clash-patch-usage-profile.json"))) "successful safe uninstall retained the profile 3 gate"
+    Assert-True (-not (Test-Path -LiteralPath $nullAutoUpdateStatePath)) "successful safe uninstall retained auto-update ownership state"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $nullCase "profiles.yaml") -Raw) -match '(?m)^\s+allow_auto_update:\s+true\s*$') "safe uninstall did not restore remote subscription auto-update"
     $postUninstallLight = Invoke-TestPowerShell $installer @("-AppHome", $nullCase, "-UsageProfile", "1", "-MihomoPath", $fakeCore)
     Assert-True ($postUninstallLight.ExitCode -eq 0) "safe uninstall did not permit a documented profile 3 to profile 1 downgrade: $($postUninstallLight.Output)"
     $postUninstallProfile = Get-Content -LiteralPath (Join-Path $nullCase "clash-patch-usage-profile.json") -Raw | ConvertFrom-Json
@@ -1043,6 +1748,157 @@ items:
         $mihomoArguments = Get-Content -LiteralPath (Join-Path $sandbox "mihomo-arguments.log") -Raw
         Assert-True ($mihomoArguments -match '(?m)(^| )-t( |$)') "installer never asked Mihomo to test a generated candidate"
         Assert-True ($mihomoArguments -match '(?m)(^| )-f( |$)') "installer never passed the generated candidate to Mihomo"
+
+        $createdSettingsCase = Join-Path $sandbox "created-settings-uninstall-case"
+        New-Item -ItemType Directory -Path $createdSettingsCase -Force | Out-Null
+        [System.IO.File]::WriteAllText(
+            (Join-Path $createdSettingsCase "profiles.yaml"),
+            "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n"
+        )
+        Invoke-Installer $createdSettingsCase
+        foreach ($createdPath in @(
+            (Join-Path (Join-Path $createdSettingsCase "profiles") "Script.js"),
+            (Join-Path $createdSettingsCase "config.yaml"),
+            (Join-Path $createdSettingsCase "verge.yaml")
+        )) {
+            Assert-True (Test-Path -LiteralPath $createdPath -PathType Leaf) "installer did not create the expected managed file: $createdPath"
+        }
+        Invoke-Uninstaller $createdSettingsCase
+        foreach ($removedPath in @(
+            (Join-Path (Join-Path $createdSettingsCase "profiles") "Script.js"),
+            (Join-Path $createdSettingsCase "config.yaml"),
+            (Join-Path $createdSettingsCase "verge.yaml"),
+            (Join-Path $createdSettingsCase "clash-patch-install-state.json"),
+            (Join-Path $createdSettingsCase "clash-patch-auto-update-state.json"),
+            (Join-Path $createdSettingsCase "clash-patch-usage-profile.json")
+        )) {
+            Assert-True (-not (Test-Path -LiteralPath $removedPath)) "safe uninstall retained a file created by the installer: $removedPath"
+        }
+        Assert-True (
+            (Get-Content -LiteralPath (Join-Path $createdSettingsCase "profiles.yaml") -Raw) -match
+            '(?m)^\s+allow_auto_update:\s+true\s*$'
+        ) "safe uninstall did not restore auto-update when every application settings file was installer-created"
+
+        foreach ($stateFileName in @(
+            "clash-patch-install-state.json",
+            "clash-patch-auto-update-state.json",
+            "clash-patch-usage-profile.json"
+        )) {
+            $nonFileStateCase = Join-Path $sandbox ("non-file-state-" + $stateFileName.Replace(".", "-"))
+            New-Item -ItemType Directory -Path $nonFileStateCase -Force | Out-Null
+            [System.IO.File]::WriteAllText(
+                (Join-Path $nonFileStateCase "profiles.yaml"),
+                "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n"
+            )
+            [System.IO.File]::WriteAllText((Join-Path $nonFileStateCase "config.yaml"), "ipv6: true`ntun: null`n")
+            [System.IO.File]::WriteAllText((Join-Path $nonFileStateCase "verge.yaml"), "enable_tun_mode: false`n")
+            Invoke-Installer $nonFileStateCase
+            $nonFileStatePath = Join-Path $nonFileStateCase $stateFileName
+            Remove-Item -LiteralPath $nonFileStatePath -Force
+            New-Item -ItemType Directory -Path $nonFileStatePath -Force | Out-Null
+            $nonFileStateBefore = Get-TreeContentSnapshot $nonFileStateCase
+
+            $nonFileStateResult = Invoke-TestPowerShell $uninstaller @("-AppHome", $nonFileStateCase, "-Json")
+            $nonFileStateJson = Assert-JsonResult $nonFileStateResult "uninstall" 1
+
+            Assert-True ($nonFileStateJson.status -eq "failed") "non-file state path did not fail the whole uninstall: $stateFileName"
+            Assert-True (
+                (Get-TreeContentSnapshot $nonFileStateCase) -ceq $nonFileStateBefore
+            ) "non-file state path allowed a partial uninstall: $stateFileName"
+        }
+
+        $invalidUsageCase = Join-Path $sandbox "invalid-usage-state-case"
+        New-Item -ItemType Directory -Path $invalidUsageCase -Force | Out-Null
+        [System.IO.File]::WriteAllText(
+            (Join-Path $invalidUsageCase "profiles.yaml"),
+            "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n"
+        )
+        [System.IO.File]::WriteAllText((Join-Path $invalidUsageCase "config.yaml"), "ipv6: true`ntun: null`n")
+        [System.IO.File]::WriteAllText((Join-Path $invalidUsageCase "verge.yaml"), "enable_tun_mode: false`n")
+        Invoke-Installer $invalidUsageCase
+        $invalidUsageStatePath = Join-Path $invalidUsageCase "clash-patch-usage-profile.json"
+        foreach ($invalidUsageState in @(
+            "{",
+            '{"Version":2,"Profile":3}',
+            '{"Version":"1","Profile":3}',
+            '{"Version":1,"Profile":"3"}',
+            '{"Version":1,"Profile":0}',
+            '{"Version":1}',
+            '{"Version":1,"Profile":3,"Extra":true}',
+            '{"Version":1,"Version":1,"Profile":3}'
+        )) {
+            [System.IO.File]::WriteAllText($invalidUsageStatePath, $invalidUsageState)
+            $invalidUsageBefore = Get-TreeContentSnapshot $invalidUsageCase
+            $invalidUsageResult = Invoke-TestPowerShell $uninstaller @("-AppHome", $invalidUsageCase, "-Json")
+            $invalidUsageJson = Assert-JsonResult $invalidUsageResult "uninstall" 1
+            Assert-True ($invalidUsageJson.status -eq "failed") "invalid usage state did not fail the whole uninstall: $invalidUsageState"
+            Assert-True (
+                (Get-TreeContentSnapshot $invalidUsageCase) -ceq $invalidUsageBefore
+            ) "invalid usage state allowed a partial uninstall: $invalidUsageState"
+        }
+
+        $uninstallConflictCase = Join-Path $sandbox "uninstall-conflict-case"
+        New-Item -ItemType Directory -Path $uninstallConflictCase -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $uninstallConflictCase "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
+        [System.IO.File]::WriteAllText((Join-Path $uninstallConflictCase "config.yaml"), "ipv6: true`ntun: null`n")
+        [System.IO.File]::WriteAllText((Join-Path $uninstallConflictCase "verge.yaml"), "enable_tun_mode: false`n")
+        Invoke-Installer $uninstallConflictCase
+        $conflictScriptPath = Join-Path (Join-Path $uninstallConflictCase "profiles") "Script.js"
+        $conflictProfilesPath = Join-Path $uninstallConflictCase "profiles.yaml"
+        $conflictConfigPath = Join-Path $uninstallConflictCase "config.yaml"
+        $conflictVergePath = Join-Path $uninstallConflictCase "verge.yaml"
+        $conflictAutoUpdateStatePath = Join-Path $uninstallConflictCase "clash-patch-auto-update-state.json"
+        $conflictScriptBefore = [System.IO.File]::ReadAllBytes($conflictScriptPath)
+        $conflictProfilesBefore = [System.IO.File]::ReadAllBytes($conflictProfilesPath)
+        $conflictConfigBefore = [System.IO.File]::ReadAllBytes($conflictConfigPath)
+        $conflictAutoUpdateStateBefore = [System.IO.File]::ReadAllBytes($conflictAutoUpdateStatePath)
+        [System.IO.File]::WriteAllText($conflictVergePath, "enable_tun_mode: true`nfriend_after_install: true`n")
+        $conflictVergeBefore = [System.IO.File]::ReadAllBytes($conflictVergePath)
+
+        $uninstallConflict = Invoke-TestPowerShell $uninstaller @("-AppHome", $uninstallConflictCase, "-Json")
+        $uninstallConflictResult = Assert-JsonResult $uninstallConflict "uninstall" 1
+
+        Assert-True ($uninstallConflictResult.status -eq "failed") "conflicting uninstall did not fail closed"
+        Assert-True (([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($conflictScriptPath))) -eq ([Convert]::ToBase64String($conflictScriptBefore))) "conflicting uninstall removed the global script before checking every target"
+        Assert-True (([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($conflictProfilesPath))) -eq ([Convert]::ToBase64String($conflictProfilesBefore))) "conflicting uninstall restored auto-update before checking every target"
+        Assert-True (([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($conflictConfigPath))) -eq ([Convert]::ToBase64String($conflictConfigBefore))) "conflicting uninstall restored config.yaml before checking every target"
+        Assert-True (([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($conflictVergePath))) -eq ([Convert]::ToBase64String($conflictVergeBefore))) "conflicting uninstall changed the user-edited verge.yaml"
+        Assert-True (([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($conflictAutoUpdateStatePath))) -eq ([Convert]::ToBase64String($conflictAutoUpdateStateBefore))) "conflicting uninstall removed auto-update recovery state"
+        Assert-True (Test-Path -LiteralPath (Join-Path $uninstallConflictCase "clash-patch-install-state.json") -PathType Leaf) "conflicting uninstall removed its recovery state"
+        Assert-True (Test-Path -LiteralPath (Join-Path $uninstallConflictCase "clash-patch-usage-profile.json") -PathType Leaf) "conflicting uninstall removed the profile 3 gate"
+
+        $invalidOwnershipCase = Join-Path $sandbox "invalid-auto-update-ownership-case"
+        New-Item -ItemType Directory -Path $invalidOwnershipCase -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $invalidOwnershipCase "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
+        [System.IO.File]::WriteAllText((Join-Path $invalidOwnershipCase "config.yaml"), "ipv6: true`ntun: null`n")
+        [System.IO.File]::WriteAllText((Join-Path $invalidOwnershipCase "verge.yaml"), "enable_tun_mode: false`n")
+        Invoke-Installer $invalidOwnershipCase
+        $invalidOwnershipStatePath = Join-Path $invalidOwnershipCase "clash-patch-auto-update-state.json"
+        [System.IO.File]::WriteAllText(
+            $invalidOwnershipStatePath,
+            '{"Version":1,"Profiles":[{"Uid":"R-test","OriginalState":"true","OriginalOptionBase64":"***"}]}'
+        )
+        $invalidOwnershipProtectedPaths = @(
+            (Join-Path (Join-Path $invalidOwnershipCase "profiles") "Script.js"),
+            (Join-Path $invalidOwnershipCase "profiles.yaml"),
+            (Join-Path $invalidOwnershipCase "config.yaml"),
+            (Join-Path $invalidOwnershipCase "verge.yaml"),
+            (Join-Path $invalidOwnershipCase "clash-patch-install-state.json"),
+            (Join-Path $invalidOwnershipCase "clash-patch-usage-profile.json"),
+            $invalidOwnershipStatePath
+        )
+        $invalidOwnershipBefore = @{}
+        foreach ($protectedPath in $invalidOwnershipProtectedPaths) {
+            $invalidOwnershipBefore[$protectedPath] = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($protectedPath))
+        }
+        $invalidOwnershipUninstall = Invoke-TestPowerShell $uninstaller @("-AppHome", $invalidOwnershipCase, "-Json")
+        Assert-JsonResult $invalidOwnershipUninstall "uninstall" 1 | Out-Null
+        foreach ($protectedPath in $invalidOwnershipProtectedPaths) {
+            Assert-True (
+                [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($protectedPath)) -eq
+                $invalidOwnershipBefore[$protectedPath]
+            ) "invalid auto-update ownership changed a protected uninstall target: $protectedPath"
+        }
     }
 
     if ($onWindows) {
@@ -1067,9 +1923,55 @@ items:
             Assert-True ((Get-Content -LiteralPath (Join-Path $runningCase "config.yaml") -Raw) -eq $runningConfig) "running client changed config.yaml"
             Assert-True ((Get-Content -LiteralPath (Join-Path $runningCase "verge.yaml") -Raw) -eq $runningVerge) "running client changed verge.yaml"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $runningCase "clash-patch-install-state.json"))) "running client created an offline install state"
+            Assert-True (Test-Path -LiteralPath (Join-Path $runningCase "clash-patch-auto-update-state.json") -PathType Leaf) "running client install did not save auto-update ownership"
         } finally {
             if (-not $runningClient.HasExited) { Stop-Process -Id $runningClient.Id -Force }
         }
+        Invoke-Uninstaller $runningCase
+        Assert-True ((Get-Content -LiteralPath (Join-Path $runningCase "profiles.yaml") -Raw) -match '(?m)^\s+allow_auto_update:\s+true\s*$') "running-client install could not later restore auto-update"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $runningCase "clash-patch-auto-update-state.json"))) "running-client uninstall retained auto-update ownership"
+
+        $deferredUninstallCase = Join-Path $sandbox "deferred-running-uninstall-case"
+        New-Item -ItemType Directory -Path $deferredUninstallCase -Force | Out-Null
+        $deferredConfigOriginal = "ipv6: true`ntun: null`n"
+        $deferredVergeOriginal = "enable_tun_mode: false`n"
+        [System.IO.File]::WriteAllText((Join-Path $deferredUninstallCase "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
+        [System.IO.File]::WriteAllText((Join-Path $deferredUninstallCase "config.yaml"), $deferredConfigOriginal)
+        [System.IO.File]::WriteAllText((Join-Path $deferredUninstallCase "verge.yaml"), $deferredVergeOriginal)
+        Invoke-Installer $deferredUninstallCase
+        $deferredProtectedPaths = @(
+            (Join-Path (Join-Path $deferredUninstallCase "profiles") "Script.js"),
+            (Join-Path $deferredUninstallCase "profiles.yaml"),
+            (Join-Path $deferredUninstallCase "config.yaml"),
+            (Join-Path $deferredUninstallCase "verge.yaml"),
+            (Join-Path $deferredUninstallCase "clash-patch-install-state.json"),
+            (Join-Path $deferredUninstallCase "clash-patch-auto-update-state.json"),
+            (Join-Path $deferredUninstallCase "clash-patch-usage-profile.json")
+        )
+        $deferredProtectedBefore = @{}
+        foreach ($protectedPath in $deferredProtectedPaths) {
+            $deferredProtectedBefore[$protectedPath] = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($protectedPath))
+        }
+        $deferredClient = Start-Process -FilePath $runningClientPath -ArgumentList @("-n", "20", "127.0.0.1") -PassThru
+        try {
+            Start-Sleep -Milliseconds 100
+            $deferredResult = Invoke-TestPowerShell $uninstaller @("-AppHome", $deferredUninstallCase, "-Json")
+            $deferredJson = Assert-JsonResult $deferredResult "uninstall" 1
+            Assert-True ($deferredJson.status -eq "partial") "running offline uninstall did not report a partial result"
+            Assert-True (@($deferredJson.changes).Count -eq 0) "running offline uninstall reported changes despite deferring the whole batch"
+            foreach ($protectedPath in $deferredProtectedPaths) {
+                Assert-True (
+                    [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($protectedPath)) -eq
+                    $deferredProtectedBefore[$protectedPath]
+                ) "running offline uninstall changed a protected target: $protectedPath"
+            }
+        } finally {
+            if (-not $deferredClient.HasExited) { Stop-Process -Id $deferredClient.Id -Force }
+        }
+        Invoke-Uninstaller $deferredUninstallCase
+        Assert-True ((Get-Content -LiteralPath (Join-Path $deferredUninstallCase "config.yaml") -Raw) -eq $deferredConfigOriginal) "second safe uninstall did not restore deferred config.yaml"
+        Assert-True ((Get-Content -LiteralPath (Join-Path $deferredUninstallCase "verge.yaml") -Raw) -eq $deferredVergeOriginal) "second safe uninstall did not restore deferred verge.yaml"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $deferredUninstallCase "clash-patch-usage-profile.json"))) "second safe uninstall retained the profile 3 gate"
     }
 
     $blockCase = Join-Path $sandbox "block-case"
@@ -1079,7 +1981,10 @@ items:
     [System.IO.File]::WriteAllText((Join-Path $blockCase "config.yaml"), $blockInput)
     [System.IO.File]::WriteAllText((Join-Path $blockCase "verge.yaml"), "enable_dns_settings: true`n")
     Invoke-Installer $blockCase
+    $blockAutoUpdateStatePath = Join-Path $blockCase "clash-patch-auto-update-state.json"
+    $blockAutoUpdateStateBeforeReinstall = [System.IO.File]::ReadAllBytes($blockAutoUpdateStatePath)
     Invoke-Installer $blockCase
+    Assert-True (([Convert]::ToBase64String([System.IO.File]::ReadAllBytes($blockAutoUpdateStatePath))) -eq ([Convert]::ToBase64String($blockAutoUpdateStateBeforeReinstall))) "second install forgot the pre-patch auto-update state"
     $blockOutput = Get-Content -LiteralPath (Join-Path $blockCase "config.yaml") -Raw
     Assert-True (-not $blockOutput.Contains("0.0.0.0:53")) "old dns-hijack child survived"
     Assert-True ($blockOutput.Contains("device: Clash")) "unmanaged tun setting was removed"

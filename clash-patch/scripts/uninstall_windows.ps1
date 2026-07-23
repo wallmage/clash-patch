@@ -5,7 +5,15 @@
 
 $ErrorActionPreference = "Stop"
 $resultContractPath = Join-Path (Join-Path $PSScriptRoot "windows") "result_contract.ps1"
-if (-not (Test-Path -LiteralPath $resultContractPath -PathType Leaf)) {
+$uninstallerModuleRoot = Join-Path (Join-Path $PSScriptRoot "windows") "install_windows"
+$uninstallerModules = @("yaml.ps1", "profiles.ps1", "transaction.ps1", "script_js.ps1")
+$packageComplete = Test-Path -LiteralPath $resultContractPath -PathType Leaf
+foreach ($uninstallerModule in $uninstallerModules) {
+    if (-not (Test-Path -LiteralPath (Join-Path $uninstallerModuleRoot $uninstallerModule) -PathType Leaf)) {
+        $packageComplete = $false
+    }
+}
+if (-not $packageComplete) {
     if ($Json) {
         [Console]::Out.WriteLine('{"schema":"clash-patch.result","version":1,"command":"uninstall","platform":"windows","client":"clash-verge-rev","operation":"load","ok":false,"status":"failed","code":"incomplete_package","exit_code":6,"summary_zh":"安装包不完整。","profile":null,"changes":[],"checks":[],"items":[],"messages":[],"warnings":[]}')
     } else {
@@ -14,6 +22,9 @@ if (-not (Test-Path -LiteralPath $resultContractPath -PathType Leaf)) {
     exit 6
 }
 . $resultContractPath
+foreach ($uninstallerModule in $uninstallerModules) {
+    . (Join-Path $uninstallerModuleRoot $uninstallerModule)
+}
 $script:ClashPatchMessages = New-Object System.Collections.ArrayList
 
 function Write-Info([string]$Message) {
@@ -39,215 +50,61 @@ function Complete-UninstallResult(
     exit $ExitCode
 }
 
-function Protect-BackupAcl([string]$Path) {
-    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return }
-
-    $security = Get-Acl -LiteralPath $Path
-    $security.SetAccessRuleProtection($true, $false)
-    @($security.Access) | Where-Object { -not $_.IsInherited } | ForEach-Object {
-        $security.RemoveAccessRuleSpecific($_)
-    } | Out-Null
-    $sidValues = @(
-        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
-        "S-1-5-18",
-        "S-1-5-32-544"
-    ) | Select-Object -Unique
-    foreach ($sidValue in $sidValues) {
-        $sid = New-Object System.Security.Principal.SecurityIdentifier($sidValue)
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $sid,
-            [System.Security.AccessControl.FileSystemRights]::FullControl,
-            [System.Security.AccessControl.AccessControlType]::Allow
-        )
-        $security.AddAccessRule($rule) | Out-Null
-    }
-    Set-Acl -LiteralPath $Path -AclObject $security
-}
-
 function New-UninstallBackup([string]$Path) {
-    $stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
-    $nonce = [System.Guid]::NewGuid().ToString("N").Substring(0, 12)
-    $destination = "$Path.clash-patch-uninstall.$stamp-$nonce.backup"
-    [System.IO.File]::Copy($Path, $destination, $false)
-    try {
-        Protect-BackupAcl $destination
-    } catch {
-        if (Test-Path -LiteralPath $destination -PathType Leaf) {
-            Remove-Item -LiteralPath $destination -Force
-        }
-        throw
+    $backupRoot = $script:ClashPatchUninstallBackupRoot
+    if ([string]::IsNullOrWhiteSpace([string]$backupRoot)) {
+        $backupRoot = Join-Path (Split-Path -Parent $Path) "clash-patch-backups"
     }
-    return $destination
+    return (Backup-Versioned $Path $backupRoot "pre-uninstall")
 }
 
-function Write-BytesAtomic([string]$Path, [byte[]]$Bytes) {
-    if (Test-Path -LiteralPath $Path -PathType Container) { throw "目标路径是目录，不能写入：$Path" }
-    $directory = Split-Path -Parent $Path
-    $temporary = Join-Path $directory (".clash-patch-uninstall-" + [System.IO.Path]::GetRandomFileName())
-    try {
-        [System.IO.File]::WriteAllBytes($temporary, $Bytes)
-        Move-Item -LiteralPath $temporary -Destination $Path -Force
-    } finally {
-        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
-    }
-}
-
-function Write-Utf8Atomic([string]$Path, [string]$Content) {
-    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Content)
-    Write-BytesAtomic $Path $bytes
-}
-
-function Get-BytesSha256([byte[]]$Bytes) {
-    # PowerShell binds an empty byte array as $null; empty input must still hash.
-    if ($null -eq $Bytes) { $Bytes = [byte[]]@() }
-    $sha = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
-    } finally {
-        $sha.Dispose()
-    }
-}
-
-function Get-FileSha256([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return "" }
-    return (Get-BytesSha256 ([System.IO.File]::ReadAllBytes($Path)))
-}
-
-function Get-InstallStateEntry([object]$State, [string]$Name) {
-    if ($null -eq $State) { return $null }
-    $property = $State.PSObject.Properties[$Name]
-    if ($null -eq $property) { return $null }
-    return $property.Value
-}
-
-function Assert-InstallStateEntry([object]$Entry, [string]$Label) {
-    if ($null -eq $Entry) { throw "安装状态文件无效：缺少 $Label。" }
-    if (-not ($Entry.Existed -is [bool])) { throw "安装状态文件无效：$Label.Existed 不是布尔值。" }
-    if (-not ($Entry.OriginalBase64 -is [string])) { throw "安装状态文件无效：$Label.OriginalBase64 不是字符串。" }
-    if (-not ($Entry.InstalledSha256 -is [string]) -or [string]$Entry.InstalledSha256 -notmatch '^[0-9a-fA-F]{64}$') {
-        throw "安装状态文件无效：$Label.InstalledSha256 不是 SHA-256。"
-    }
-    $encoded = [string]$Entry.OriginalBase64
-    try {
-        $decoded = [Convert]::FromBase64String($encoded)
-    } catch {
-        throw "安装状态文件无效：$Label.OriginalBase64 不是 Base64。"
-    }
-    if ([Convert]::ToBase64String($decoded) -cne $encoded) {
-        throw "安装状态文件无效：$Label.OriginalBase64 不是规范 Base64。"
-    }
-    if (-not [bool]$Entry.Existed -and $encoded.Length -ne 0) {
-        throw "安装状态文件无效：$Label 不存在却保存了原始内容。"
-    }
-}
-
-function Assert-InstallState([object]$State) {
-    if ($null -eq $State) { throw "安装状态文件无效。" }
-    $version = $State.Version
-    $numericVersion = $version -is [int] -or $version -is [long]
-    if (-not $numericVersion -or [long]$version -ne 1) { throw "安装状态文件无效：版本不受支持。" }
-    Assert-InstallStateEntry (Get-InstallStateEntry $State "VergeYaml") "VergeYaml"
-    Assert-InstallStateEntry (Get-InstallStateEntry $State "ConfigYaml") "ConfigYaml"
-}
-
-function Get-JavaScriptAnalysis([string]$Text) {
-    $mask = New-Object System.Text.StringBuilder
-    $markers = @()
-    $state = "code"
-    $index = 0
-    while ($index -lt $Text.Length) {
-        $character = [string]$Text[$index]
-        $next = if ($index + 1 -lt $Text.Length) { [string]$Text[$index + 1] } else { "" }
-        if ($state -eq "code") {
-            if ($character -eq "/" -and $next -eq "/") {
-                $finish = $index + 2
-                while ($finish -lt $Text.Length -and $Text[$finish] -ne "`r" -and $Text[$finish] -ne "`n") { $finish++ }
-                $comment = $Text.Substring($index, $finish - $index).Trim()
-                if ($comment -eq "// CLASH PATCH BEGIN") {
-                    $markers += [pscustomobject]@{ Kind = "begin"; Start = $index; End = $finish }
-                } elseif ($comment -eq "// CLASH PATCH END") {
-                    $markers += [pscustomobject]@{ Kind = "end"; Start = $index; End = $finish }
-                }
-                while ($index -lt $finish) { [void]$mask.Append(" "); $index++ }
-                continue
-            }
-            if ($character -eq "/" -and $next -eq "*") {
-                $finish = $index + 2
-                while ($finish + 1 -lt $Text.Length -and -not ($Text[$finish] -eq "*" -and $Text[$finish + 1] -eq "/")) { $finish++ }
-                if ($finish + 1 -ge $Text.Length) { throw "JavaScript 块注释没有结束，原脚本未修改。" }
-                $finish += 2
-                while ($index -lt $finish) {
-                    $masked = [string]$Text[$index]
-                    [void]$mask.Append($(if ($masked -eq "`r" -or $masked -eq "`n") { $masked } else { " " }))
-                    $index++
-                }
-                continue
-            }
-            if ($character -eq "'") { $state = "single"; [void]$mask.Append(" "); $index++; continue }
-            if ($character -eq '"') { $state = "double"; [void]$mask.Append(" "); $index++; continue }
-            if ($character -eq '`') { $state = "template"; [void]$mask.Append(" "); $index++; continue }
-            [void]$mask.Append($character)
-            $index++
-            continue
-        }
-        if ($character -eq "\") {
-            [void]$mask.Append(" ")
-            $index++
-            if ($index -lt $Text.Length) {
-                $escaped = [string]$Text[$index]
-                [void]$mask.Append($(if ($escaped -eq "`r" -or $escaped -eq "`n") { $escaped } else { " " }))
-                $index++
-            }
-            continue
-        }
-        if (($state -eq "single" -and $character -eq "'") -or
-            ($state -eq "double" -and $character -eq '"') -or
-            ($state -eq "template" -and $character -eq '`')) {
-            $state = "code"
-            [void]$mask.Append(" ")
-            $index++
-            continue
-        }
-        if (($state -eq "single" -or $state -eq "double") -and ($character -eq "`r" -or $character -eq "`n")) {
-            throw "JavaScript 字符串没有结束，原脚本未修改。"
-        }
-        [void]$mask.Append($(if ($character -eq "`r" -or $character -eq "`n") { $character } else { " " }))
-        $index++
-    }
-    if ($state -ne "code") { throw "JavaScript 字符串没有结束，原脚本未修改。" }
-    return [pscustomobject]@{ Code = $mask.ToString(); Markers = @($markers) }
-}
-
-function Rename-JavaScriptMain([string]$Text, [string]$From, [string]$To) {
-    $analysis = Get-JavaScriptAnalysis $Text
-    $pattern = '(?m)^\s*function\s+' + [regex]::Escape($From) + '\s*\('
-    $matches = [regex]::Matches($analysis.Code, $pattern)
-    if ($matches.Count -ne 1) { throw "无法确认原始 main 函数，原文件未修改。" }
-    $relative = $matches[0].Value.IndexOf($From, [StringComparison]::Ordinal)
-    $nameIndex = $matches[0].Index + $relative
-    return $Text.Substring(0, $nameIndex) + $To + $Text.Substring($nameIndex + $From.Length)
-}
-
-function Restore-InstalledSetting([object]$Entry, [string]$Path, [string]$Label) {
-    if ($null -eq $Entry) { return $true }
+function Get-InstalledSettingRestorePlan([object]$Entry, [string]$Path, [string]$Label) {
+    if ($null -eq $Entry) { return $null }
+    $snapshot = Get-OptionalFileSnapshot $Path $Label
+    $existed = [bool]$snapshot.Exists
+    $currentBytes = $snapshot.Bytes
+    $current = Get-BytesSha256 $currentBytes
     $expected = [string]$Entry.InstalledSha256
-    $current = Get-FileSha256 $Path
     if ([bool]$Entry.Existed) {
         $originalBytes = [Convert]::FromBase64String([string]$Entry.OriginalBase64)
-        if ($current -eq (Get-BytesSha256 $originalBytes)) { return $true }
-    } elseif ([string]::IsNullOrEmpty($current)) {
-        return $true
+        if ($existed -and $current -eq (Get-BytesSha256 $originalBytes)) {
+            return [pscustomobject]@{ Changed = $false; Path = $Path; Label = $Label }
+        }
+    } elseif (-not $existed) {
+        return [pscustomobject]@{ Changed = $false; Path = $Path; Label = $Label }
     }
     if ($current -ne $expected) {
-        Write-Info "$Label 在安装后有新改动，未自动覆盖；安装状态文件将保留。"
-        return $false
+        throw "$Label 在安装后有新改动，未自动覆盖。"
     }
-    if ([bool]$Entry.Existed) {
-        Write-BytesAtomic $Path $originalBytes
-    } elseif (Test-Path -LiteralPath $Path) {
-        Remove-Item -LiteralPath $Path -Force
+    $replacement = if ([bool]$Entry.Existed) { $originalBytes } else { [byte[]]@() }
+    return [pscustomobject]@{
+        Changed = $true
+        Path = $Path
+        Label = $Label
+        Bytes = $replacement
+        Existed = $existed
+        OriginalBytes = $currentBytes
+        OriginalIdentity = $snapshot.Identity
+        Delete = (-not [bool]$Entry.Existed)
     }
-    return $true
+}
+
+function Assert-UsageProfileState([object]$State) {
+    if ($null -eq $State) { throw "用途档位状态文件无效。" }
+    $propertyNames = @($State.PSObject.Properties.Name)
+    if ($propertyNames.Count -ne 2 -or
+        $propertyNames -notcontains "Version" -or
+        $propertyNames -notcontains "Profile") {
+        throw "用途档位状态文件结构无效。"
+    }
+    $version = $State.Version
+    $profile = $State.Profile
+    $numericVersion = $version -is [int] -or $version -is [long]
+    $numericProfile = $profile -is [int] -or $profile -is [long]
+    if (-not $numericVersion -or [long]$version -ne 1 -or
+        -not $numericProfile -or [long]$profile -notin @(1, 2, 3)) {
+        throw "用途档位状态文件内容无效。"
+    }
 }
 
 function Test-ClashVergeRunning {
@@ -271,24 +128,105 @@ if ([string]::IsNullOrWhiteSpace($AppHome)) {
 }
 
 $target = Join-Path (Join-Path $AppHome "profiles") "Script.js"
+$profilesIndexPath = Join-Path $AppHome "profiles.yaml"
 $vergePath = Join-Path $AppHome "verge.yaml"
 $configPath = Join-Path $AppHome "config.yaml"
 $statePath = Join-Path $AppHome "clash-patch-install-state.json"
+$autoUpdateStatePath = Join-Path $AppHome "clash-patch-auto-update-state.json"
 $usageStatePath = Join-Path $AppHome "clash-patch-usage-profile.json"
+$script:ClashPatchUninstallBackupRoot = Join-Path $AppHome "clash-patch-backups"
 $state = $null
 
+$mutationLock = $null
+try {
+    $mutationLock = Enter-AppHomeMutationLock $AppHome
+} catch {
+    Complete-UninstallResult 1 "failed" "operation_in_progress" $_.Exception.Message
+}
+
+try {
 try {
     $clientRunning = Test-ClashVergeRunning
-    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
-        $state = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $stateSnapshot = Get-OptionalFileSnapshot $statePath "安装状态"
+    $autoUpdateStateSnapshot = Get-OptionalFileSnapshot $autoUpdateStatePath "订阅自动更新所有权状态"
+    $usageStateSnapshot = Get-OptionalFileSnapshot $usageStatePath "用途档位状态"
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+
+    if ($stateSnapshot.Exists) {
+        try {
+            $state = $strictUtf8.GetString($stateSnapshot.Bytes) | ConvertFrom-Json
+        } catch {
+            throw "安装状态文件无效。"
+        }
         Assert-InstallState $state
     }
+    $autoUpdateStateExists = [bool]$autoUpdateStateSnapshot.Exists
+    $autoUpdatePlan = $null
+    $autoUpdateStateBytes = $autoUpdateStateSnapshot.Bytes
+    if ($autoUpdateStateExists) {
+        try {
+            $autoUpdateState = $strictUtf8.GetString($autoUpdateStateBytes) | ConvertFrom-Json
+        } catch {
+            throw "订阅自动更新所有权状态文件无效。"
+        }
+        $autoUpdateOwnership = @(Assert-RemoteSubscriptionAutoUpdateOwnershipState $autoUpdateState)
+    }
+    if ($usageStateSnapshot.Exists) {
+        try {
+            $usageStateText = $strictUtf8.GetString($usageStateSnapshot.Bytes)
+            if ([regex]::Matches($usageStateText, '(?i)"Version"\s*:').Count -ne 1 -or
+                [regex]::Matches($usageStateText, '(?i)"Profile"\s*:').Count -ne 1) {
+                throw "用途档位状态文件字段重复或缺失。"
+            }
+            $usageState = $usageStateText | ConvertFrom-Json
+        } catch {
+            throw "用途档位状态文件无效。"
+        }
+        Assert-UsageProfileState $usageState
+    }
+    if ($clientRunning -and $null -ne $state) {
+        Write-Info "客户端保持运行；本次没有修改任何文件，应用设置、全局脚本、自动更新设置和用途档位均继续保留。以后检测到客户端未运行时，可再次执行安全卸载。"
+        Complete-UninstallResult 1 "partial" "client_running" "客户端保持运行，本次卸载未修改任何文件。" @() @("以后检测到客户端未运行时，可再次执行安全卸载。")
+    }
 
-    $scriptChanged = $false
-    if (Test-Path -LiteralPath $target -PathType Leaf) {
+    if ($autoUpdateStateExists) {
+        $profilesIndexSnapshot = Get-OptionalFileSnapshot $profilesIndexPath "profiles.yaml"
+        if (-not $profilesIndexSnapshot.Exists) {
+            throw "找不到 profiles.yaml，无法安全恢复订阅自动更新设置。"
+        }
+        $profilesIndexOriginalBytes = $profilesIndexSnapshot.Bytes
+        try {
+            $profilesIndexInput = $strictUtf8.GetString($profilesIndexOriginalBytes)
+        } catch {
+            throw "profiles.yaml 不是有效的 UTF-8 文件。"
+        }
+        $profilesIndexOutput = Restore-RemoteSubscriptionAutoUpdate $profilesIndexInput $autoUpdateOwnership
+        $profilesIndexBytes = ConvertTo-Utf8Bytes $profilesIndexOutput
+        if ((Get-BytesSha256 $profilesIndexBytes) -ne (Get-BytesSha256 $profilesIndexOriginalBytes)) {
+            $autoUpdatePlan = [pscustomobject]@{
+                Changed = $true
+                Path = $profilesIndexPath
+                Label = "profiles.yaml"
+                Bytes = $profilesIndexBytes
+                Existed = $true
+                OriginalBytes = $profilesIndexOriginalBytes
+                OriginalIdentity = $profilesIndexSnapshot.Identity
+                Delete = $false
+            }
+        }
+    }
+
+    $scriptPlan = $null
+    $scriptSnapshot = Get-OptionalFileSnapshot $target "Script.js"
+    if ($scriptSnapshot.Exists) {
         $begin = "// CLASH PATCH BEGIN"
         $end = "// CLASH PATCH END"
-        $current = Get-Content -LiteralPath $target -Raw -Encoding UTF8
+        $scriptOriginalBytes = $scriptSnapshot.Bytes
+        try {
+            $current = $strictUtf8.GetString($scriptOriginalBytes)
+        } catch {
+            throw "Script.js 不是有效的 UTF-8 文件。"
+        }
         $analysis = Get-JavaScriptAnalysis $current
         $beginMarkers = @($analysis.Markers | Where-Object { $_.Kind -eq "begin" })
         $endMarkers = @($analysis.Markers | Where-Object { $_.Kind -eq "end" })
@@ -307,53 +245,106 @@ try {
                 $prefix = (Rename-JavaScriptMain $prefix "clashPatchPreviousMain" "main").TrimEnd()
             }
             $remaining = @($prefix, $suffix) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-            New-UninstallBackup $target | Out-Null
-            if ($remaining.Count -eq 0) {
-                Remove-Item -LiteralPath $target -Force
+            $scriptBytes = if ($remaining.Count -eq 0) {
+                [byte[]]@()
             } else {
-                Write-Utf8Atomic $target (($remaining -join "`r`n`r`n") + "`r`n")
+                (New-Object System.Text.UTF8Encoding($false)).GetBytes((($remaining -join "`r`n`r`n") + "`r`n"))
             }
-            $scriptChanged = $true
+            $scriptPlan = [pscustomobject]@{
+                Changed = $true
+                Path = $target
+                Label = "Script.js"
+                Bytes = $scriptBytes
+                Existed = $true
+                OriginalBytes = $scriptOriginalBytes
+                OriginalIdentity = $scriptSnapshot.Identity
+                Delete = ($remaining.Count -eq 0)
+            }
         }
     }
 
-    $settingsRestored = $true
+    $settingPlans = @()
     if ($null -ne $state -and -not $clientRunning) {
-        $settingTargets = @(
+        $settingEntries = @(
             [pscustomobject]@{ Entry = $state.ConfigYaml; Path = $configPath; Label = "config.yaml" },
             [pscustomobject]@{ Entry = $state.VergeYaml; Path = $vergePath; Label = "verge.yaml" }
         )
-        foreach ($settingTarget in $settingTargets) {
-            try {
-                if (-not (Restore-InstalledSetting $settingTarget.Entry $settingTarget.Path $settingTarget.Label)) {
-                    $settingsRestored = $false
-                }
-            } catch {
-                Write-Info "$($settingTarget.Label) 恢复失败：$($_.Exception.Message)"
-                $settingsRestored = $false
-            }
+        foreach ($settingEntry in $settingEntries) {
+            $settingPlans += Get-InstalledSettingRestorePlan $settingEntry.Entry $settingEntry.Path $settingEntry.Label
         }
-        if ($settingsRestored) { Remove-Item -LiteralPath $statePath -Force }
     } elseif ($null -ne $state) {
-        $settingsRestored = $false
         Write-Info "Clash Verge Rev 保持运行；config.yaml 与 verge.yaml 未改动，安装状态文件继续保留。"
     }
 
-    $usageStateExists = Test-Path -LiteralPath $usageStatePath -PathType Leaf
-    if (-not $scriptChanged -and $null -eq $state -and -not $usageStateExists) {
+    $usageStateExists = [bool]$usageStateSnapshot.Exists
+    if ($null -eq $scriptPlan -and $null -eq $state -and -not $autoUpdateStateExists -and -not $usageStateExists) {
         Write-Info "没有发现已安装的自动补丁，无需移除。"
         Complete-UninstallResult 0 "no_change" "not_installed" "没有发现已安装的自动补丁，无需移除。"
     }
-    if (-not $settingsRestored -and -not $clientRunning) { throw "部分设置在安装后有新改动，未自动覆盖；请根据保留的安装状态文件手动处理。" }
-    if ($usageStateExists) { Remove-Item -LiteralPath $usageStatePath -Force }
 
-    if ($clientRunning) {
-        Write-Info "全局自动补丁已移除；客户端保持运行，应用设置和现有备份均未改动。"
-    } else {
-        Write-Info "全局自动补丁已移除，config.yaml 与 verge.yaml 已恢复到安装前状态。现有备份没有删除。"
+    $filePlans = @()
+    if ($null -ne $autoUpdatePlan) { $filePlans += $autoUpdatePlan }
+    if ($null -ne $scriptPlan) { $filePlans += $scriptPlan }
+    $filePlans += @($settingPlans | Where-Object { $_.Changed })
+    foreach ($filePlan in $filePlans) {
+        if ([bool]$filePlan.Existed) { New-UninstallBackup $filePlan.Path | Out-Null }
     }
-    Complete-UninstallResult 0 "ok" "uninstalled" "Clash 补丁已安全移除。" @("global_script", "application_settings")
+    $writePlans = @($filePlans | Where-Object { -not [bool]$_.Delete })
+    $deletePlans = @($filePlans | Where-Object { [bool]$_.Delete } | ForEach-Object {
+        [pscustomobject]@{
+            Path = $_.Path
+            Existed = $_.Existed
+            OriginalBytes = $_.OriginalBytes
+            OriginalIdentity = $_.OriginalIdentity
+        }
+    })
+    if ($null -ne $state -and -not $clientRunning) {
+        $deletePlans += [pscustomobject]@{
+            Path = $statePath
+            Existed = $true
+            OriginalBytes = $stateSnapshot.Bytes
+            OriginalIdentity = $stateSnapshot.Identity
+        }
+    }
+    if ($autoUpdateStateExists) {
+        $deletePlans += [pscustomobject]@{
+            Path = $autoUpdateStatePath
+            Existed = $true
+            OriginalBytes = $autoUpdateStateBytes
+            OriginalIdentity = $autoUpdateStateSnapshot.Identity
+        }
+    }
+    if ($usageStateExists) {
+        $deletePlans += [pscustomobject]@{
+            Path = $usageStatePath
+            Existed = $true
+            OriginalBytes = $usageStateSnapshot.Bytes
+            OriginalIdentity = $usageStateSnapshot.Identity
+        }
+    }
+
+    $writeTargets = @($writePlans | ForEach-Object {
+        [pscustomobject]@{
+            Path = $_.Path
+            Bytes = $_.Bytes
+            Existed = $_.Existed
+            OriginalBytes = $_.OriginalBytes
+            OriginalIdentity = $_.OriginalIdentity
+        }
+    })
+    Invoke-VerifiedWriteDeleteTransaction $writeTargets $deletePlans
+
+    Write-Info "全局自动补丁已移除，config.yaml 与 verge.yaml 已恢复到安装前状态。现有备份没有删除。"
+    $changes = @()
+    if ($null -ne $scriptPlan) { $changes += "global_script" }
+    if ($autoUpdateStateExists) { $changes += "subscription_auto_update" }
+    if ($null -ne $state -and -not $clientRunning) { $changes += "application_settings" }
+    if ($usageStateExists) { $changes += "usage_profile" }
+    Complete-UninstallResult 0 "ok" "uninstalled" "Clash 补丁已安全移除。" $changes
 } catch {
     if (-not $Json) { [Console]::Error.WriteLine("[Clash 补丁] 卸载失败：$($_.Exception.Message)") }
     Complete-UninstallResult 1 "failed" "uninstall_failed" ("卸载失败：" + $_.Exception.Message)
+}
+} finally {
+    Exit-AppHomeMutationLock $mutationLock
 }

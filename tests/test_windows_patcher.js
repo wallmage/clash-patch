@@ -883,7 +883,7 @@ test('PowerShell installer structurally edits YAML and rolls back failed transac
   assert.match(source, /function Set-YamlTopLevelScalar/);
   assert.match(source, /function Set-YamlTunMapping/);
   assert.match(source, /function Test-GeneratedYaml/);
-  assert.match(source, /function Restore-Transaction/);
+  assert.match(source, /function Invoke-VerifiedPathTransaction/);
   assert.match(source, /function Get-RedactedYamlChangedPaths/);
   assert.match(source, /ChangedFields/);
   assert.match(source, /Assert-RemoteSubscriptionAutoUpdateDisabled \$output \| Out-Null/);
@@ -916,7 +916,7 @@ test('Windows installation fails closed and preserves exact restore state', () =
   assert.match(installer, /不会等待异步 main/);
   assert.match(uninstaller, /InstalledSha256/);
   assert.match(uninstaller, /function New-UninstallBackup/);
-  assert.match(uninstaller, /Guid.*NewGuid/);
+  assert.match(uninstaller, /Backup-Versioned \$Path \$backupRoot "pre-uninstall"/);
   assert.equal(fs.existsSync(installWrapperPath), true);
   assert.equal(fs.existsSync(uninstallWrapperPath), true);
   assert.match(fs.readFileSync(installWrapperPath, 'utf8'), /-ExecutionPolicy Bypass/);
@@ -928,10 +928,13 @@ test('Windows installer is split into side-effect-free modules with stable funct
   const expected = {
     'common.ps1': ['Write-Info', 'Complete-InstallResult', 'Get-SavedUsageProfile', 'Save-UsageProfile'],
     'transaction.ps1': [
-      'Protect-BackupAcl', 'Get-PathKey', 'Backup-Versioned', 'Backup-InitialOnce', 'Write-BytesAtomic',
+      'Protect-BackupAcl', 'Enter-AppHomeMutationLock', 'Exit-AppHomeMutationLock',
+      'Get-PathKey', 'Assert-NoReparsePointPath', 'Backup-Versioned', 'Backup-InitialOnce', 'Write-BytesAtomic',
       'ConvertTo-Utf8Bytes', 'Write-Utf8Atomic', 'Get-BytesSha256', 'Get-FileSha256',
-      'Get-StreamBytes', 'Write-LockedStreamBytes', 'Invoke-VerifiedFileTransaction', 'Restore-Transaction',
-      'Get-InstallStateEntry', 'Assert-InstallStateEntry', 'Assert-InstallState', 'Assert-StateTargetUnchanged',
+      'Get-StreamBytes', 'Get-OptionalFileSnapshot', 'Remove-VerifiedOwnedFile', 'Write-LockedStreamBytes',
+      'Initialize-VerifiedFileNative', 'Set-VerifiedDeleteDisposition', 'Invoke-VerifiedPathTransaction',
+      'Invoke-VerifiedFileTransaction', 'Invoke-VerifiedWriteDeleteTransaction',
+      'Get-InstallStateEntry', 'Assert-InstallStateEntry', 'Assert-InstallState', 'Assert-StateSnapshotUnchanged',
       'New-InstallStateEntry'
     ],
     'yaml.ps1': [
@@ -940,7 +943,10 @@ test('Windows installer is split into side-effect-free modules with stable funct
       'Get-ManagedTunLines', 'New-ManagedTunBlock', 'Set-YamlTunMapping', 'Test-GeneratedYaml'
     ],
     'profiles.ps1': [
-      'Get-RemoteSubscriptionProfileItems', 'Get-RemoteSubscriptionTargets',
+      'Get-RemoteSubscriptionProfileItems', 'Get-RemoteSubscriptionAutoUpdateStateRecords',
+      'Get-RemoteSubscriptionAutoUpdateOwnership', 'Restore-RemoteSubscriptionAutoUpdate',
+      'Assert-RemoteSubscriptionAutoUpdateOwnershipState', 'Merge-RemoteSubscriptionAutoUpdateOwnership',
+      'Get-RemoteSubscriptionTargets',
       'Set-RemoteSubscriptionAutoUpdateDisabled', 'Assert-RemoteSubscriptionAutoUpdateDisabled'
     ],
     'mihomo.ps1': [

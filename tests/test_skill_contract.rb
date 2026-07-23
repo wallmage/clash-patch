@@ -897,6 +897,31 @@ class SkillContractTest < Minitest::Test
     assert_includes windows_install, "S-1-5-18"
     assert_includes windows_install, "S-1-5-32-544"
     assert_includes windows_uninstall, "InstalledSha256"
+    assert_includes windows_install, "clash-patch-auto-update-state.json"
+    assert_includes windows_uninstall, "clash-patch-auto-update-state.json"
+    assert_includes windows_uninstall, "Invoke-VerifiedWriteDeleteTransaction"
+    assert_includes windows_tests, "auto-update restore did not reconstruct the original absent/null/tilde/empty-map shapes"
+    assert_includes windows_tests, "running offline uninstall changed a protected target"
+    assert_includes windows_tests, "delete transaction allowed a same-target write between verification and deletion"
+  end
+
+  def test_windows_safe_uninstall_ownership_and_partial_boundary_are_documented
+    readme = File.read(File.join(ROOT, "README.md"))
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+    baseline = File.read(File.join(ROOT, "tests/baseline.md"))
+
+    [readme, policy, design].each do |source|
+      assert_includes source, "所有权状态"
+      assert_match(/客户端.*运行.*(?:不改任何文件|整批不改|整批卸载返回 `partial`)/, source)
+      assert_match(/不得要求.*退出、停止或重启|不要求退出、停止或重启|不会要求退出或重启/, source)
+    end
+    assert_includes skill, "Windows 卸载返回 `partial`"
+    assert_includes skill, "必须保留旧档位且不得继续降档"
+    assert_includes baseline, "句柄绑定删除"
+    assert_includes baseline, "文件身份"
+    assert_includes baseline, "失败恢复不覆盖并发内容"
   end
 
 
@@ -962,8 +987,10 @@ class SkillContractTest < Minitest::Test
     assert_includes workflow, "--test-coverage-branches=80"
     assert_includes workflow, "shell: powershell"
     assert_includes workflow, "Get-Command powershell.exe"
+    assert_includes workflow, "-ExpectedPSEdition Desktop -ExpectedPSMajor 5"
     assert_includes workflow, "shell: pwsh"
     assert_includes workflow, "Get-Command pwsh.exe"
+    assert_includes workflow, "-ExpectedPSEdition Core -ExpectedPSMajor 7"
     assert_includes workflow, "git diff --check"
     assert_includes workflow, "fetch-depth: 0"
     assert_includes workflow, "github.event.before"

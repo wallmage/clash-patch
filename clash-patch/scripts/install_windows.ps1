@@ -90,13 +90,23 @@ $profilesIndexPath = Join-Path $AppHome "profiles.yaml"
 $vergePath = Join-Path $AppHome "verge.yaml"
 $configPath = Join-Path $AppHome "config.yaml"
 $statePath = Join-Path $AppHome "clash-patch-install-state.json"
+$autoUpdateStatePath = Join-Path $AppHome "clash-patch-auto-update-state.json"
 $usageStatePath = Join-Path $AppHome "clash-patch-usage-profile.json"
 $safeUpdateStatePath = Join-Path $AppHome "clash-patch-safe-update.json"
 $targetScript = Join-Path $profilesDirectory "Script.js"
 
+$mutationLock = $null
+try {
+    $mutationLock = Enter-AppHomeMutationLock $AppHome
+} catch {
+    Complete-InstallResult 1 "failed" "operation_in_progress" $_.Exception.Message
+}
+
+try {
 try {
 if ($SnapshotProfiles) {
-    if (Test-Path -LiteralPath $safeUpdateStatePath -PathType Leaf) {
+    $newManifestSnapshot = Get-OptionalFileSnapshot $safeUpdateStatePath "安全更新准备记录"
+    if ($newManifestSnapshot.Exists) {
         throw "发现尚未验收的安全更新；请先运行 -VerifySafeUpdate，不能覆盖更新前清单。"
     }
     if (-not (Test-Path -LiteralPath $profilesIndexPath -PathType Leaf)) { throw "找不到远程订阅清单。" }
@@ -105,25 +115,34 @@ if ($SnapshotProfiles) {
     $manifestItems = @()
     foreach ($profile in $profiles) {
         Backup-InitialOnce $profile.Path $backupRoot | Out-Null
-        $backup = Backup-Versioned $profile.Path $backupRoot "pre-update"
+        $backup = Backup-Versioned $profile.Path $backupRoot "pre-update" -WithMetadata
         $manifestItems += [ordered]@{
             Uid = $profile.Uid
             File = (Split-Path -Leaf $profile.Path)
-            BeforeSha256 = (Get-FileSha256 $profile.Path)
-            Backup = (Split-Path -Leaf $backup)
+            BeforeSha256 = $backup.Sha256
+            Backup = (Split-Path -Leaf $backup.Path)
         }
     }
     $manifest = [ordered]@{ Version = 1; CreatedAt = [DateTimeOffset]::Now.ToString("o"); Profiles = $manifestItems }
     $manifestBytes = ConvertTo-Utf8Bytes (($manifest | ConvertTo-Json -Depth 5) + "`r`n")
-    Write-BytesAtomic $safeUpdateStatePath $manifestBytes
+    Invoke-VerifiedFileTransaction @(
+        [pscustomobject]@{
+            Path = $safeUpdateStatePath
+            Bytes = $manifestBytes
+            Existed = $false
+            OriginalBytes = $null
+            OriginalIdentity = $null
+        }
+    )
     Write-Info "已核对远程清单，并为 $($profiles.Count) 份订阅创建安全更新前备份。"
     foreach ($profile in $profiles) { Write-Info ("待更新：" + $(if ([string]::IsNullOrWhiteSpace($profile.Name)) { $profile.Uid } else { $profile.Name })) }
     Complete-InstallResult 0 "ok" "snapshot_created" "已创建全部远程订阅的安全更新前备份。" @("profile_backups")
 }
 
 if ($VerifySafeUpdate) {
-    if (-not (Test-Path -LiteralPath $safeUpdateStatePath -PathType Leaf)) { throw "没有找到本次安全更新的准备记录。" }
-    $manifest = Get-Content -LiteralPath $safeUpdateStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $manifestSnapshot = Get-OptionalFileSnapshot $safeUpdateStatePath "安全更新准备记录"
+    if (-not $manifestSnapshot.Exists) { throw "没有找到本次安全更新的准备记录。" }
+    $manifest = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($manifestSnapshot.Bytes) | ConvertFrom-Json
     if ([int]$manifest.Version -ne 1 -or @($manifest.Profiles).Count -eq 0) { throw "安全更新准备记录无效。" }
     $recoveryItems = @(Get-SafeUpdateRecoveryItems $manifest $profilesDirectory $backupRoot)
     $validated = @()
@@ -133,7 +152,9 @@ if ($VerifySafeUpdate) {
             if (-not (Test-Path -LiteralPath $recovery.TargetPath -PathType Leaf)) { throw "更新后的订阅文件缺失。" }
             $observedCurrentHashes[$recovery.TargetPath] = Get-FileSha256 $recovery.TargetPath
         }
-        $indexText = Get-Content -LiteralPath $profilesIndexPath -Raw -Encoding UTF8
+        $indexSnapshot = Get-OptionalFileSnapshot $profilesIndexPath "profiles.yaml"
+        if (-not $indexSnapshot.Exists) { throw "远程订阅清单在更新期间消失。" }
+        $indexText = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($indexSnapshot.Bytes)
         $currentTargets = @(Get-RemoteSubscriptionTargets $indexText $profilesDirectory)
         if ($currentTargets.Count -ne $recoveryItems.Count) { throw "远程订阅清单在更新期间发生变化。" }
         $core = Find-MihomoCore $MihomoPath
@@ -170,7 +191,17 @@ if ($VerifySafeUpdate) {
                     throw "订阅在验收期间再次发生变化。"
                 }
             }
-            Remove-Item -LiteralPath $safeUpdateStatePath -Force
+            $indexGuard = [System.IO.File]::Open(
+                $profilesIndexPath,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::Read
+            )
+            $versionGuards += $indexGuard
+            if ((Get-BytesSha256 (Get-StreamBytes $indexGuard)) -ne (Get-BytesSha256 $indexSnapshot.Bytes)) {
+                throw "远程订阅清单在验收期间发生变化。"
+            }
+            Remove-VerifiedOwnedFile $safeUpdateStatePath $manifestSnapshot.Bytes $manifestSnapshot.Identity
         } finally {
             foreach ($guard in $versionGuards) { $guard.Dispose() }
         }
@@ -180,7 +211,7 @@ if ($VerifySafeUpdate) {
             throw "更新验收失败；检测到订阅同时发生变化，未覆盖新内容：$($restoreResult.Conflicts -join '、')。安全更新记录已保留。"
         }
         if ($restoreResult.Failures.Count -gt 0) { throw "更新验收失败，且部分订阅未能恢复：$($restoreResult.Failures -join '、')。安全更新记录已保留。" }
-        Remove-Item -LiteralPath $safeUpdateStatePath -Force
+        Remove-VerifiedOwnedFile $safeUpdateStatePath $manifestSnapshot.Bytes $manifestSnapshot.Identity
         throw "更新验收失败，全部订阅文件已恢复到更新前版本。"
     }
     foreach ($entry in $validated) {
@@ -317,6 +348,7 @@ if (-not (Test-Path -LiteralPath $enginePath -PathType Leaf)) {
 }
 
 try {
+    $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
     $clientRunning = Test-ClashVergeRunning
     $corePath = Find-MihomoCore $MihomoPath
     Test-MihomoVersion $corePath | Out-Null
@@ -325,6 +357,7 @@ try {
     }
     $usageProfileTarget = $null
     if ($profileSource -ne "saved") {
+        $usageProfileSnapshot = Get-OptionalFileSnapshot $usageStatePath "用途档位状态"
         $usageProfileBytes = ConvertTo-Utf8Bytes ((([ordered]@{
             Version = 1
             Profile = $resolvedUsageProfile
@@ -332,15 +365,16 @@ try {
         $usageProfileTarget = [pscustomobject]@{
             Path = $usageStatePath
             Bytes = $usageProfileBytes
-            Existed = (Test-Path -LiteralPath $usageStatePath)
-            OriginalBytes = $(if (Test-Path -LiteralPath $usageStatePath) { [System.IO.File]::ReadAllBytes($usageStatePath) } else { $null })
+            Existed = [bool]$usageProfileSnapshot.Exists
+            OriginalBytes = $usageProfileSnapshot.Bytes
+            OriginalIdentity = $usageProfileSnapshot.Identity
         }
     }
     if ($resolvedUsageProfile -ne 3) {
-        New-Item -ItemType Directory -Path $profilesDirectory -Force | Out-Null
-        $scriptExisted = Test-Path -LiteralPath $targetScript -PathType Leaf
-        $scriptOriginalBytes = if ($scriptExisted) { [System.IO.File]::ReadAllBytes($targetScript) } else { $null }
-        $scriptCurrentText = if ($scriptExisted) { [System.Text.Encoding]::UTF8.GetString($scriptOriginalBytes) } else { $null }
+        $scriptSnapshot = Get-OptionalFileSnapshot $targetScript "Script.js"
+        $scriptExisted = [bool]$scriptSnapshot.Exists
+        $scriptOriginalBytes = $scriptSnapshot.Bytes
+        $scriptCurrentText = if ($scriptExisted) { $strictUtf8.GetString($scriptOriginalBytes) } else { $null }
         $scriptOutput = Build-GlobalScript $enginePath $targetScript $resolvedUsageProfile $scriptCurrentText
         $scriptBytes = ConvertTo-Utf8Bytes $scriptOutput
         $scriptTarget = [pscustomobject]@{
@@ -348,6 +382,7 @@ try {
             Bytes = $scriptBytes
             Existed = $scriptExisted
             OriginalBytes = $scriptOriginalBytes
+            OriginalIdentity = $scriptSnapshot.Identity
         }
         Backup-InitialOnce $scriptTarget.Path $backupRoot | Out-Null
         Backup-Versioned $scriptTarget.Path $backupRoot "prewrite" | Out-Null
@@ -358,29 +393,64 @@ try {
         Write-Info "已为全部订阅安装共享国内域名直连规则；未修改 TUN、IPv6 或订阅自动更新。"
         Complete-InstallResult 0 "ok" "installed_common_baseline" "已安装全部订阅共用的国内域名直连规则。" @("global_script", "cn_domain_baseline")
     }
-    if (-not (Test-Path -LiteralPath $profilesIndexPath -PathType Leaf)) {
+    $profilesIndexSnapshot = Get-OptionalFileSnapshot $profilesIndexPath "profiles.yaml"
+    if (-not $profilesIndexSnapshot.Exists) {
         throw "找不到 Clash Verge Rev 的 profiles.yaml，无法自动关闭订阅更新。"
     }
-    $profilesIndexOriginalBytes = [System.IO.File]::ReadAllBytes($profilesIndexPath)
-    $profilesIndexInput = [System.Text.Encoding]::UTF8.GetString($profilesIndexOriginalBytes)
+    $profilesIndexOriginalBytes = $profilesIndexSnapshot.Bytes
+    $profilesIndexInput = $strictUtf8.GetString($profilesIndexOriginalBytes)
+    $currentAutoUpdateOwnership = @(Get-RemoteSubscriptionAutoUpdateOwnership $profilesIndexInput)
+    $autoUpdateStateSnapshot = Get-OptionalFileSnapshot $autoUpdateStatePath "订阅自动更新所有权状态"
+    if ($autoUpdateStateSnapshot.Exists) {
+        $autoUpdateStateExisted = $true
+        $autoUpdateStateOriginalBytes = $autoUpdateStateSnapshot.Bytes
+        try {
+            $existingAutoUpdateState = $strictUtf8.GetString($autoUpdateStateOriginalBytes) | ConvertFrom-Json
+        } catch {
+            throw "订阅自动更新所有权状态文件无效。"
+        }
+        $existingAutoUpdateOwnership = @(Assert-RemoteSubscriptionAutoUpdateOwnershipState $existingAutoUpdateState)
+    } else {
+        $autoUpdateStateExisted = $false
+        $autoUpdateStateOriginalBytes = $null
+        $existingAutoUpdateOwnership = @()
+    }
+    $mergedAutoUpdateOwnership = @(
+        Merge-RemoteSubscriptionAutoUpdateOwnership $existingAutoUpdateOwnership $currentAutoUpdateOwnership
+    )
+    $autoUpdateStateTarget = $null
+    if ($autoUpdateStateExisted -or $mergedAutoUpdateOwnership.Count -gt 0) {
+        $autoUpdateStateBytes = ConvertTo-Utf8Bytes ((([ordered]@{
+            Version = 1
+            Profiles = $mergedAutoUpdateOwnership
+        }) | ConvertTo-Json -Depth 5) + "`r`n")
+        $autoUpdateStateTarget = [pscustomobject]@{
+            Path = $autoUpdateStatePath
+            Bytes = $autoUpdateStateBytes
+            Existed = $autoUpdateStateExisted
+            OriginalBytes = $autoUpdateStateOriginalBytes
+            OriginalIdentity = $autoUpdateStateSnapshot.Identity
+        }
+    }
     $profilesIndexOutput = Set-RemoteSubscriptionAutoUpdateDisabled $profilesIndexInput
     Assert-RemoteSubscriptionAutoUpdateDisabled $profilesIndexOutput | Out-Null
     $profilesIndexBytes = ConvertTo-Utf8Bytes $profilesIndexOutput
 
     if ($clientRunning) {
-        New-Item -ItemType Directory -Path $profilesDirectory -Force | Out-Null
-        $scriptExisted = Test-Path -LiteralPath $targetScript -PathType Leaf
-        $scriptOriginalBytes = if ($scriptExisted) { [System.IO.File]::ReadAllBytes($targetScript) } else { $null }
-        $scriptCurrentText = if ($scriptExisted) { [System.Text.Encoding]::UTF8.GetString($scriptOriginalBytes) } else { $null }
+        $scriptSnapshot = Get-OptionalFileSnapshot $targetScript "Script.js"
+        $scriptExisted = [bool]$scriptSnapshot.Exists
+        $scriptOriginalBytes = $scriptSnapshot.Bytes
+        $scriptCurrentText = if ($scriptExisted) { $strictUtf8.GetString($scriptOriginalBytes) } else { $null }
         $scriptOutput = Build-GlobalScript $enginePath $targetScript $resolvedUsageProfile $scriptCurrentText
         $scriptBytes = ConvertTo-Utf8Bytes $scriptOutput
         $runningTargets = @(
-            [pscustomobject]@{ Path = $targetScript; Bytes = $scriptBytes; Existed = $scriptExisted; OriginalBytes = $scriptOriginalBytes },
-            [pscustomobject]@{ Path = $profilesIndexPath; Bytes = $profilesIndexBytes; Existed = $true; OriginalBytes = $profilesIndexOriginalBytes }
+            [pscustomobject]@{ Path = $targetScript; Bytes = $scriptBytes; Existed = $scriptExisted; OriginalBytes = $scriptOriginalBytes; OriginalIdentity = $scriptSnapshot.Identity },
+            [pscustomobject]@{ Path = $profilesIndexPath; Bytes = $profilesIndexBytes; Existed = $true; OriginalBytes = $profilesIndexOriginalBytes; OriginalIdentity = $profilesIndexSnapshot.Identity }
         )
+        if ($null -ne $autoUpdateStateTarget) { $runningTargets += $autoUpdateStateTarget }
         if ($null -ne $usageProfileTarget) { $runningTargets += $usageProfileTarget }
         foreach ($target in $runningTargets) {
-            if ($target.Path -eq $usageStatePath) { continue }
+            if ($target.Path -in @($usageStatePath, $autoUpdateStatePath)) { continue }
             Backup-InitialOnce $target.Path $backupRoot | Out-Null
             Backup-Versioned $target.Path $backupRoot "prewrite" | Out-Null
         }
@@ -394,30 +464,33 @@ try {
     }
 
     $installState = $null
-    $stateExisted = Test-Path -LiteralPath $statePath -PathType Leaf
-    $stateOriginalBytes = if ($stateExisted) { [System.IO.File]::ReadAllBytes($statePath) } else { $null }
-    if (Test-Path -LiteralPath $statePath -PathType Leaf) {
-        $installState = [System.Text.Encoding]::UTF8.GetString($stateOriginalBytes) | ConvertFrom-Json
+    $stateSnapshot = Get-OptionalFileSnapshot $statePath "安装状态"
+    $stateExisted = [bool]$stateSnapshot.Exists
+    $stateOriginalBytes = $stateSnapshot.Bytes
+    if ($stateExisted) {
+        $installState = $strictUtf8.GetString($stateOriginalBytes) | ConvertFrom-Json
         Assert-InstallState $installState
     }
     $previousVerge = Get-InstallStateEntry $installState "VergeYaml"
     $previousConfig = Get-InstallStateEntry $installState "ConfigYaml"
-    Assert-StateTargetUnchanged $previousVerge $vergePath "verge.yaml"
-    Assert-StateTargetUnchanged $previousConfig $configPath "config.yaml"
 
-    New-Item -ItemType Directory -Path $profilesDirectory -Force | Out-Null
-    $scriptExisted = Test-Path -LiteralPath $targetScript -PathType Leaf
-    $scriptOriginalBytes = if ($scriptExisted) { [System.IO.File]::ReadAllBytes($targetScript) } else { $null }
-    $scriptCurrentText = if ($scriptExisted) { [System.Text.Encoding]::UTF8.GetString($scriptOriginalBytes) } else { $null }
+    $scriptSnapshot = Get-OptionalFileSnapshot $targetScript "Script.js"
+    $scriptExisted = [bool]$scriptSnapshot.Exists
+    $scriptOriginalBytes = $scriptSnapshot.Bytes
+    $scriptCurrentText = if ($scriptExisted) { $strictUtf8.GetString($scriptOriginalBytes) } else { $null }
     $scriptOutput = Build-GlobalScript $enginePath $targetScript $resolvedUsageProfile $scriptCurrentText
-    $vergeExisted = Test-Path -LiteralPath $vergePath -PathType Leaf
-    $vergeOriginalBytes = if ($vergeExisted) { [System.IO.File]::ReadAllBytes($vergePath) } else { $null }
-    $vergeInput = if ($vergeExisted) { [System.Text.Encoding]::UTF8.GetString($vergeOriginalBytes) } else { "" }
+    $vergeSnapshot = Get-OptionalFileSnapshot $vergePath "verge.yaml"
+    $vergeExisted = [bool]$vergeSnapshot.Exists
+    $vergeOriginalBytes = $vergeSnapshot.Bytes
+    Assert-StateSnapshotUnchanged $previousVerge $vergeSnapshot "verge.yaml"
+    $vergeInput = if ($vergeExisted) { $strictUtf8.GetString($vergeOriginalBytes) } else { "" }
     $vergeOutput = Set-YamlTopLevelScalar $vergeInput "enable_tun_mode" "true"
     $vergeOutput = Set-YamlTopLevelScalar $vergeOutput "enable_dns_settings" "false"
-    $configExisted = Test-Path -LiteralPath $configPath -PathType Leaf
-    $configOriginalBytes = if ($configExisted) { [System.IO.File]::ReadAllBytes($configPath) } else { $null }
-    $configInput = if ($configExisted) { [System.Text.Encoding]::UTF8.GetString($configOriginalBytes) } else { "" }
+    $configSnapshot = Get-OptionalFileSnapshot $configPath "config.yaml"
+    $configExisted = [bool]$configSnapshot.Exists
+    $configOriginalBytes = $configSnapshot.Bytes
+    Assert-StateSnapshotUnchanged $previousConfig $configSnapshot "config.yaml"
+    $configInput = if ($configExisted) { $strictUtf8.GetString($configOriginalBytes) } else { "" }
     $configOutput = Set-YamlTopLevelScalar $configInput "ipv6" "false"
     $configOutput = Set-YamlTunMapping $configOutput
 
@@ -436,15 +509,16 @@ try {
     $stateBytes = ConvertTo-Utf8Bytes (($stateObject | ConvertTo-Json -Depth 5) + "`r`n")
 
     $targets = @(
-        [pscustomobject]@{ Path = $targetScript; Bytes = $scriptBytes; Existed = $scriptExisted; OriginalBytes = $scriptOriginalBytes },
-        [pscustomobject]@{ Path = $profilesIndexPath; Bytes = $profilesIndexBytes; Existed = $true; OriginalBytes = $profilesIndexOriginalBytes },
-        [pscustomobject]@{ Path = $vergePath; Bytes = $vergeBytes; Existed = $vergeExisted; OriginalBytes = $vergeOriginalBytes },
-        [pscustomobject]@{ Path = $configPath; Bytes = $configBytes; Existed = $configExisted; OriginalBytes = $configOriginalBytes },
-        [pscustomobject]@{ Path = $statePath; Bytes = $stateBytes; Existed = $stateExisted; OriginalBytes = $stateOriginalBytes }
+        [pscustomobject]@{ Path = $targetScript; Bytes = $scriptBytes; Existed = $scriptExisted; OriginalBytes = $scriptOriginalBytes; OriginalIdentity = $scriptSnapshot.Identity },
+        [pscustomobject]@{ Path = $profilesIndexPath; Bytes = $profilesIndexBytes; Existed = $true; OriginalBytes = $profilesIndexOriginalBytes; OriginalIdentity = $profilesIndexSnapshot.Identity },
+        [pscustomobject]@{ Path = $vergePath; Bytes = $vergeBytes; Existed = $vergeExisted; OriginalBytes = $vergeOriginalBytes; OriginalIdentity = $vergeSnapshot.Identity },
+        [pscustomobject]@{ Path = $configPath; Bytes = $configBytes; Existed = $configExisted; OriginalBytes = $configOriginalBytes; OriginalIdentity = $configSnapshot.Identity },
+        [pscustomobject]@{ Path = $statePath; Bytes = $stateBytes; Existed = $stateExisted; OriginalBytes = $stateOriginalBytes; OriginalIdentity = $stateSnapshot.Identity }
     )
+    if ($null -ne $autoUpdateStateTarget) { $targets += $autoUpdateStateTarget }
     if ($null -ne $usageProfileTarget) { $targets += $usageProfileTarget }
     foreach ($target in $targets) {
-        if ($target.Path -eq $usageStatePath) { continue }
+        if ($target.Path -in @($usageStatePath, $autoUpdateStatePath)) { continue }
         Backup-InitialOnce $target.Path $backupRoot | Out-Null
         Backup-Versioned $target.Path $backupRoot "prewrite" | Out-Null
     }
@@ -464,4 +538,7 @@ try {
     if (-not $Json) { [Console]::Error.WriteLine("[Clash 补丁] 安装失败：$($_.Exception.Message)") }
     Complete-InstallResult 1 $(if ($_.Exception.Message -match "已撤销|恢复") { "rolled_back" } else { "failed" }) "install_failed" ("安装失败：" + $_.Exception.Message)
     exit 1
+}
+} finally {
+    Exit-AppHomeMutationLock $mutationLock
 }

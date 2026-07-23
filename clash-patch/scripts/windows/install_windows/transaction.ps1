@@ -22,6 +22,45 @@
     }
     Set-Acl -LiteralPath $Path -AclObject $security
 }
+
+function Enter-AppHomeMutationLock([string]$AppHome) {
+    Assert-NoReparsePointPath $AppHome "Clash Verge Rev 配置目录"
+    $canonical = [System.IO.Path]::GetFullPath($AppHome).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    ).ToUpperInvariant()
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($canonical)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $key = ([System.BitConverter]::ToString($sha.ComputeHash($bytes, 0, $bytes.Length))).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $sha.Dispose()
+    }
+    $mutex = New-Object System.Threading.Mutex($false, ("Local\ClashPatch-" + $key))
+    $acquired = $false
+    try {
+        try {
+            $acquired = $mutex.WaitOne(0, $false)
+        } catch [System.Threading.AbandonedMutexException] {
+            $acquired = $true
+        }
+        if (-not $acquired) { throw "同一配置目录已有 Clash 补丁操作正在进行，请稍后重试。" }
+        return $mutex
+    } catch {
+        $mutex.Dispose()
+        throw
+    }
+}
+
+function Exit-AppHomeMutationLock([System.Threading.Mutex]$Mutex) {
+    if ($null -eq $Mutex) { return }
+    try {
+        $Mutex.ReleaseMutex()
+    } finally {
+        $Mutex.Dispose()
+    }
+}
+
 function Get-PathKey([string]$Path) {
     $absolute = [System.IO.Path]::GetFullPath($Path)
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($absolute)
@@ -33,7 +72,33 @@ function Get-PathKey([string]$Path) {
     }
 }
 
-function Backup-Versioned([string]$Path, [string]$BackupRoot, [string]$Reason = "prewrite") {
+function Assert-NoReparsePointPath([string]$Path, [string]$Label) {
+    $current = [System.IO.Path]::GetFullPath($Path)
+    $visited = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    while (-not [string]::IsNullOrWhiteSpace($current) -and $visited.Add($current)) {
+        if (Test-Path -LiteralPath $current) {
+            $item = Get-Item -LiteralPath $current -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "$Label 不能经过符号链接、目录联接或其他重解析点：$current"
+            }
+        }
+        $parent = [System.IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrWhiteSpace($parent) -or
+            [string]::Equals($parent, $current, [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $current = $parent
+    }
+}
+
+function Backup-Versioned(
+    [string]$Path,
+    [string]$BackupRoot,
+    [string]$Reason = "prewrite",
+    [switch]$WithMetadata
+) {
+    Assert-NoReparsePointPath $Path "备份来源"
+    Assert-NoReparsePointPath $BackupRoot "备份目录"
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return }
     if ($Reason -notmatch '^[a-z][a-z0-9-]{0,31}$') { throw "备份原因无效。" }
     if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) {
@@ -46,32 +111,41 @@ function Backup-Versioned([string]$Path, [string]$BackupRoot, [string]$Reason = 
     $sourceStream = $null
     $backupStream = $null
     $created = $false
+    $createdBytes = $null
     $failure = $null
     try {
         $sourceStream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
-        $backupStream = [System.IO.File]::Open($destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        $backupStream = [System.IO.File]::Open($destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
         $created = $true
         $sourceStream.CopyTo($backupStream)
-        $backupStream.Flush()
+        $backupStream.Flush($true)
+        $createdBytes = Get-StreamBytes $backupStream
     } catch {
         $failure = $_
     } finally {
+        if ($created -and $null -ne $backupStream -and $null -eq $createdBytes) {
+            try { $createdBytes = Get-StreamBytes $backupStream } catch { }
+        }
         if ($null -ne $backupStream) { $backupStream.Dispose() }
         if ($null -ne $sourceStream) { $sourceStream.Dispose() }
     }
     if ($null -ne $failure) {
-        if ($created -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
-            Remove-Item -LiteralPath $destination -Force
+        if ($created -and $null -ne $createdBytes) {
+            Remove-VerifiedOwnedFile $destination $createdBytes
         }
         throw $failure
     }
     try {
         Protect-BackupAcl $destination
     } catch {
-        if ($created -and (Test-Path -LiteralPath $destination -PathType Leaf)) {
-            Remove-Item -LiteralPath $destination -Force
-        }
+        Remove-VerifiedOwnedFile $destination $createdBytes
         throw
+    }
+    if ($WithMetadata) {
+        return [pscustomobject]@{
+            Path = $destination
+            Sha256 = Get-BytesSha256 $createdBytes
+        }
     }
     return $destination
 }
@@ -90,15 +164,16 @@ function Backup-InitialOnce([string]$Path, [string]$BackupRoot) {
 }
 
 function Write-BytesAtomic([string]$Path, [byte[]]$Bytes) {
-    if (Test-Path -LiteralPath $Path -PathType Container) { throw "目标路径是目录，不能写入：$Path" }
-    $directory = Split-Path -Parent $Path
-    $temporary = Join-Path $directory (".clash-patch-" + [System.IO.Path]::GetRandomFileName())
-    try {
-        [System.IO.File]::WriteAllBytes($temporary, $Bytes)
-        Move-Item -LiteralPath $temporary -Destination $Path -Force
-    } finally {
-        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
-    }
+    $snapshot = Get-OptionalFileSnapshot $Path "写入目标"
+    Invoke-VerifiedFileTransaction @(
+        [pscustomobject]@{
+            Path = $Path
+            Bytes = $Bytes
+            Existed = [bool]$snapshot.Exists
+            OriginalBytes = $snapshot.Bytes
+            OriginalIdentity = $snapshot.Identity
+        }
+    )
 }
 
 function ConvertTo-Utf8Bytes([string]$Content) {
@@ -137,6 +212,67 @@ function Get-StreamBytes([System.IO.FileStream]$Stream) {
     }
 }
 
+function Get-OptionalFileSnapshot([string]$Path, [string]$Label) {
+    Assert-NoReparsePointPath $Path $Label
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{
+            Exists = $false
+            Path = $Path
+            Bytes = $null
+            Identity = $null
+        }
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "$Label 路径不是文件。"
+    }
+    Initialize-VerifiedFileNative
+    $handle = [ClashPatch.VerifiedDeleteNative]::Open($Path, $false, $false)
+    $stream = $null
+    try {
+        if ([ClashPatch.VerifiedDeleteNative]::IsReparsePoint($handle)) {
+            throw "$Label 不能是符号链接或其他重解析点。"
+        }
+        if ([ClashPatch.VerifiedDeleteNative]::GetLinkCount($handle) -ne 1) {
+            throw "$Label 不能有硬链接别名。"
+        }
+        $identity = [ClashPatch.VerifiedDeleteNative]::GetIdentity($handle)
+        $stream = New-Object System.IO.FileStream($handle, [System.IO.FileAccess]::Read)
+        return [pscustomobject]@{
+            Exists = $true
+            Path = $Path
+            Bytes = Get-StreamBytes $stream
+            Identity = $identity
+        }
+    } finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        } else {
+            $handle.Dispose()
+        }
+    }
+}
+
+function Remove-VerifiedOwnedFile(
+    [string]$Path,
+    [byte[]]$ExpectedBytes,
+    [string]$ExpectedIdentity = ""
+) {
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    $snapshot = Get-OptionalFileSnapshot $Path "待删除文件"
+    if ((Get-BytesSha256 $snapshot.Bytes) -ne (Get-BytesSha256 $ExpectedBytes) -or
+        (-not [string]::IsNullOrWhiteSpace($ExpectedIdentity) -and $snapshot.Identity -cne $ExpectedIdentity)) {
+        throw "待删除文件在验证后发生变化。"
+    }
+    Invoke-VerifiedWriteDeleteTransaction @() @(
+        [pscustomobject]@{
+            Path = $Path
+            Existed = $true
+            OriginalBytes = $snapshot.Bytes
+            OriginalIdentity = $snapshot.Identity
+        }
+    )
+}
+
 function Write-LockedStreamBytes(
     [System.IO.FileStream]$Stream,
     [byte[]]$Replacement,
@@ -161,83 +297,321 @@ function Write-LockedStreamBytes(
     }
 }
 
-function Invoke-VerifiedFileTransaction([object[]]$Targets) {
+function Initialize-VerifiedFileNative {
+    if ($null -ne ("ClashPatch.VerifiedDeleteNative" -as [type])) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+namespace ClashPatch
+{
+    public static class VerifiedDeleteNative
+    {
+        private const uint GenericRead = 0x80000000;
+        private const uint GenericWrite = 0x40000000;
+        private const uint DeleteAccess = 0x00010000;
+        private const uint CreateNew = 1;
+        private const uint OpenExisting = 3;
+        private const uint OpenReparsePoint = 0x00200000;
+        private const uint FileAttributeReparsePoint = 0x00000400;
+        private const int FileDispositionInfo = 4;
+        private const int FileAttributeTagInfo = 9;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileDispositionInformation
+        {
+            public byte DeleteFile;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FileAttributeTagInformation
+        {
+            public uint FileAttributes;
+            public uint ReparseTag;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ByHandleFileInformation
+        {
+            public uint FileAttributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile
+        );
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetFileInformationByHandle(
+            SafeFileHandle file,
+            int informationClass,
+            ref FileDispositionInformation information,
+            uint bufferSize
+        );
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandleEx(
+            SafeFileHandle file,
+            int informationClass,
+            out FileAttributeTagInformation information,
+            uint bufferSize
+        );
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(
+            SafeFileHandle file,
+            out ByHandleFileInformation information
+        );
+
+        public static SafeFileHandle Open(string path, bool writable, bool createNew)
+        {
+            uint desiredAccess = GenericRead | DeleteAccess;
+            if (writable)
+            {
+                desiredAccess |= GenericWrite;
+            }
+            SafeFileHandle handle = CreateFile(
+                path,
+                desiredAccess,
+                0,
+                IntPtr.Zero,
+                createNew ? CreateNew : OpenExisting,
+                OpenReparsePoint,
+                IntPtr.Zero
+            );
+            if (handle.IsInvalid)
+            {
+                int error = Marshal.GetLastWin32Error();
+                handle.Dispose();
+                throw new Win32Exception(error, "无法独占打开事务目标。");
+            }
+            return handle;
+        }
+
+        public static bool IsReparsePoint(SafeFileHandle handle)
+        {
+            FileAttributeTagInformation information;
+            if (!GetFileInformationByHandleEx(
+                handle,
+                FileAttributeTagInfo,
+                out information,
+                (uint)Marshal.SizeOf(typeof(FileAttributeTagInformation))
+            ))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "无法读取待删除文件属性。");
+            }
+            return (information.FileAttributes & FileAttributeReparsePoint) != 0;
+        }
+
+        public static uint GetLinkCount(SafeFileHandle handle)
+        {
+            ByHandleFileInformation information;
+            if (!GetFileInformationByHandle(handle, out information))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "无法读取事务目标的文件身份。");
+            }
+            return information.NumberOfLinks;
+        }
+
+        public static string GetIdentity(SafeFileHandle handle)
+        {
+            ByHandleFileInformation information;
+            if (!GetFileInformationByHandle(handle, out information))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "无法读取事务目标的文件身份。");
+            }
+            return information.VolumeSerialNumber.ToString("x8") + ":" +
+                information.FileIndexHigh.ToString("x8") +
+                information.FileIndexLow.ToString("x8");
+        }
+
+        public static void SetDeleteDisposition(SafeFileHandle handle, bool deleteFile)
+        {
+            FileDispositionInformation information = new FileDispositionInformation();
+            information.DeleteFile = deleteFile ? (byte)1 : (byte)0;
+            if (!SetFileInformationByHandle(
+                handle,
+                FileDispositionInfo,
+                ref information,
+                (uint)Marshal.SizeOf(typeof(FileDispositionInformation))
+            ))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "无法更新已经验证的文件删除状态。");
+            }
+        }
+    }
+}
+'@
+}
+
+function Set-VerifiedDeleteDisposition([System.IO.FileStream]$Stream, [bool]$DeleteFile) {
+    [ClashPatch.VerifiedDeleteNative]::SetDeleteDisposition($Stream.SafeFileHandle, $DeleteFile)
+}
+
+function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$DeleteTargets) {
+    $writePathKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $actions = @()
+    foreach ($writeTarget in @($WriteTargets)) {
+        if ([string]::IsNullOrWhiteSpace([string]$writeTarget.Path)) { throw "事务写入目标路径无效。" }
+        $pathKey = [System.IO.Path]::GetFullPath([string]$writeTarget.Path)
+        if (-not $writePathKeys.Add($pathKey)) { throw "事务包含重复写入目标：$($writeTarget.Path)" }
+        $actions += [pscustomobject]@{
+            Action = "write"
+            Path = [string]$writeTarget.Path
+            Target = $writeTarget
+            Writable = $true
+            CreateNew = (-not [bool]$writeTarget.Existed)
+        }
+    }
+    $deletePathKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($deleteTarget in @($DeleteTargets)) {
+        if ([string]::IsNullOrWhiteSpace([string]$deleteTarget.Path)) { throw "事务删除目标路径无效。" }
+        $pathKey = [System.IO.Path]::GetFullPath([string]$deleteTarget.Path)
+        if (-not $deletePathKeys.Add($pathKey)) { throw "事务包含重复删除目标：$($deleteTarget.Path)" }
+        if ($writePathKeys.Contains($pathKey)) { throw "事务不能同时写入并删除同一路径：$($deleteTarget.Path)" }
+        if (-not [bool]$deleteTarget.Existed) { throw "事务删除目标必须是已经存在的文件：$($deleteTarget.Path)" }
+        $actions += [pscustomobject]@{
+            Action = "delete"
+            Path = [string]$deleteTarget.Path
+            Target = $deleteTarget
+            Writable = $false
+            CreateNew = $false
+        }
+    }
+
+    foreach ($action in $actions) {
+        Assert-NoReparsePointPath $action.Path "事务目标"
+    }
+    Initialize-VerifiedFileNative
     $opened = @()
+    $markedDeletes = @()
     $operationFailure = $null
     $recoveryFailures = @()
     try {
-        foreach ($target in @($Targets | Sort-Object Path)) {
-            $directory = Split-Path -Parent $target.Path
-            if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        foreach ($action in @($actions | Sort-Object Path)) {
+            $directory = Split-Path -Parent $action.Path
+            if ($action.CreateNew -and -not (Test-Path -LiteralPath $directory -PathType Container)) {
                 New-Item -ItemType Directory -Path $directory -Force | Out-Null
             }
-            if ([bool]$target.Existed) {
-                $stream = [System.IO.File]::Open(
-                    $target.Path,
-                    [System.IO.FileMode]::Open,
-                    [System.IO.FileAccess]::ReadWrite,
-                    [System.IO.FileShare]::Read
-                )
-                $current = Get-StreamBytes $stream
-                if ((Get-BytesSha256 $current) -ne (Get-BytesSha256 $target.OriginalBytes)) {
-                    $stream.Dispose()
-                    throw "目标文件在候选生成后发生变化，拒绝覆盖：$($target.Path)"
+            if ($action.CreateNew) {
+                if (Test-Path -LiteralPath $action.Path) {
+                    throw "目标路径在候选生成后出现，拒绝覆盖：$($action.Path)"
                 }
-            } else {
-                if (Test-Path -LiteralPath $target.Path) {
-                    throw "目标路径在候选生成后出现，拒绝覆盖：$($target.Path)"
-                }
-                $stream = [System.IO.File]::Open(
-                    $target.Path,
-                    [System.IO.FileMode]::CreateNew,
-                    [System.IO.FileAccess]::ReadWrite,
-                    [System.IO.FileShare]::Read
-                )
-                $current = [byte[]]@()
+            } elseif (-not (Test-Path -LiteralPath $action.Path -PathType Leaf)) {
+                throw "事务目标在候选生成后消失或不再是文件：$($action.Path)"
             }
-            $opened += [pscustomobject]@{ Target = $target; Stream = $stream; Original = $current }
+
+            $handle = [ClashPatch.VerifiedDeleteNative]::Open(
+                $action.Path,
+                [bool]$action.Writable,
+                [bool]$action.CreateNew
+            )
+            $stream = $null
+            try {
+                if ([ClashPatch.VerifiedDeleteNative]::IsReparsePoint($handle)) {
+                    throw "事务目标不能是符号链接或其他重解析点：$($action.Path)"
+                }
+                if ([ClashPatch.VerifiedDeleteNative]::GetLinkCount($handle) -ne 1) {
+                    throw "事务目标不能有硬链接别名：$($action.Path)"
+                }
+                $access = if ($action.Writable) { [System.IO.FileAccess]::ReadWrite } else { [System.IO.FileAccess]::Read }
+                $stream = New-Object System.IO.FileStream($handle, $access)
+            } catch {
+                if ($null -ne $stream) { $stream.Dispose() } else { $handle.Dispose() }
+                throw
+            }
+            $entry = [pscustomobject]@{
+                Action = $action.Action
+                Target = $action.Target
+                Stream = $stream
+                Original = [byte[]]@()
+                Created = [bool]$action.CreateNew
+            }
+            $opened += $entry
+            $current = Get-StreamBytes $stream
+            $entry.Original = $current
+            if ($action.CreateNew) {
+                if ($current.Length -ne 0) { throw "新建事务目标不是空文件：$($action.Path)" }
+            } else {
+                $identityProperty = $action.Target.PSObject.Properties["OriginalIdentity"]
+                if ($null -eq $identityProperty -or [string]::IsNullOrWhiteSpace([string]$identityProperty.Value)) {
+                    throw "事务目标缺少候选生成时的文件身份：$($action.Path)"
+                }
+                if ([ClashPatch.VerifiedDeleteNative]::GetIdentity($handle) -cne [string]$identityProperty.Value -or
+                    (Get-BytesSha256 $current) -ne (Get-BytesSha256 $action.Target.OriginalBytes)) {
+                    throw "事务目标在候选生成后发生变化，拒绝继续：$($action.Path)"
+                }
+            }
         }
 
-        foreach ($entry in $opened) {
+        foreach ($entry in @($opened | Where-Object { $_.Action -eq "write" })) {
             Write-LockedStreamBytes $entry.Stream $entry.Target.Bytes $entry.Original
         }
-        foreach ($entry in $opened) {
+        foreach ($entry in @($opened | Where-Object { $_.Action -eq "write" })) {
             if ((Get-BytesSha256 (Get-StreamBytes $entry.Stream)) -ne (Get-BytesSha256 $entry.Target.Bytes)) {
                 throw "写入后的文件与已验证候选不一致：$($entry.Target.Path)"
             }
         }
+        foreach ($entry in @($opened | Where-Object { $_.Action -eq "delete" })) {
+            Set-VerifiedDeleteDisposition $entry.Stream $true
+            $markedDeletes += $entry
+        }
     } catch {
         $operationFailure = $_
-    } finally {
-        if ($null -ne $operationFailure) {
-            for ($i = $opened.Count - 1; $i -ge 0; $i--) {
-                $entry = $opened[$i]
-                if ([bool]$entry.Target.Existed) {
-                    try {
-                        Write-LockedStreamBytes $entry.Stream $entry.Original (Get-StreamBytes $entry.Stream)
-                    } catch {
-                        $recoveryFailures += "$($entry.Target.Path)：$($_.Exception.Message)"
-                    }
-                }
-            }
-        }
-        foreach ($entry in $opened) {
+    }
+
+    if ($null -ne $operationFailure) {
+        for ($i = $markedDeletes.Count - 1; $i -ge 0; $i--) {
             try {
-                $entry.Stream.Dispose()
+                Set-VerifiedDeleteDisposition $markedDeletes[$i].Stream $false
             } catch {
-                $recoveryFailures += "$($entry.Target.Path)：关闭文件失败：$($_.Exception.Message)"
+                $recoveryFailures += "$($markedDeletes[$i].Target.Path)：取消删除失败：$($_.Exception.Message)"
             }
         }
-        if ($null -ne $operationFailure) {
-            foreach ($entry in $opened) {
-                if (-not [bool]$entry.Target.Existed -and (Test-Path -LiteralPath $entry.Target.Path)) {
-                    try {
-                        Remove-Item -LiteralPath $entry.Target.Path -Force
-                    } catch {
-                        $recoveryFailures += "$($entry.Target.Path)：删除新文件失败：$($_.Exception.Message)"
+        for ($i = $opened.Count - 1; $i -ge 0; $i--) {
+            $entry = $opened[$i]
+            if ($entry.Action -ne "write") { continue }
+            if ($entry.Created) {
+                try {
+                    Set-VerifiedDeleteDisposition $entry.Stream $true
+                } catch {
+                    $recoveryFailures += "$($entry.Target.Path)：删除事务新建文件失败：$($_.Exception.Message)"
+                }
+            } else {
+                try {
+                    Write-LockedStreamBytes $entry.Stream $entry.Original (Get-StreamBytes $entry.Stream)
+                    if ((Get-BytesSha256 (Get-StreamBytes $entry.Stream)) -ne (Get-BytesSha256 $entry.Original)) {
+                        throw "恢复后的内容与原文件不一致。"
                     }
+                } catch {
+                    $recoveryFailures += "$($entry.Target.Path)：恢复原文件失败：$($_.Exception.Message)"
                 }
             }
+        }
+    }
+
+    for ($i = $opened.Count - 1; $i -ge 0; $i--) {
+        try {
+            $opened[$i].Stream.Dispose()
+        } catch {
+            $recoveryFailures += "$($opened[$i].Target.Path)：关闭事务文件失败：$($_.Exception.Message)"
         }
     }
     if ($recoveryFailures.Count -gt 0) {
@@ -247,23 +621,14 @@ function Invoke-VerifiedFileTransaction([object[]]$Targets) {
     if ($null -ne $operationFailure) { throw $operationFailure }
 }
 
-
-function Restore-Transaction([object[]]$Targets) {
-    $failures = @()
-    for ($i = $Targets.Count - 1; $i -ge 0; $i--) {
-        $target = $Targets[$i]
-        try {
-            if ($target.Existed) {
-                Write-BytesAtomic $target.Path $target.OriginalBytes
-            } elseif (Test-Path -LiteralPath $target.Path) {
-                Remove-Item -LiteralPath $target.Path -Force
-            }
-        } catch {
-            $failures += "$($target.Path)：$($_.Exception.Message)"
-        }
-    }
-    if ($failures.Count -gt 0) { throw ("回滚未能恢复所有文件：" + ($failures -join "；")) }
+function Invoke-VerifiedFileTransaction([object[]]$Targets) {
+    Invoke-VerifiedPathTransaction $Targets @()
 }
+
+function Invoke-VerifiedWriteDeleteTransaction([object[]]$WriteTargets, [object[]]$DeleteTargets) {
+    Invoke-VerifiedPathTransaction $WriteTargets $DeleteTargets
+}
+
 
 function Get-InstallStateEntry([object]$State, [string]$Name) {
     if ($null -eq $State) { return $null }
@@ -274,6 +639,10 @@ function Get-InstallStateEntry([object]$State, [string]$Name) {
 
 function Assert-InstallStateEntry([object]$Entry, [string]$Label) {
     if ($null -eq $Entry) { throw "安装状态文件无效：缺少 $Label。" }
+    $propertyNames = @($Entry.PSObject.Properties.Name | Sort-Object)
+    if (($propertyNames -join ",") -cne "Existed,InstalledSha256,OriginalBase64") {
+        throw "安装状态文件无效：$Label 字段无效。"
+    }
     if (-not ($Entry.Existed -is [bool])) { throw "安装状态文件无效：$Label.Existed 不是布尔值。" }
     if (-not ($Entry.OriginalBase64 -is [string])) { throw "安装状态文件无效：$Label.OriginalBase64 不是字符串。" }
     if (-not ($Entry.InstalledSha256 -is [string]) -or [string]$Entry.InstalledSha256 -notmatch '^[0-9a-fA-F]{64}$') {
@@ -295,6 +664,10 @@ function Assert-InstallStateEntry([object]$Entry, [string]$Label) {
 
 function Assert-InstallState([object]$State) {
     if ($null -eq $State) { throw "安装状态文件无效。" }
+    $propertyNames = @($State.PSObject.Properties.Name | Sort-Object)
+    if (($propertyNames -join ",") -cne "ConfigYaml,VergeYaml,Version") {
+        throw "安装状态文件无效：字段无效。"
+    }
     $version = $State.Version
     $numericVersion = $version -is [int] -or $version -is [long]
     if (-not $numericVersion -or [long]$version -ne 1) { throw "安装状态文件无效：版本不受支持。" }
@@ -302,10 +675,10 @@ function Assert-InstallState([object]$State) {
     Assert-InstallStateEntry (Get-InstallStateEntry $State "ConfigYaml") "ConfigYaml"
 }
 
-function Assert-StateTargetUnchanged([object]$Entry, [string]$Path, [string]$Label) {
+function Assert-StateSnapshotUnchanged([object]$Entry, [object]$Snapshot, [string]$Label) {
     if ($null -eq $Entry) { return }
     $expected = [string]$Entry.InstalledSha256
-    $actual = Get-FileSha256 $Path
+    $actual = if ([bool]$Snapshot.Exists) { Get-BytesSha256 $Snapshot.Bytes } else { "" }
     if ($actual -ne $expected) {
         throw "$Label 在上次安装后被其他程序修改。为避免覆盖这些改动，请先卸载补丁或备份并手动处理该文件。"
     }

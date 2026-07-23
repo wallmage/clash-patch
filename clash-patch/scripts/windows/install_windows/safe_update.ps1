@@ -7,7 +7,7 @@
     if ($BackupId -notmatch '--([0-9a-f]{16})--(.+)\.backup$') { throw "备份编号无效。" }
     $key = $Matches[1]
     $basename = $Matches[2]
-    $candidates = @($targetScript, $profilesIndexPath, $vergePath, $configPath, $statePath, $usageStatePath, $safeUpdateStatePath)
+    $candidates = @($targetScript, $profilesIndexPath, $vergePath, $configPath)
     if (Test-Path -LiteralPath $profilesDirectory -PathType Container) {
         $candidates += @(Get-ChildItem -LiteralPath $profilesDirectory -File | ForEach-Object { $_.FullName })
     }
@@ -25,8 +25,7 @@ function Test-RestoreCandidate([string]$TargetPath, [byte[]]$Bytes) {
     $extension = [System.IO.Path]::GetExtension($TargetPath).ToLowerInvariant()
     $text = [System.Text.Encoding]::UTF8.GetString($Bytes)
     if ($extension -eq ".json") {
-        $null = $text | ConvertFrom-Json
-        return
+        throw "内部状态文件不能通过单文件备份恢复。"
     }
     if ($extension -notin @(".yaml", ".yml")) { return }
 
@@ -67,39 +66,40 @@ function Get-SafeUpdateRecoveryItems([object]$Manifest, [string]$Directory, [str
 function Restore-SafeUpdateFiles([object[]]$RecoveryItems, [hashtable]$ObservedHashes) {
     $failures = @()
     $conflicts = @()
+    $targets = @()
     foreach ($recovery in $RecoveryItems) {
         try {
-            if (-not $ObservedHashes.ContainsKey($recovery.TargetPath) -or -not (Test-Path -LiteralPath $recovery.TargetPath -PathType Leaf)) {
+            if (-not $ObservedHashes.ContainsKey($recovery.TargetPath)) {
                 $conflicts += $recovery.File
                 continue
             }
-            $backupBytes = [System.IO.File]::ReadAllBytes($recovery.BackupPath)
-            $stream = [System.IO.File]::Open(
-                $recovery.TargetPath,
-                [System.IO.FileMode]::Open,
-                [System.IO.FileAccess]::ReadWrite,
-                [System.IO.FileShare]::None
-            )
-            try {
-                $hasher = [System.Security.Cryptography.SHA256]::Create()
-                try { $currentSha = ([System.BitConverter]::ToString($hasher.ComputeHash($stream))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
-                if ($currentSha -ne [string]$ObservedHashes[$recovery.TargetPath]) {
-                    $conflicts += $recovery.File
-                    continue
-                }
-                $stream.Position = 0
-                $stream.SetLength(0)
-                $stream.Write($backupBytes, 0, $backupBytes.Length)
-                $stream.Flush($true)
-                $stream.Position = 0
-                $hasher = [System.Security.Cryptography.SHA256]::Create()
-                try { $restoredSha = ([System.BitConverter]::ToString($hasher.ComputeHash($stream))).Replace("-", "").ToLowerInvariant() } finally { $hasher.Dispose() }
-                if ($restoredSha -ne $recovery.BeforeSha256) { throw "恢复后哈希不匹配。" }
-            } finally {
-                $stream.Dispose()
+            $backupSnapshot = Get-OptionalFileSnapshot $recovery.BackupPath "安全更新备份"
+            if (-not $backupSnapshot.Exists -or
+                (Get-BytesSha256 $backupSnapshot.Bytes) -ne [string]$recovery.BeforeSha256) {
+                throw "安全更新备份在恢复前发生变化。"
+            }
+            $targetSnapshot = Get-OptionalFileSnapshot $recovery.TargetPath "更新后的订阅"
+            if (-not $targetSnapshot.Exists -or
+                (Get-BytesSha256 $targetSnapshot.Bytes) -ne [string]$ObservedHashes[$recovery.TargetPath]) {
+                $conflicts += $recovery.File
+                continue
+            }
+            $targets += [pscustomobject]@{
+                Path = $recovery.TargetPath
+                Bytes = $backupSnapshot.Bytes
+                Existed = $true
+                OriginalBytes = $targetSnapshot.Bytes
+                OriginalIdentity = $targetSnapshot.Identity
             }
         } catch {
             $failures += $recovery.File
+        }
+    }
+    if ($failures.Count -eq 0 -and $conflicts.Count -eq 0) {
+        try {
+            Invoke-VerifiedFileTransaction $targets
+        } catch {
+            $failures = @($RecoveryItems | ForEach-Object { $_.File })
         }
     }
     return [pscustomobject]@{ Failures = @($failures); Conflicts = @($conflicts) }

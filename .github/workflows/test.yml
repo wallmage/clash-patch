@@ -76,7 +76,7 @@ jobs:
           node-version: "22"
       - name: PowerShell 5.1 installer, uninstaller, and route regressions
         shell: powershell
-        run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command powershell.exe).Source
+        run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command powershell.exe).Source -ExpectedPSEdition Desktop -ExpectedPSMajor 5
       - name: PowerShell 7 installer, uninstaller, and route regressions
         shell: pwsh
-        run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command pwsh.exe).Source
+        run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command pwsh.exe).Source -ExpectedPSEdition Core -ExpectedPSMajor 7

@@ -24,10 +24,22 @@ function Complete-InstallResult(
 }
 
 function Get-SavedUsageProfile([string]$Path) {
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return 0 }
+    $snapshot = Get-OptionalFileSnapshot $Path "用途档位状态"
+    if (-not $snapshot.Exists) { return 0 }
     try {
-        $state = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+        $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($snapshot.Bytes)
+        if ([regex]::Matches($text, '(?i)"Version"\s*:').Count -ne 1 -or
+            [regex]::Matches($text, '(?i)"Profile"\s*:').Count -ne 1) {
+            throw "用途档位文件字段重复或缺失。"
+        }
+        $state = $text | ConvertFrom-Json
     } catch {
+        throw "用途档位文件无效，无法确认之前的选择。"
+    }
+    $propertyNames = @($state.PSObject.Properties.Name)
+    if ($propertyNames.Count -ne 2 -or
+        $propertyNames -notcontains "Version" -or
+        $propertyNames -notcontains "Profile") {
         throw "用途档位文件无效，无法确认之前的选择。"
     }
     $version = $state.Version
