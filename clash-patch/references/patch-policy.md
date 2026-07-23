@@ -390,7 +390,7 @@ AI 网页流量、AI 域名 DNS 和所有 UDP 使用同一 AI 分组。多个结
 
 ### macOS
 
-macOS 只允许单次显式运行。不得安装永久监听、LaunchAgent、`RunAtLoad`、`WatchPaths`、计划任务或目录监听。安装程序必须移除能通过 `Label` 和程序参数确认所有权的旧版 `com.clashpatch.profiles` 与 `com.wallny.clash-profile-patcher` LaunchAgent；无法确认所有权时保持不动并报告。
+macOS 只允许单次显式运行。不得安装永久监听、LaunchAgent、`RunAtLoad`、`WatchPaths`、计划任务或目录监听。安装程序必须移除能通过 `Label` 和程序参数确认所有权的旧版 `com.clashpatch.profiles` 与 `com.wallny.clash-profile-patcher` LaunchAgent；无法确认所有权时保持不动并报告。用户明确选择新档位时，安装器在平台、客户端、Mihomo、状态路径和初始快照全部通过后，先原子保存新档位作为恢复意图，再修改自动更新或订阅。可捕获的失败必须恢复旧档位；进程被强制结束时保留新选择，下一次 Patch 或安全更新按新档位完成缺失步骤，不得按旧档位重建订阅。
 
 只处理 ClashX Meta 当前存储位置。使用本地存储时只看本地目录；使用 iCloud 时只选包含当前订阅的当前容器。读不到存储模式，或多个 iCloud 容器无法通过当前订阅唯一判断时停止，不猜。旧容器、历史目录和备份即使仍存在也不得处理。
 

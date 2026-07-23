@@ -419,8 +419,8 @@ class MacosWrapperTest < Minitest::Test
         puts "supported"
         exit 0
       end
-      exit 1 if ARGV.include?("--snapshot-initial")
-      exit 0
+      exit 0 if ARGV.include?("--snapshot-initial")
+      exit 1
     RUBY
     with_supported_mihomo_installer(patcher_source: failing_patcher) do |installer|
       Dir.mktmpdir do |home|
@@ -434,15 +434,105 @@ class MacosWrapperTest < Minitest::Test
           stdout, _stderr, status = run_script(installer, "--profile", "2", home: home)
 
           assert_equal 1, status.exitstatus
-          assert_includes stdout, "无法创建初始快照"
+          assert_includes stdout, "配置处理失败"
+          assert_equal "1", Open3.capture3(
+            "/usr/bin/plutil", "-extract", "Profile", "raw", state
+          ).first.strip
           assert_equal original, File.binread(state)
 
           stdout, stderr, status = run_script(installer, "--profile", "2", "--json", home: home)
           assert_equal 1, status.exitstatus
           assert_empty stderr
           result = assert_json_result(stdout, status, command: "install")
-          assert_equal "snapshot_failed", result.fetch("code")
+          assert_equal "patch_failed", result.fetch("code")
+          assert_equal "1", Open3.capture3(
+            "/usr/bin/plutil", "-extract", "Profile", "raw", state
+          ).first.strip
           assert_equal original, File.binread(state)
+        end
+      end
+    end
+  end
+
+  def test_strong_kill_after_profile_application_keeps_new_profile_as_recovery_intent
+    patcher = <<~'RUBY'
+      profile_index = ARGV.index("--usage-profile")
+      profile = ARGV.fetch(profile_index + 1) if profile_index
+      if ARGV.include?("--print-core-status")
+        puts "supported"
+        exit 0
+      end
+      if ARGV.include?("--disable-subscription-auto-update")
+        puts "already_disabled"
+        exit 0
+      end
+      exit 0 if ARGV.include?("--snapshot-initial")
+      if ARGV.include?("--safe-update-all")
+        File.write(File.join(ENV.fetch("HOME"), "safe-update-profile"), profile)
+        exit 0
+      end
+      File.write(File.join(ENV.fetch("HOME"), "applied-profile"), profile)
+      File.write(File.join(ENV.fetch("HOME"), "patcher-pid"), Process.pid.to_s)
+      File.write(File.join(ENV.fetch("HOME"), "patcher-ready"), "ready")
+      sleep 60
+    RUBY
+    with_supported_mihomo_installer(patcher_source: patcher) do |installer|
+      Dir.mktmpdir do |home|
+        with_supported_app(home) do
+          state = File.join(home, "usage-profile.plist")
+          system("/usr/bin/plutil", "-create", "xml1", state)
+          system("/usr/bin/plutil", "-insert", "Version", "-integer", "1", state)
+          system("/usr/bin/plutil", "-insert", "Profile", "-integer", "1", state)
+          env = {
+            "HOME" => home,
+            "CLASH_PATCH_USAGE_STATE_PATH" => state,
+            "CLASH_PATCH_USAGE_PROFILE" => nil,
+            "CLASH_PATCH_PROFILE_DIR" => nil
+          }
+          ready = File.join(home, "patcher-ready")
+          process_thread = nil
+          child_pid = nil
+          begin
+            Open3.popen3(env, "/bin/sh", installer, "--profile", "3") do |stdin, stdout, stderr, thread|
+              process_thread = thread
+              stdin.close
+              deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+              until File.exist?(ready)
+                raise "installer never reached the profile application gate" if
+                  Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+                sleep 0.01
+              end
+              child_pid = Integer(File.read(File.join(home, "patcher-pid")))
+              Process.kill("KILL", thread.pid)
+              Process.kill("KILL", child_pid)
+              stdout.read
+              stderr.read
+              raise "installer did not stop after SIGKILL" unless thread.join(10)
+              refute thread.value.success?
+            end
+          ensure
+            begin
+              Process.kill("KILL", child_pid) if child_pid
+            rescue Errno::ESRCH
+              nil
+            end
+            begin
+              Process.kill("KILL", process_thread.pid) if process_thread&.alive?
+            rescue Errno::ESRCH
+              nil
+            end
+          end
+
+          assert_equal "3", File.read(File.join(home, "applied-profile"))
+          saved_profile, _error, read_status = Open3.capture3(
+            "/usr/bin/plutil", "-extract", "Profile", "raw", state
+          )
+          assert read_status.success?
+          assert_equal "3", saved_profile.strip
+
+          stdout, stderr, status = run_script(installer, "--safe-update", home: home)
+          assert status.success?, "#{stdout}\n#{stderr}"
+          assert_equal "3", File.read(File.join(home, "safe-update-profile"))
         end
       end
     end
@@ -463,8 +553,8 @@ class MacosWrapperTest < Minitest::Test
         puts "restored"
         exit 0
       end
-      exit 1 if ARGV.include?("--snapshot-initial")
-      exit 0
+      exit 0 if ARGV.include?("--snapshot-initial")
+      exit 1
     RUBY
     with_supported_mihomo_installer(patcher_source: patcher) do |installer|
       Dir.mktmpdir do |home|
@@ -472,7 +562,7 @@ class MacosWrapperTest < Minitest::Test
           stdout, _stderr, status = run_script(installer, "--profile", "3", home: home)
 
           assert_equal 1, status.exitstatus
-          assert_includes stdout, "无法创建初始快照"
+          assert_includes stdout, "配置处理失败"
           calls = File.read(File.join(home, "patcher-calls.log")).lines.map(&:strip)
           disable_index = calls.index { |call| call.include?("--disable-subscription-auto-update") }
           restore_index = calls.index { |call| call.include?("--restore-owned-subscription-auto-update") }
@@ -499,8 +589,8 @@ class MacosWrapperTest < Minitest::Test
         puts "restored"
         exit 0
       end
-      exit 1 if ARGV.include?("--snapshot-initial")
-      exit 0
+      exit 0 if ARGV.include?("--snapshot-initial")
+      exit 1
     RUBY
     with_supported_mihomo_installer(patcher_source: patcher) do |installer|
       Dir.mktmpdir do |home|
@@ -560,8 +650,8 @@ class MacosWrapperTest < Minitest::Test
         exit 0
       end
       exit 1 if ARGV.include?("--restore-owned-subscription-auto-update")
-      exit 1 if ARGV.include?("--snapshot-initial")
-      exit 0
+      exit 0 if ARGV.include?("--snapshot-initial")
+      exit 1
     RUBY
     with_supported_mihomo_installer(patcher_source: patcher) do |installer|
       Dir.mktmpdir do |home|

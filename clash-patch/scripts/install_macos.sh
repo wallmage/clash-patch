@@ -25,6 +25,8 @@ JSON_OUTPUT=0
 OPERATION="install"
 AUTO_UPDATE_CHANGED=0
 PENDING_TEMPORARY=""
+PREVIOUS_PROFILE=""
+PROFILE_STATE_CHANGED=0
 
 unexpected_exit() {
   unexpected_status=$1
@@ -32,6 +34,10 @@ unexpected_exit() {
   [ "$unexpected_status" -ne 0 ] || return 0
   set +e
   [ -z "$PENDING_TEMPORARY" ] || /bin/rm -f "$PENDING_TEMPORARY"
+  profile_restore_failed=0
+  if [ "$PROFILE_STATE_CHANGED" -eq 1 ]; then
+    rollback_profile_selection || profile_restore_failed=1
+  fi
   if [ "$AUTO_UPDATE_CHANGED" -eq 1 ]; then
     AUTO_UPDATE_CHANGED=0
     /usr/bin/ruby "$PATCHER_SOURCE" \
@@ -39,12 +45,22 @@ unexpected_exit() {
   fi
   if [ "$JSON_OUTPUT" -eq 1 ]; then
     if [ -x /usr/bin/ruby ] && [ -f "$RESULT_CONTRACT_SOURCE" ]; then
-      /usr/bin/ruby "$RESULT_CONTRACT_SOURCE" \
-        --command install --operation "$OPERATION" --ok false --status failed \
-        --code unexpected_exit --exit-code "$unexpected_status" --summary "安装流程意外中止。"
+      if [ "$profile_restore_failed" -eq 1 ]; then
+        /usr/bin/ruby "$RESULT_CONTRACT_SOURCE" \
+          --command install --operation "$OPERATION" --ok false --status partial \
+          --code profile_restore_failed --exit-code "$unexpected_status" --summary "安装流程意外中止，且旧用途档位未能恢复。"
+      else
+        /usr/bin/ruby "$RESULT_CONTRACT_SOURCE" \
+          --command install --operation "$OPERATION" --ok false --status failed \
+          --code unexpected_exit --exit-code "$unexpected_status" --summary "安装流程意外中止。"
+      fi
     fi
   else
-    /usr/bin/printf '%s\n' "[Clash 补丁] 安装流程意外中止；已尝试恢复订阅自动更新。"
+    if [ "$profile_restore_failed" -eq 1 ]; then
+      /usr/bin/printf '%s\n' "[Clash 补丁] 安装流程意外中止，且旧用途档位未能恢复。"
+    else
+      /usr/bin/printf '%s\n' "[Clash 补丁] 安装流程意外中止；已尝试恢复用途档位与订阅自动更新。"
+    fi
   fi
   exit "$unexpected_status"
 }
@@ -65,6 +81,13 @@ finish() {
   finish_summary=$4
   finish_operation=${5:-$OPERATION}
   finish_profile=${6:-$USAGE_PROFILE}
+  if [ "$finish_exit" -ne 0 ] && [ "$PROFILE_STATE_CHANGED" -eq 1 ]; then
+    if ! rollback_profile_selection; then
+      finish_status=partial
+      finish_code=profile_restore_failed
+      finish_summary="操作失败，且旧用途档位未能恢复。"
+    fi
+  fi
   if [ "$finish_exit" -ne 0 ] && [ "$AUTO_UPDATE_CHANGED" -eq 1 ]; then
     AUTO_UPDATE_CHANGED=0
     restore_result=$(/usr/bin/ruby "$PATCHER_SOURCE" \
@@ -141,17 +164,24 @@ read_saved_profile() {
   esac
 }
 
-assert_profile_state_safe() {
+profile_state_is_safe() {
   state_dir=$(/usr/bin/dirname "$USAGE_STATE_PATH")
   if [ -L "$state_dir" ] || [ -L "$USAGE_STATE_PATH" ] ||
      { [ -e "$USAGE_STATE_PATH" ] && [ ! -f "$USAGE_STATE_PATH" ]; }; then
-    say "档位保存位置不安全，未写入任何设置。"
-    finish 7 failed unsafe_profile_state "档位保存位置不安全，未写入任何设置。" save_profile
+    return 1
   fi
+  return 0
 }
 
-save_profile() {
-  assert_profile_state_safe
+assert_profile_state_safe() {
+  profile_state_is_safe && return 0
+  say "档位保存位置不安全，未写入任何设置。"
+  finish 7 failed unsafe_profile_state "档位保存位置不安全，未写入任何设置。" save_profile
+}
+
+write_profile() {
+  profile_to_write=$1
+  profile_state_is_safe || return 1
   state_dir=$(/usr/bin/dirname "$USAGE_STATE_PATH")
   /bin/mkdir -p "$state_dir"
   /bin/chmod 700 "$state_dir"
@@ -160,13 +190,43 @@ save_profile() {
   trap '/bin/rm -f "$temporary"; exit 1' HUP INT TERM
   /usr/bin/plutil -create xml1 "$temporary"
   /usr/bin/plutil -insert Version -integer 1 "$temporary"
-  /usr/bin/plutil -insert Profile -integer "$USAGE_PROFILE" "$temporary"
+  /usr/bin/plutil -insert Profile -integer "$profile_to_write" "$temporary"
   /bin/chmod 600 "$temporary"
   /bin/mv -f "$temporary" "$USAGE_STATE_PATH"
   PENDING_TEMPORARY=""
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
+}
+
+save_profile() {
+  assert_profile_state_safe
+  write_profile "$USAGE_PROFILE"
+}
+
+rollback_profile_selection() {
+  [ "$PROFILE_STATE_CHANGED" -eq 1 ] || return 0
+  profile_state_is_safe || return 1
+  current_profile=$(read_saved_profile || true)
+  [ "$current_profile" = "$USAGE_PROFILE" ] || return 1
+  if [ -n "$PREVIOUS_PROFILE" ]; then
+    write_profile "$PREVIOUS_PROFILE" || return 1
+  else
+    /bin/rm -f "$USAGE_STATE_PATH" || return 1
+  fi
+  PROFILE_STATE_CHANGED=0
+}
+
+stage_profile_selection() {
+  [ "$PROFILE_SOURCE" != "saved" ] || return 0
+  save_profile
+  PROFILE_STATE_CHANGED=1
+}
+
+commit_profile_selection() {
+  [ "$PROFILE_STATE_CHANGED" -eq 1 ] || return 0
+  PROFILE_STATE_CHANGED=0
+  say "已保存用途档位 ${USAGE_PROFILE}。"
 }
 
 while [ "$#" -gt 0 ]; do
@@ -329,18 +389,6 @@ if [ "$core_status" != "supported" ]; then
   finish 8 unsupported mihomo_unavailable "Mihomo 内核不可用或版本不受支持。" core_status
 fi
 
-if [ "$USAGE_PROFILE" -eq 3 ]; then
-  if ! auto_update_result=$(/usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --disable-subscription-auto-update 2>&1); then
-    say "无法自动关闭 ClashX Meta 的订阅自动更新；本次未修改任何订阅。"
-    finish 9 failed auto_update_failed "无法自动关闭订阅自动更新；未修改任何订阅。" install
-  fi
-  case "$auto_update_result" in
-    disabled) AUTO_UPDATE_CHANGED=1; say "已自动关闭订阅更新，并保存修改前状态。" ;;
-    already_disabled) say "订阅自动更新已经关闭。" ;;
-    *) say "订阅自动更新回读结果异常；本次未修改任何订阅。"; finish 9 failed auto_update_verify_failed "订阅自动更新回读结果异常；未修改任何订阅。" install ;;
-  esac
-fi
-
 /bin/mkdir -p "$BACKUP_DIR"
 /bin/chmod 700 "$INSTALL_DIR" "$BACKUP_DIR"
 
@@ -362,6 +410,20 @@ else
     /usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --snapshot-initial ||
       { say "无法创建初始快照。"; finish 1 failed snapshot_failed "无法创建初始快照。" snapshot_initial; }
   fi
+fi
+
+stage_profile_selection
+
+if [ "$USAGE_PROFILE" -eq 3 ]; then
+  if ! auto_update_result=$(/usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --disable-subscription-auto-update 2>&1); then
+    say "无法自动关闭 ClashX Meta 的订阅自动更新；本次未修改任何订阅。"
+    finish 9 failed auto_update_failed "无法自动关闭订阅自动更新；未修改任何订阅。" install
+  fi
+  case "$auto_update_result" in
+    disabled) AUTO_UPDATE_CHANGED=1; say "已自动关闭订阅更新，并保存修改前状态。" ;;
+    already_disabled) say "订阅自动更新已经关闭。" ;;
+    *) say "订阅自动更新回读结果异常；本次未修改任何订阅。"; finish 9 failed auto_update_verify_failed "订阅自动更新回读结果异常；未修改任何订阅。" install ;;
+  esac
 fi
 
 if [ "$SAFE_UPDATE" -eq 1 ]; then
@@ -402,10 +464,7 @@ if [ "$SAFE_UPDATE" -eq 1 ]; then
         { say "安全更新失败。"; finish 1 failed safe_update_failed "安全更新失败。" safe_update; }
     fi
   fi
-  if [ "$PROFILE_SOURCE" != "saved" ]; then
-    save_profile
-    say "已保存用途档位 ${USAGE_PROFILE}。"
-  fi
+  commit_profile_selection
   say "安全更新已完成：当前存储位置中的全部远程订阅已一起更新。"
   finish 0 ok safe_update_completed "安全更新已完成。" safe_update
 fi
@@ -440,10 +499,7 @@ else
   fi
 fi
 
-if [ "$PROFILE_SOURCE" != "saved" ]; then
-  save_profile
-  say "已保存用途档位 ${USAGE_PROFILE}。"
-fi
+commit_profile_selection
 say "本次为单次运行；当前存储位置中的全部订阅都已使用同一套国内域名直连规则。"
 say "当前订阅需要修改时，会通过本地控制器自动刷新并检查；失败时补丁程序会恢复原配置。"
 say "脚本没有退出、停止或重启 ClashX Meta，也没有切换订阅、代理组或节点。"

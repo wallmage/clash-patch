@@ -990,8 +990,12 @@ class SkillContractTest < Minitest::Test
     windows_tests = File.binread(File.join(ROOT, "tests/test_windows_installer.ps1"))
     patcher = mac_patcher_source
 
-    assert_operator mac_install.index('id -u'), :<, mac_install.index("\n  save_profile\n")
-    assert_operator mac_install.index('core_status='), :<, mac_install.index("\n  save_profile\n")
+    profile_stage = mac_install.index("\nstage_profile_selection\n")
+    assert_operator mac_install.index('id -u'), :<, profile_stage
+    assert_operator mac_install.index('core_status='), :<, profile_stage
+    assert_operator mac_install.index('--snapshot-initial'), :<, profile_stage
+    assert_operator profile_stage, :<, mac_install.index('--disable-subscription-auto-update')
+    assert_includes mac_install, "rollback_profile_selection"
     assert_operator mac_install.index('core_status='), :<, mac_install.index('--disable-subscription-auto-update')
     assert_operator mac_install.index('plutil -extract Label'), :<, mac_install.index('launchctl bootout')
     assert_operator mac_install.index('ProgramArguments.0'), :<, mac_install.index('launchctl bootout')

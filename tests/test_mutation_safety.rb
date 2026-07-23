@@ -154,19 +154,13 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
-  def test_early_profile_save_mutation_is_killed
+  def test_profile_restore_removal_mutation_is_killed
     with_repo_copy do |root|
-      early_save = <<~SH
-        if [ "$PROFILE_SOURCE" != "saved" ]; then
-          save_profile
-        fi
-
-      SH
       replace_once(
         root,
         "clash-patch/scripts/install_macos.sh",
-        "if [ \"$USAGE_PROFILE\" -eq 3 ]; then\n",
-        early_save + "if [ \"$USAGE_PROFILE\" -eq 3 ]; then\n"
+        "    if ! rollback_profile_selection; then\n",
+        "    if false; then\n"
       )
 
       assert_mutation_is_killed(
