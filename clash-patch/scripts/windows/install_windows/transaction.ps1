@@ -3,9 +3,9 @@
 
     $security = Get-Acl -LiteralPath $Path
     $security.SetAccessRuleProtection($true, $false)
-    @($security.Access.IdentityReference | Select-Object -Unique) | ForEach-Object {
-        $security.PurgeAccessRules($_)
-    }
+    @($security.Access) | Where-Object { -not $_.IsInherited } | ForEach-Object {
+        $security.RemoveAccessRuleSpecific($_)
+    } | Out-Null
     $sidValues = @(
         [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
         "S-1-5-18",

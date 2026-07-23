@@ -286,6 +286,12 @@ if (-not [string]::IsNullOrWhiteSpace($RestoreBackup)) {
     if ($currentHash -ne $ExpectedCurrentSha256.ToLowerInvariant()) { throw "当前配置已变化，拒绝覆盖。" }
     $restoreBytes = [System.IO.File]::ReadAllBytes($resolved.BackupPath)
     Test-RestoreCandidate $resolved.TargetPath $restoreBytes
+    $validatedCurrentSnapshot = Get-OptionalFileSnapshot $resolved.TargetPath "当前配置"
+    if (-not $validatedCurrentSnapshot.Exists -or
+        $validatedCurrentSnapshot.Identity -cne $currentSnapshot.Identity -or
+        (Get-BytesSha256 $validatedCurrentSnapshot.Bytes) -ne $currentHash) {
+        throw "当前配置在检查期间发生变化，拒绝覆盖。"
+    }
     Backup-Versioned $resolved.TargetPath $backupRoot "pre-restore" | Out-Null
     Invoke-VerifiedFileTransaction @(
         [pscustomobject]@{
