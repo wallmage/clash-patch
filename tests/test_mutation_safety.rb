@@ -579,6 +579,30 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_macos_uninstall_auto_update_transaction_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/uninstall_macos.sh",
+        "\ndelete_staged_install_files\n\nAUTO_UPDATE_RESTORED=0",
+        "\nAUTO_UPDATE_RESTORED=0"
+      )
+      replace_once(
+        root,
+        "clash-patch/scripts/uninstall_macos.sh",
+        "\ncommit_staged_install_files\n/bin/rmdir",
+        "\ndelete_staged_install_files\ncommit_staged_install_files\n/bin/rmdir"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        "/usr/bin/env", "CLASH_PATCH_RUN_PRODUCTION_PROBES=1",
+        RbConfig.ruby, "tests/test_macos_wrappers.rb",
+        "--name", "test_production_probe_uninstall_preserves_a_file_replaced_after_staging"
+      )
+    end
+  end
+
   def test_macos_production_probe_inventory_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

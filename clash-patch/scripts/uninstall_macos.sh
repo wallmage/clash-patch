@@ -124,6 +124,20 @@ restore_uncommitted_uninstall() {
     /bin/rm -rf "$UNINSTALL_STAGING"
     return 0
   fi
+  if [ -f "$UNINSTALL_STAGING/AUTO_UPDATE_WAS_OWNED" ]; then
+    [ -f "$PATCHER_SOURCE" ] ||
+      finish 6 failed incomplete_package "安装包不完整，无法恢复未完成的安全卸载。"
+    if ! disable_result=$(/usr/bin/ruby "$PATCHER_SOURCE" \
+      --backup-dir "$BACKUP_DIR" --disable-subscription-auto-update 2>/dev/null); then
+      finish 1 failed auto_update_rollback_failed "无法恢复未完成安全卸载的订阅自动更新状态。"
+    fi
+    case "$disable_result" in
+      disabled|already_disabled) ;;
+      *) finish 1 failed auto_update_rollback_failed "订阅自动更新回退结果异常。" ;;
+    esac
+    [ -f "$AUTO_UPDATE_OWNERSHIP_PATH" ] && [ ! -L "$AUTO_UPDATE_OWNERSHIP_PATH" ] ||
+      finish 1 failed auto_update_rollback_failed "订阅自动更新所有权未能恢复。"
+  fi
   restore_slot "$UNINSTALL_STAGING/patcher" "$INSTALL_DIR/patch_profiles.rb"
   restore_slot "$UNINSTALL_STAGING/policy" "$INSTALL_DIR/policy.json"
   restore_slot "$UNINSTALL_STAGING/state" "$STATE_PATH"
@@ -191,6 +205,11 @@ delete_staged_install_files() {
   stage_slot "$USAGE_STATE_PATH" usage
   stage_slot "$INSTALL_DIR/patch.log" log
   stage_slot "$INSTALL_DIR/patch-error.log" error-log
+  if [ -e "$AUTO_UPDATE_OWNERSHIP_PATH" ] || [ -L "$AUTO_UPDATE_OWNERSHIP_PATH" ]; then
+    [ -f "$AUTO_UPDATE_OWNERSHIP_PATH" ] && [ ! -L "$AUTO_UPDATE_OWNERSHIP_PATH" ] ||
+      finish 1 failed auto_update_state_unsafe "订阅自动更新所有权状态不安全；未继续卸载。"
+    /usr/bin/touch "$UNINSTALL_STAGING/AUTO_UPDATE_WAS_OWNED"
+  fi
   /usr/bin/touch "$UNINSTALL_STAGING/READY"
 
   if ! verify_staged_slot "$INSTALL_DIR/patch_profiles.rb" patcher ||
@@ -222,6 +241,9 @@ delete_staged_install_files() {
       finish 1 failed uninstall_delete_failed "安装文件未能整批删除，已恢复其余文件。"
     fi
   done
+}
+
+commit_staged_install_files() {
   /usr/bin/touch "$UNINSTALL_STAGING/COMMITTED"
   /bin/rm -rf "$UNINSTALL_STAGING"
 }
@@ -242,33 +264,43 @@ restore_uncommitted_uninstall
 remove_owned_agent "$CURRENT_PLIST" "$CURRENT_LABEL" "$CURRENT_PATCHER"
 remove_owned_agent "$LEGACY_PLIST" "$LEGACY_LABEL" "$LEGACY_PATCHER"
 
-AUTO_UPDATE_RESTORED=0
+AUTO_UPDATE_OWNED=0
 if [ -e "$AUTO_UPDATE_OWNERSHIP_PATH" ] || [ -L "$AUTO_UPDATE_OWNERSHIP_PATH" ]; then
   if [ ! -f "$PATCHER_SOURCE" ]; then
     say "安装包不完整，无法安全恢复订阅自动更新；未删除用途档位。"
     finish 6 failed incomplete_package "安装包不完整，无法安全恢复订阅自动更新。"
   fi
+  AUTO_UPDATE_OWNED=1
+fi
+
+delete_staged_install_files
+
+AUTO_UPDATE_RESTORED=0
+if [ "$AUTO_UPDATE_OWNED" -eq 1 ]; then
   if ! auto_update_restore=$(/usr/bin/ruby "$PATCHER_SOURCE" \
     --backup-dir "$BACKUP_DIR" --restore-owned-subscription-auto-update 2>/dev/null); then
+    restore_uncommitted_uninstall
     say "无法恢复本工具关闭的订阅自动更新；未删除用途档位和所有权状态。"
     finish 1 failed auto_update_restore_failed "无法恢复本工具关闭的订阅自动更新；未删除用途档位。"
   fi
   case "$auto_update_restore" in
     restored|already_restored)
       if [ -e "$AUTO_UPDATE_OWNERSHIP_PATH" ] || [ -L "$AUTO_UPDATE_OWNERSHIP_PATH" ]; then
+        restore_uncommitted_uninstall
         say "订阅自动更新虽已处理，但所有权状态未能清除；未删除用途档位。"
         finish 1 partial auto_update_state_cleanup_failed "订阅自动更新已处理，但所有权状态未能清除。"
       fi
       AUTO_UPDATE_RESTORED=1
       ;;
     *)
+      restore_uncommitted_uninstall
       say "订阅自动更新恢复结果异常；未删除用途档位和所有权状态。"
       finish 1 failed auto_update_restore_failed "订阅自动更新恢复结果异常；未删除用途档位。"
       ;;
   esac
 fi
 
-delete_staged_install_files
+commit_staged_install_files
 /bin/rmdir "$INSTALL_DIR" >/dev/null 2>&1 || true
 
 say "Clash Patch 安装文件已移除；当前版本没有后台监听任务。"

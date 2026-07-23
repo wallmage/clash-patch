@@ -113,14 +113,37 @@ class MacosWrapperTest < Minitest::Test
 
   def test_production_probe_uninstall_preserves_a_file_replaced_after_staging
     require_production_probe!
-    with_uninstaller_package(patcher_source: "exit 0\n") do |uninstaller|
+    patcher = <<~'RUBY'
+      backup_dir = ARGV[ARGV.index("--backup-dir") + 1] if ARGV.include?("--backup-dir")
+      ownership = File.join(backup_dir, "clashx-meta-kAutoUpdateEnable.state.json") if backup_dir
+      preference = File.join(ENV.fetch("HOME"), "auto-update-state")
+      if ARGV.include?("--restore-owned-subscription-auto-update")
+        File.write(preference, "enabled")
+        File.delete(ownership)
+        puts "restored"
+        exit 0
+      end
+      if ARGV.include?("--disable-subscription-auto-update")
+        File.write(preference, "disabled")
+        File.write(ownership, "{}") unless File.exist?(ownership)
+        puts "disabled"
+        exit 0
+      end
+      exit 1
+    RUBY
+    with_uninstaller_package(patcher_source: patcher) do |uninstaller|
       Dir.mktmpdir do |home|
         install_dir = File.join(home, "Library", "Application Support", "ClashPatch")
-        FileUtils.mkdir_p(install_dir)
+        backup_dir = File.join(install_dir, "backups")
+        FileUtils.mkdir_p(backup_dir)
         installed_patcher = File.join(install_dir, "patch_profiles.rb")
         state = File.join(home, "usage-profile.plist")
+        ownership = File.join(backup_dir, "clashx-meta-kAutoUpdateEnable.state.json")
+        preference = File.join(home, "auto-update-state")
         File.binwrite(installed_patcher, "owned-patcher")
         File.binwrite(state, "owned-state")
+        File.binwrite(ownership, "{}")
+        File.binwrite(preference, "disabled")
         ready = File.join(home, "uninstall-ready")
         continue_path = File.join(home, "uninstall-continue")
         anchor = "  /usr/bin/touch \"$UNINSTALL_STAGING/READY\"\n"
@@ -179,6 +202,8 @@ class MacosWrapperTest < Minitest::Test
         violations << "deleted the replacement" unless replacement_preserved
         violations << "reported success" if status.success?
         violations << "omitted a conflict message" unless (stdout + stderr).match?(/conflict|concurrent|并发|替换/)
+        violations << "enabled automatic updates while profile 3 remained" unless File.binread(preference) == "disabled"
+        violations << "discarded automatic-update ownership" unless File.file?(ownership)
         assert_empty violations, violations.join("; ")
       end
     end
@@ -712,6 +737,10 @@ class MacosWrapperTest < Minitest::Test
       if ARGV.include?("--restore-owned-subscription-auto-update")
         warn "restore failed"
         exit 1
+      end
+      if ARGV.include?("--disable-subscription-auto-update")
+        puts "already_disabled"
+        exit 0
       end
       exit 1
     RUBY
