@@ -1114,7 +1114,7 @@ test('Windows installer is split into side-effect-free modules with stable funct
     'safe_update.ps1': [
       'Get-BackupTarget', 'Get-ClashPatchManagedScriptBlock', 'Assert-ClashPatchManagedScriptCurrent',
       'Test-ClashPatchFlowSequenceHasItem', 'Assert-ClashPatchProxyGroupCollection', 'Test-RestoreCandidate',
-      'Get-SafeUpdateRecoveryItems', 'Restore-SafeUpdateFiles'
+      'Get-SafeUpdateRecoveryItems', 'Get-SafeUpdateVerificationTargets', 'Restore-SafeUpdateFiles'
     ]
   };
 

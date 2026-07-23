@@ -1670,6 +1670,38 @@ items:
     Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-second.yml") -Raw) -eq $secondSafeOriginal) "failed safe update did not restore second remote subscription"
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json"))) "completed rollback left a reusable stale safe-update manifest"
 
+    $missingTargetSnapshot = Invoke-TestPowerShell $installer @(
+        "-AppHome", $safeUpdateCase,
+        "-SnapshotProfiles",
+        "-Json"
+    )
+    Assert-JsonResult $missingTargetSnapshot "install" 0 | Out-Null
+    Remove-Item -LiteralPath (Join-Path $safeUpdateProfiles "R-first.yaml") -Force
+    $missingTargetVerify = Invoke-TestPowerShell $installer @(
+        "-AppHome", $safeUpdateCase,
+        "-VerifySafeUpdate",
+        "-MihomoPath", $fakeCore,
+        "-Json"
+    )
+    $missingTargetVerifyJson = Assert-JsonResult $missingTargetVerify "install" 1
+    Assert-True (
+        $missingTargetVerifyJson.status -eq "rolled_back" -and
+        $missingTargetVerifyJson.code -eq "operation_failed"
+    ) "missing safe-update target did not report a completed rollback"
+    Assert-True (
+        (Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-first.yaml") -Raw) -eq
+            $firstSafeOriginal
+    ) "safe update did not recreate a missing remote subscription"
+    Assert-True (
+        (Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-second.yml") -Raw) -eq
+            $secondSafeOriginal
+    ) "missing-target rollback changed another remote subscription"
+    Assert-True (-not (
+        Test-Path -LiteralPath (
+            Join-Path $safeUpdateCase "clash-patch-safe-update.json"
+        )
+    )) "missing-target rollback retained a stale safe-update manifest"
+
     $noMainSnapshot = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
     Assert-True ($noMainSnapshot.ExitCode -eq 0) "main-group failure snapshot failed; $(Get-TestOutputDiagnostic $noMainSnapshot.Output)"
     $noMainUpdated = @'
@@ -1955,6 +1987,37 @@ rules:
         ) "safe update accepted invalid UTF-8 bytes after replacement-character decoding"
     }
 
+    $missingMappingDirectory = Join-Path $safeUpdateCase "missing-mapping"
+    New-Item -ItemType Directory -Path $missingMappingDirectory -Force | Out-Null
+    $missingMappingTarget = Join-Path $missingMappingDirectory "R-mapping.yaml"
+    $missingMappingRecovery = [pscustomobject]@{
+        Uid = "R-mapping"
+        File = "R-mapping.yaml"
+        TargetPath = $missingMappingTarget
+    }
+    $missingMappingIndex = "items:`n- uid: R-mapping`n  type: remote`n"
+    $missingMappingTargets = @(
+        Get-SafeUpdateVerificationTargets `
+            $missingMappingIndex $missingMappingDirectory @($missingMappingRecovery)
+    )
+    Assert-True (
+        $missingMappingTargets.Count -eq 1 -and
+        $missingMappingTargets[0].Path -eq $missingMappingTarget
+    ) "safe update could not bind an absent manifest target to an unchanged index"
+    $alternateMappingTarget = Join-Path $missingMappingDirectory "R-mapping.yml"
+    [System.IO.File]::WriteAllText($alternateMappingTarget, "concurrent: true`n")
+    $alternateMappingRejected = $false
+    try {
+        Get-SafeUpdateVerificationTargets `
+            $missingMappingIndex $missingMappingDirectory @($missingMappingRecovery) | Out-Null
+    } catch {
+        $alternateMappingRejected = $true
+    }
+    Assert-True $alternateMappingRejected "safe update accepted a replacement under the alternate subscription extension"
+    Assert-True (
+        (Get-Content -LiteralPath $alternateMappingTarget -Raw) -eq "concurrent: true`n"
+    ) "safe update changed a replacement under the alternate subscription extension"
+
     $unitRestoreManifestPath = Join-Path $safeUpdateProfiles "unit-restore-manifest.json"
     [System.IO.File]::WriteAllText($unitRestoreManifestPath, '{"Version":1}')
     $unitRestoreManifestSnapshot = Get-OptionalFileSnapshot $unitRestoreManifestPath "测试安全更新准备记录"
@@ -1975,6 +2038,23 @@ rules:
     Assert-True ($concurrentRestore.Conflicts.Count -eq 1) "safe update rollback did not detect a concurrent subscription change"
     Assert-True ((Get-Content -LiteralPath $concurrentTarget -Raw) -eq "newer: true`n") "safe update rollback overwrote a concurrent subscription change"
     Assert-True (Test-Path -LiteralPath $unitRestoreManifestPath -PathType Leaf) "safe update conflict consumed its recovery manifest"
+
+    $reappearedTarget = Join-Path $safeUpdateProfiles "reappeared.yaml"
+    $reappearedBackup = Join-Path $safeUpdateProfiles "reappeared.backup"
+    [System.IO.File]::WriteAllText($reappearedBackup, "before: true`n")
+    $reappearedRecovery = [pscustomobject]@{
+        File = "reappeared.yaml"
+        TargetPath = $reappearedTarget
+        BackupPath = $reappearedBackup
+        BeforeSha256 = Get-FileSha256 $reappearedBackup
+    }
+    $missingObservedHashes = @{ $reappearedTarget = "" }
+    [System.IO.File]::WriteAllText($reappearedTarget, "concurrent: true`n")
+    $reappearedRestore = Restore-SafeUpdateFiles `
+        @($reappearedRecovery) $missingObservedHashes $unitRestoreManifestPath $unitRestoreManifestSnapshot
+    Assert-True ($reappearedRestore.Conflicts.Count -eq 1) "safe update rollback did not detect a subscription created after a missing-target observation"
+    Assert-True ((Get-Content -LiteralPath $reappearedTarget -Raw) -eq "concurrent: true`n") "safe update rollback overwrote a subscription created after a missing-target observation"
+    Assert-True (Test-Path -LiteralPath $unitRestoreManifestPath -PathType Leaf) "missing-target conflict consumed its recovery manifest"
 
     $batchFirstTarget = Join-Path $safeUpdateProfiles "batch-first.yaml"
     $batchFirstBackup = Join-Path $safeUpdateProfiles "batch-first.backup"

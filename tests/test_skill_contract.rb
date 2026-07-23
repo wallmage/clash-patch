@@ -1106,6 +1106,54 @@ class SkillContractTest < Minitest::Test
     assert_equal 1, installer.scan("Remove-VerifiedOwnedFile $safeUpdateStatePath").length
   end
 
+  def test_windows_safe_update_restores_a_missing_manifest_target
+    installer = File.read(File.join(SKILL, "scripts/install_windows.ps1"))
+    safe_update = File.read(
+      File.join(SKILL, "scripts/windows/install_windows/safe_update.ps1")
+    )
+    windows_tests = File.binread(
+      File.join(ROOT, "tests/test_windows_installer.ps1")
+    ).force_encoding("UTF-8")
+
+    index_snapshot = installer.index(
+      'Get-OptionalFileSnapshot $profilesIndexPath "profiles.yaml"'
+    )
+    observed_missing = installer.index(
+      '$observedCurrentHashes[$recovery.TargetPath] = ""'
+    )
+    refute_nil index_snapshot
+    refute_nil observed_missing
+    assert_operator index_snapshot, :<, observed_missing
+    verify_prefix = installer[index_snapshot...observed_missing]
+    refute_includes verify_prefix, "Get-RemoteSubscriptionTargets"
+    assert_includes safe_update, "function Get-SafeUpdateVerificationTargets("
+    assert_includes safe_update,
+                    '$items = @(Get-RemoteSubscriptionProfileItems @(Split-YamlLines $ProfilesIndexText))'
+    assert_includes safe_update, "if ($matches.Count -eq 1) {"
+    assert_includes safe_update, '$path = [string]$recovery.TargetPath'
+    assert_includes safe_update,
+                    '$observedHash = [string]$ObservedHashes[$recovery.TargetPath]'
+    assert_includes safe_update,
+                    'if ([string]::IsNullOrWhiteSpace($observedHash)) {'
+    assert_includes safe_update, "                Existed = $false"
+    assert_includes windows_tests,
+                    "safe update did not recreate a missing remote subscription"
+
+    documents = [
+      File.read(File.join(ROOT, "README.md")),
+      File.read(File.join(SKILL, "SKILL.md")),
+      File.read(File.join(SKILL, "references/patch-policy.md")),
+      File.read(
+        File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md")
+      ),
+      File.read(File.join(ROOT, "tests/baseline.md"))
+    ]
+    documents.each do |document|
+      assert_includes document, "订阅文件缺失"
+      assert_includes document, "原子重建"
+    end
+  end
+
   def test_windows_preparation_recovery_accepts_targets_removed_by_the_main_journal
     transaction = File.read(
       File.join(SKILL, "scripts/windows/install_windows/transaction.ps1")

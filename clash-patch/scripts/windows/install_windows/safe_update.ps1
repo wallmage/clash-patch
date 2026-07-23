@@ -172,6 +172,58 @@ function Get-SafeUpdateRecoveryItems([object]$Manifest, [string]$Directory, [str
     return @($items)
 }
 
+function Get-SafeUpdateVerificationTargets(
+    [string]$ProfilesIndexText,
+    [string]$Directory,
+    [object[]]$RecoveryItems
+) {
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        throw "找不到订阅目录。"
+    }
+    $items = @(Get-RemoteSubscriptionProfileItems @(Split-YamlLines $ProfilesIndexText))
+    $items = @($items | Where-Object { $_.Type -eq "remote" })
+    if ($items.Count -eq 0 -or $items.Count -ne $RecoveryItems.Count) {
+        throw "远程订阅清单在更新期间发生变化。"
+    }
+    $targets = @()
+    foreach ($recovery in $RecoveryItems) {
+        $item = @($items | Where-Object {
+            [string]::Equals(
+                [string]$_.Uid,
+                [string]$recovery.Uid,
+                [StringComparison]::Ordinal
+            )
+        })
+        if ($item.Count -ne 1) { throw "远程订阅清单在更新期间发生变化。" }
+        $candidates = @(
+            (Join-Path $Directory ($item[0].Uid + ".yaml")),
+            (Join-Path $Directory ($item[0].Uid + ".yml"))
+        )
+        $matches = @($candidates | Where-Object {
+            Test-Path -LiteralPath $_ -PathType Leaf
+        })
+        if ($matches.Count -gt 1) { throw "远程订阅清单在更新期间发生变化。" }
+        if ($matches.Count -eq 1) {
+            $path = (Resolve-Path -LiteralPath $matches[0]).Path
+            if (-not [string]::Equals(
+                (Split-Path -Leaf $path),
+                [string]$recovery.File,
+                [StringComparison]::Ordinal
+            )) {
+                throw "远程订阅清单在更新期间发生变化。"
+            }
+        } else {
+            $path = [string]$recovery.TargetPath
+        }
+        $targets += [pscustomobject]@{
+            Uid = [string]$item[0].Uid
+            Name = [string]$item[0].Name
+            Path = $path
+        }
+    }
+    return @($targets)
+}
+
 function Restore-SafeUpdateFiles(
     [object[]]$RecoveryItems,
     [hashtable]$ObservedHashes,
@@ -192,18 +244,34 @@ function Restore-SafeUpdateFiles(
                 (Get-BytesSha256 $backupSnapshot.Bytes) -ne [string]$recovery.BeforeSha256) {
                 throw "安全更新备份在恢复前发生变化。"
             }
+            $observedHash = [string]$ObservedHashes[$recovery.TargetPath]
             $targetSnapshot = Get-OptionalFileSnapshot $recovery.TargetPath "更新后的订阅"
-            if (-not $targetSnapshot.Exists -or
-                (Get-BytesSha256 $targetSnapshot.Bytes) -ne [string]$ObservedHashes[$recovery.TargetPath]) {
-                $conflicts += $recovery.File
-                continue
-            }
-            $targets += [pscustomobject]@{
-                Path = $recovery.TargetPath
-                Bytes = $backupSnapshot.Bytes
-                Existed = $true
-                OriginalBytes = $targetSnapshot.Bytes
-                OriginalIdentity = $targetSnapshot.Identity
+            if ([string]::IsNullOrWhiteSpace($observedHash)) {
+                if ($targetSnapshot.Exists) {
+                    $conflicts += $recovery.File
+                    continue
+                }
+                $targets += [pscustomobject]@{
+                    Path = $recovery.TargetPath
+                    Bytes = $backupSnapshot.Bytes
+                    Existed = $false
+                    OriginalBytes = $null
+                    OriginalIdentity = $null
+                }
+            } else {
+                if ($observedHash -notmatch '^[0-9a-f]{64}$' -or
+                    -not $targetSnapshot.Exists -or
+                    (Get-BytesSha256 $targetSnapshot.Bytes) -ne $observedHash) {
+                    $conflicts += $recovery.File
+                    continue
+                }
+                $targets += [pscustomobject]@{
+                    Path = $recovery.TargetPath
+                    Bytes = $backupSnapshot.Bytes
+                    Existed = $true
+                    OriginalBytes = $targetSnapshot.Bytes
+                    OriginalIdentity = $targetSnapshot.Identity
+                }
             }
         } catch {
             $failures += $recovery.File

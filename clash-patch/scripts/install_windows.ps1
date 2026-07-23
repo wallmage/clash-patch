@@ -168,15 +168,23 @@ if ($VerifySafeUpdate) {
     $validated = @()
     $observedCurrentHashes = @{}
     try {
-        foreach ($recovery in $recoveryItems) {
-            if (-not (Test-Path -LiteralPath $recovery.TargetPath -PathType Leaf)) { throw "更新后的订阅文件缺失。" }
-            $observedCurrentHashes[$recovery.TargetPath] = Get-FileSha256 $recovery.TargetPath
-        }
         $indexSnapshot = Get-OptionalFileSnapshot $profilesIndexPath "profiles.yaml"
         if (-not $indexSnapshot.Exists) { throw "远程订阅清单在更新期间消失。" }
         $indexText = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($indexSnapshot.Bytes)
-        $currentTargets = @(Get-RemoteSubscriptionTargets $indexText $profilesDirectory)
-        if ($currentTargets.Count -ne $recoveryItems.Count) { throw "远程订阅清单在更新期间发生变化。" }
+        $currentTargets = @(
+            Get-SafeUpdateVerificationTargets $indexText $profilesDirectory $recoveryItems
+        )
+        $missingTarget = $false
+        foreach ($recovery in $recoveryItems) {
+            $targetSnapshot = Get-OptionalFileSnapshot $recovery.TargetPath "更新后的订阅"
+            if ($targetSnapshot.Exists) {
+                $observedCurrentHashes[$recovery.TargetPath] = Get-BytesSha256 $targetSnapshot.Bytes
+            } else {
+                $observedCurrentHashes[$recovery.TargetPath] = ""
+                $missingTarget = $true
+            }
+        }
+        if ($missingTarget) { throw "更新后的订阅文件缺失。" }
         $savedProfile = Get-SavedUsageProfile $usageStatePath
         if ($savedProfile -notin @(1, 2, 3)) { throw "没有可用于安全更新验收的用途档位。" }
         $scriptSnapshot = Get-OptionalFileSnapshot $targetScript "全局扩展脚本"

@@ -577,6 +577,24 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_safe_update_missing_target_restore_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/install_windows/safe_update.ps1",
+        "            if ([string]::IsNullOrWhiteSpace($observedHash)) {\n",
+        "            if ($false) {\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name",
+        "test_windows_safe_update_restores_a_missing_manifest_target"
+      )
+    end
+  end
+
   def test_windows_preparation_missing_target_handoff_mutation_is_killed
     with_repo_copy do |root|
       replace_once(
