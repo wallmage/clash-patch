@@ -125,8 +125,8 @@ class MutationSafetyTest < Minitest::Test
       replace_once(
         root,
         "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
-        "handle.write(item.fetch(:original))",
-        "handle.write(item.fetch(:candidate))"
+        "        item.fetch(:path), item.fetch(:original),\n",
+        "        item.fetch(:path), item.fetch(:candidate),\n"
       )
 
       assert_mutation_is_killed(
@@ -150,6 +150,56 @@ class MutationSafetyTest < Minitest::Test
         root,
         RbConfig.ruby, "tests/test_macos_patcher.rb",
         "--name", "test_locked_write_restores_original_bytes_after_a_partial_write_error"
+      )
+    end
+  end
+
+  def test_atomic_swap_verification_recovery_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/profile_writer.rb",
+        "        if File.exist?(temporary.path) && File.exist?(write_path) &&\n" \
+          "           same_file_identity?(source_stat, temporary.path) &&\n" \
+          "           File.binread(write_path) == replacement_bytes\n" \
+          "          atomic_swap_paths(temporary.path, write_path)\n" \
+          "        end\n",
+        "        if File.exist?(temporary.path) && File.exist?(write_path) &&\n" \
+          "           same_file_identity?(source_stat, temporary.path) &&\n" \
+          "           File.binread(write_path) == replacement_bytes\n" \
+          "          false\n" \
+          "        end\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_atomic_replace_restores_the_original_when_commit_verification_fails"
+      )
+    end
+  end
+
+  def test_safe_update_post_swap_recovery_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        "          if File.exist?(item.fetch(:temporary).path) &&\n" \
+          "             same_file_identity?(handle.stat, item.fetch(:temporary).path) &&\n" \
+          "             File.binread(item.fetch(:write_path)) == item.fetch(:candidate)\n" \
+          "            atomic_swap_paths(item.fetch(:temporary).path, item.fetch(:write_path))\n" \
+          "          end\n",
+        "          if File.exist?(item.fetch(:temporary).path) &&\n" \
+          "             same_file_identity?(handle.stat, item.fetch(:temporary).path) &&\n" \
+          "             File.binread(item.fetch(:write_path)) == item.fetch(:candidate)\n" \
+          "            false\n" \
+          "          end\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_safe_update_detects_lock_time_and_post_swap_identity_changes"
       )
     end
   end
@@ -185,6 +235,24 @@ class MutationSafetyTest < Minitest::Test
         root,
         RbConfig.ruby, "tests/test_macos_patcher.rb",
         "--name", "test_route_verifier_ignores_same_host_traffic_from_another_source_port"
+      )
+    end
+  end
+
+  def test_windows_idempotence_fail_safe_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/clash_verge_global.js",
+        "  if (JSON.stringify(candidate) !== JSON.stringify(secondPass)) return config;\n",
+        "  if (JSON.stringify(candidate) !== JSON.stringify(secondPass)) return candidate;\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        "node", "--test",
+        "--test-name-pattern=global transform verifies a second pass before returning a candidate",
+        "tests/test_windows_patcher.js"
       )
     end
   end
@@ -228,8 +296,10 @@ class MutationSafetyTest < Minitest::Test
       replace_once(
         root,
         "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
-        "      ownership_path = create_auto_update_ownership_state(backup_root, domain)\n",
-        "      ownership_path = nil\n"
+        "      ownership = write_auto_update_ownership_state(\n" \
+          "        backup_root, domain, original, \"installed\", existing: auto_update_ownership_state(backup_root)\n" \
+          "      )\n",
+        "      ownership = { \"Path\" => auto_update_ownership_path(backup_root) }\n"
       )
 
       assert_mutation_is_killed(

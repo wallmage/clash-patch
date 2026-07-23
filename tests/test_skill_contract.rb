@@ -982,6 +982,29 @@ class SkillContractTest < Minitest::Test
     assert_includes workflow, "ruby tests/test_mutation_safety.rb"
     assert_includes workflow, "ruby tests/test_macos_wrappers.rb"
     assert_includes workflow, "/usr/bin/ruby tests/test_macos_wrappers.rb"
+    assert_includes workflow, "runs-on: ${{ matrix.runner }}"
+    assert_includes workflow, "runner: macos-15-intel"
+    assert_includes workflow, "architecture: arm64"
+    assert_includes workflow, "architecture: amd64"
+    assert_includes workflow, "v1.19.27:$MIHOMO_MINIMUM_SHA256:MINIMUM"
+    assert_includes workflow, "v1.19.29:$MIHOMO_CURRENT_SHA256:CURRENT"
+    assert_includes workflow, "3617c9d8a5a55aecfe1ebd0f55ff59f2706c8ad68fd65c6c4e5f7cf2b74263f1"
+    assert_includes workflow, "5392bea435a1c4b0a496571daafa977f744207cfafac18fb78a9b7d0747585c2"
+    assert_includes workflow, "4dc25df9e899f14161911302a8ee5fc9e202ed9c976fc405bf82c50ff27466ca"
+    assert_includes workflow, "b57fec2e38462532fe75252792b355b99db16b0b8ea2d6bdf0cd8bc7ddacb9d2"
+    mihomo_hashes = workflow.scan(/(?:minimum|current)_sha256:\s*"([^"]+)"/).flatten
+    assert_equal 4, mihomo_hashes.length
+    mihomo_hashes.each { |digest| assert_match(/\A[0-9a-f]{64}\z/, digest) }
+    assert_includes workflow, "github.com/MetaCubeX/mihomo/releases/download/"
+    assert_includes workflow, "shasum -a 256 --check"
+    assert_includes workflow, "--connect-timeout 15 --max-time 300"
+    assert_equal 2, workflow.scan(/CLASH_PATCH_REQUIRE_REAL_MIHOMO: "1"/).length
+    assert_includes workflow, 'CLASH_PATCH_TEST_MIHOMO="$MIHOMO_MINIMUM_PATH" ruby'
+    assert_includes workflow, 'CLASH_PATCH_TEST_MIHOMO="$MIHOMO_CURRENT_PATH" ruby'
+    assert_equal 2, workflow.scan(/ruby tests\/test_macos_patcher\.rb --name test_generated_profile_passes_installed_mihomo_validation/).length
+    macos_tests = File.read(File.join(ROOT, "tests/test_macos_patcher.rb"))
+    assert_includes macos_tests, 'ENV["CLASH_PATCH_REQUIRE_REAL_MIHOMO"] == "1"'
+    assert_includes macos_tests, 'ENV["CLASH_PATCH_TEST_MIHOMO"]'
     assert_includes workflow, "--test-coverage-lines=100"
     assert_includes workflow, "--test-coverage-functions=100"
     assert_includes workflow, "--test-coverage-branches=80"
@@ -995,14 +1018,20 @@ class SkillContractTest < Minitest::Test
     assert_includes workflow, "fetch-depth: 0"
     assert_includes workflow, "github.event.before"
     assert_includes workflow, "github.event.pull_request.base.sha"
-    assert_equal 2, workflow.scan(/timeout-minutes:\s*20/).length
+    assert_equal 3, workflow.scan(/timeout-minutes:\s*20/).length
   end
 
   def test_ruby_coverage_requires_the_entire_transform_module_at_one_hundred_percent
     source = File.read(File.join(ROOT, "tests/coverage_ruby.rb"))
 
+    assert_includes source, "MINIMUM_PATCHER_LINE_COVERAGE = 100.0"
+    assert_includes source, "MINIMUM_MODULE_LINE_COVERAGE = 100.0"
+    assert_includes source, "MINIMUM_VERIFY_LINE_COVERAGE = 100.0"
+    assert_includes source, "MINIMUM_PRODUCTION_BRANCH_COVERAGE = 75.0"
     assert_includes source, 'TRANSFORM_PATH = File.join(MACOS_RUBY_ROOT, "patch_profiles", "transform.rb")'
     assert_includes source, "MINIMUM_TRANSFORM_LINE_COVERAGE = 100.0"
+    assert_includes source, "uncovered_line_ranges"
+    assert_includes source, "uncovered_branch_lines"
     assert_includes source, "path == TRANSFORM_PATH"
     refute_includes source, "TRANSFORM_CORE_METHODS"
     refute_includes source, "RubyVM::AbstractSyntaxTree"

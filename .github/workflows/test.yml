@@ -66,6 +66,58 @@ jobs:
             git show --check --format= HEAD
           fi
 
+  mihomo:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+            minimum_sha256: "3617c9d8a5a55aecfe1ebd0f55ff59f2706c8ad68fd65c6c4e5f7cf2b74263f1"
+            current_sha256: "4dc25df9e899f14161911302a8ee5fc9e202ed9c976fc405bf82c50ff27466ca"
+          - runner: macos-15-intel
+            architecture: amd64
+            minimum_sha256: "5392bea435a1c4b0a496571daafa977f744207cfafac18fb78a9b7d0747585c2"
+            current_sha256: "b57fec2e38462532fe75252792b355b99db16b0b8ea2d6bdf0cd8bc7ddacb9d2"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ruby/setup-ruby@003a5c4d8d6321bd302e38f6f0ec593f77f06600 # v1.319.0
+        with:
+          ruby-version: "3.3"
+      - name: Download and verify pinned Mihomo versions
+        env:
+          MIHOMO_ARCHITECTURE: ${{ matrix.architecture }}
+          MIHOMO_MINIMUM_SHA256: ${{ matrix.minimum_sha256 }}
+          MIHOMO_CURRENT_SHA256: ${{ matrix.current_sha256 }}
+        run: |
+          for entry in \
+            "v1.19.27:$MIHOMO_MINIMUM_SHA256:MINIMUM" \
+            "v1.19.29:$MIHOMO_CURRENT_SHA256:CURRENT"
+          do
+            IFS=: read -r version expected label <<EOF
+          $entry
+          EOF
+            archive="$RUNNER_TEMP/mihomo-$label.gz"
+            binary="$RUNNER_TEMP/mihomo-$label"
+            curl --fail --location --retry 3 --connect-timeout 15 --max-time 300 \
+              --output "$archive" \
+              "https://github.com/MetaCubeX/mihomo/releases/download/$version/mihomo-darwin-$MIHOMO_ARCHITECTURE-$version.gz"
+            echo "$expected  $archive" | shasum -a 256 --check
+            gzip --decompress --stdout "$archive" > "$binary"
+            chmod 700 "$binary"
+            echo "MIHOMO_${label}_PATH=$binary" >> "$GITHUB_ENV"
+          done
+      - name: Validate all profiles with minimum Mihomo
+        env:
+          CLASH_PATCH_REQUIRE_REAL_MIHOMO: "1"
+        run: CLASH_PATCH_TEST_MIHOMO="$MIHOMO_MINIMUM_PATH" ruby tests/test_macos_patcher.rb --name test_generated_profile_passes_installed_mihomo_validation
+      - name: Validate all profiles with current Mihomo
+        env:
+          CLASH_PATCH_REQUIRE_REAL_MIHOMO: "1"
+        run: CLASH_PATCH_TEST_MIHOMO="$MIHOMO_CURRENT_PATH" ruby tests/test_macos_patcher.rb --name test_generated_profile_passes_installed_mihomo_validation
+
   windows-installer:
     runs-on: windows-2022
     timeout-minutes: 20

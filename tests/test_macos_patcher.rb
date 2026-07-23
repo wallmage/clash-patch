@@ -865,6 +865,80 @@ class MacosPatcherTest < Minitest::Test
     assert_equal :unknown, ClashPatch.subscription_auto_update_state(nil)
   end
 
+  def test_backup_helpers_tolerate_owned_file_permission_errors_and_cleanup_failed_creates
+    Dir.mktmpdir do |directory|
+      backup_root = File.join(directory, "backups")
+      FileUtils.mkdir_p(backup_root)
+      existing = File.join(backup_root, "existing.backup")
+      File.write(existing, "old")
+      original_chmod = FileUtils.method(:chmod)
+      chmod_with_owned_failure = lambda do |mode, path|
+        raise Errno::EPERM if path == existing
+
+        original_chmod.call(mode, path)
+      end
+      FileUtils.stub(:chmod, chmod_with_owned_failure) do
+        assert_equal backup_root, ClashPatch.secure_backup_root!(backup_root)
+      end
+
+      source = File.join(directory, "friend.yaml")
+      File.write(source, "original")
+      chmod_with_new_failure = lambda do |mode, path|
+        raise Errno::EPERM if path.end_with?(".backup")
+
+        original_chmod.call(mode, path)
+      end
+      FileUtils.stub(:chmod, chmod_with_new_failure) do
+        assert_raises(Errno::EPERM) do
+          ClashPatch.create_versioned_backup(source, backup_root)
+        end
+      end
+      assert_empty Dir.glob(File.join(backup_root, "*--prewrite--*.backup"))
+      assert_equal "old", File.read(existing)
+    end
+  end
+
+  def test_versioned_backup_retries_an_exclusive_name_collision
+    Dir.mktmpdir do |directory|
+      source = File.join(directory, "friend.yaml")
+      backup_root = File.join(directory, "backups")
+      File.write(source, "original")
+      original_open = File.method(:open)
+      attempts = 0
+      colliding_open = lambda do |path, *arguments, &block|
+        if path.to_s.end_with?(".backup")
+          attempts += 1
+          raise Errno::EEXIST if attempts == 1
+        end
+        original_open.call(path, *arguments, &block)
+      end
+
+      backup = File.stub(:open, colliding_open) do
+        ClashPatch.create_versioned_backup(source, backup_root)
+      end
+
+      assert_equal 2, attempts
+      assert_equal "original", File.read(backup)
+    end
+  end
+
+  def test_restore_backup_classifies_invalid_and_io_failures
+    ClashPatch.stub(:resolve_backup_id, ->(*_args) { raise ClashPatch::InvalidConfigError }) do
+      result = ClashPatch.restore_backup(
+        "bad.backup", directories: [], backup_root: Dir.tmpdir,
+        expected_current_sha256: "0" * 64, validator: ->(_path) { true }
+      )
+      assert_equal :invalid_backup, result.fetch(:status)
+    end
+    ClashPatch.stub(:resolve_backup_id, ->(*_args) { raise IOError }) do
+      result = ClashPatch.restore_backup(
+        "bad.backup", directories: [], backup_root: Dir.tmpdir,
+        expected_current_sha256: "0" * 64, validator: ->(_path) { true }
+      )
+      assert_equal :io_error, result.fetch(:status)
+    end
+  end
+
   def test_disables_subscription_auto_update_through_defaults_and_verifies_it
     Dir.mktmpdir do |directory|
       calls = []
@@ -928,6 +1002,189 @@ class MacosPatcherTest < Minitest::Test
       assert_equal :already_disabled, result.fetch(:status)
       assert_empty Dir.glob(File.join(directory, "*.backup"))
       refute File.exist?(File.join(directory, "clashx-meta-kAutoUpdateEnable.state.json"))
+    end
+  end
+
+  def test_auto_update_disable_recovers_a_prepared_operation_before_retrying
+    Dir.mktmpdir do |directory|
+      state_path = File.join(directory, "clashx-meta-kAutoUpdateEnable.state.json")
+      File.write(state_path, JSON.generate(
+        "Version" => 2,
+        "Domain" => "com.metacubex.ClashX.meta",
+        "Key" => "kAutoUpdateEnable",
+        "OriginalValue" => "1",
+        "Phase" => "prepared"
+      ))
+      values = %w[0 0 1 1 1 0]
+      writes = []
+      runner = lambda do |*arguments, **_options|
+        if arguments[1] == "export"
+          ["plist", "", Struct.new(:success?).new(true)]
+        elsif arguments[1] == "write"
+          writes << arguments.last
+          ["", "", Struct.new(:success?).new(true)]
+        elsif arguments[0] == "/usr/bin/plutil"
+          [values.shift, "", Struct.new(:success?).new(true)]
+        else
+          flunk("unexpected command: #{arguments.inspect}")
+        end
+      end
+
+      result = ClashPatch.disable_subscription_auto_update(backup_root: directory, runner: runner)
+
+      assert_equal :disabled, result.fetch(:status)
+      assert_equal %w[true false], writes
+      assert_empty values
+      state = JSON.parse(File.read(state_path))
+      assert_equal "installed", state.fetch("Phase")
+    end
+  end
+
+  def test_auto_update_disable_rejects_a_change_before_the_preference_write
+    Dir.mktmpdir do |directory|
+      values = %w[1 0]
+      runner = lambda do |*arguments, **_options|
+        if arguments[1] == "export"
+          ["plist", "", Struct.new(:success?).new(true)]
+        elsif arguments[0] == "/usr/bin/plutil"
+          [values.shift, "", Struct.new(:success?).new(true)]
+        else
+          flunk("changed preference reached a write: #{arguments.inspect}")
+        end
+      end
+
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.disable_subscription_auto_update(backup_root: directory, runner: runner)
+      end
+      refute File.exist?(File.join(directory, "clashx-meta-kAutoUpdateEnable.state.json"))
+      assert_empty values
+    end
+  end
+
+  def test_auto_update_helpers_fail_closed_on_malformed_state_and_runner_errors
+    Dir.mktmpdir do |directory|
+      state_path = File.join(directory, "clashx-meta-kAutoUpdateEnable.state.json")
+      File.binwrite(state_path, "\xFF".b)
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.auto_update_ownership_state(directory)
+      end
+    end
+
+    failing_runner = ->(*_arguments, **_options) { raise IOError, "injected runner failure" }
+    assert_nil ClashPatch.defaults_export_domain(runner: failing_runner)
+    assert_nil ClashPatch.defaults_export_named_domain("com.metacubex.ClashX.meta", runner: failing_runner)
+    assert_equal "", ClashPatch.plist_raw_value("plist", "key", runner: failing_runner)
+  end
+
+  def test_stale_auto_update_ownership_cannot_be_deleted
+    Dir.mktmpdir do |directory|
+      ownership = ClashPatch.write_auto_update_ownership_state(
+        directory, "com.metacubex.ClashX.meta", "1", "prepared"
+      )
+      path = ownership.fetch("Path")
+      File.write(path, JSON.generate(
+        "Version" => 2,
+        "Domain" => "com.metacubex.ClashX.meta",
+        "Key" => "kAutoUpdateEnable",
+        "OriginalValue" => "different",
+        "Phase" => "prepared"
+      ))
+
+      assert_raises(IOError) { ClashPatch.delete_auto_update_ownership_state(ownership) }
+      assert File.file?(path)
+      assert_includes File.read(path), "different"
+    end
+  end
+
+  def test_installed_auto_update_ownership_is_idempotent
+    Dir.mktmpdir do |directory|
+      ClashPatch.write_auto_update_ownership_state(
+        directory, "com.metacubex.ClashX.meta", "1", "installed"
+      )
+      runner = lambda do |*arguments, **_options|
+        if arguments[1] == "export"
+          ["plist", "", Struct.new(:success?).new(true)]
+        elsif arguments[0] == "/usr/bin/plutil"
+          ["0", "", Struct.new(:success?).new(true)]
+        else
+          flunk("idempotent disable tried to write: #{arguments.inspect}")
+        end
+      end
+
+      result = ClashPatch.disable_subscription_auto_update(backup_root: directory, runner: runner)
+
+      assert_equal :already_disabled, result.fetch(:status)
+    end
+  end
+
+  def test_auto_update_disable_compensation_reports_each_failure_stage
+    status = Struct.new(:success?)
+    run_case = lambda do |values, write_success:, installed_state_failure:, restore_failure:, &assertion|
+      Dir.mktmpdir do |directory|
+        runner = lambda do |*arguments, **_options|
+          if arguments[1] == "export"
+            ["plist", "", status.new(true)]
+          elsif arguments[1] == "write"
+            ["", "injected defaults failure", status.new(write_success)]
+          elsif arguments[0] == "/usr/bin/plutil"
+            [values.shift, "", status.new(true)]
+          else
+            flunk("unexpected command: #{arguments.inspect}")
+          end
+        end
+        restore = restore_failure ? ->(**_args) { raise IOError, "injected restore failure" } : { status: :enabled }
+        original_writer = ClashPatch.method(:write_auto_update_ownership_state)
+        state_writer = lambda do |root, domain, original, phase, existing: nil|
+          raise IOError, "injected installed-state failure" if installed_state_failure && phase == "installed"
+
+          original_writer.call(root, domain, original, phase, existing: existing)
+        end
+        ClashPatch.stub(:enable_subscription_auto_update, restore) do
+          ClashPatch.stub(:write_auto_update_ownership_state, state_writer) do
+            assertion.call(directory, runner)
+          end
+        end
+      end
+    end
+
+    [
+      [%w[1 1], false, false, false, "无法关闭 ClashX Meta"],
+      [%w[1 1], false, false, true, "恢复原值失败"],
+      [%w[1 1 1], true, false, false, "回读失败，已经恢复原值"],
+      [%w[1 1 1], true, false, true, "回读失败，且恢复原值失败"],
+      [%w[1 1 0], true, true, false, "无法记录订阅自动更新所有权，已经恢复原值"],
+      [%w[1 1 0], true, true, true, "无法记录订阅自动更新所有权，且恢复原值失败"]
+    ].each do |values, write_success, state_failure, restore_failure, message|
+      run_case.call(
+        values, write_success: write_success,
+        installed_state_failure: state_failure, restore_failure: restore_failure
+      ) do |directory, runner|
+        error = assert_raises(IOError) do
+          ClashPatch.disable_subscription_auto_update(backup_root: directory, runner: runner)
+        end
+        assert_includes error.message, message
+      end
+    end
+  end
+
+  def test_owned_auto_update_restore_rejects_an_unknown_live_value
+    Dir.mktmpdir do |directory|
+      ClashPatch.write_auto_update_ownership_state(
+        directory, "com.metacubex.ClashX.meta", "1", "installed"
+      )
+      runner = lambda do |*arguments, **_options|
+        if arguments[1] == "export"
+          ["plist", "", Struct.new(:success?).new(true)]
+        elsif arguments[0] == "/usr/bin/plutil"
+          ["mystery", "", Struct.new(:success?).new(true)]
+        else
+          flunk("unknown value reached a write: #{arguments.inspect}")
+        end
+      end
+
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.restore_owned_subscription_auto_update(backup_root: directory, runner: runner)
+      end
     end
   end
 
@@ -1089,6 +1346,29 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_remote_subscription_and_identity_helpers_fail_closed_on_bad_inputs
+    assert_raises(ClashPatch::InvalidConfigError) do
+      ClashPatch.remote_subscription_records("not-base64")
+    end
+    assert_raises(ClashPatch::InvalidConfigError) do
+      ClashPatch.fetch_remote_subscription({})
+    end
+
+    missing = File.join(Dir.tmpdir, "missing-clash-patch-subscription")
+    handle = Object.new
+    handle.define_singleton_method(:stat) { raise IOError }
+    refute ClashPatch.locked_profile_current?(handle, missing)
+    refute ClashPatch.safe_update_item_committed?(
+      path: missing, write_path: missing, committed_identity: [1, 1], candidate: "candidate"
+    )
+    assert_equal ["friend"], ClashPatch.rollback_safe_update_items([
+      {
+        name: "friend", path: missing, original: "old", candidate: "new",
+        committed_identity: [1, 1], write_path: missing
+      }
+    ])
+  end
+
   def test_remote_subscription_url_is_passed_to_curl_over_stdin_not_process_arguments
     url = "https://subscriptions.invalid/private-token"
     status = Struct.new(:success?).new(true)
@@ -1187,16 +1467,16 @@ class MacosPatcherTest < Minitest::Test
         { name: name, path: path, url: "https://subscriptions.invalid/#{name}" }
       end
       originals = targets.to_h { |target| [target.fetch(:path), File.binread(target.fetch(:path))] }
-      original_writer = ClashPatch.method(:write_locked_profile)
-      writes = 0
-      failing_writer = lambda do |handle, bytes|
-        writes += 1
-        raise IOError, "injected second write failure" if writes == 2
+      original_swap = ClashPatch.method(:atomic_swap_paths)
+      swaps = 0
+      failing_swap = lambda do |first, second|
+        swaps += 1
+        raise IOError, "injected second commit failure" if swaps == 2
 
-        original_writer.call(handle, bytes)
+        original_swap.call(first, second)
       end
 
-      result = ClashPatch.stub(:write_locked_profile, failing_writer) do
+      result = ClashPatch.stub(:atomic_swap_paths, failing_swap) do
         ClashPatch.safe_update_all(
           targets: targets, policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 3,
           fetcher: ->(target) { YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}")) },
@@ -1206,7 +1486,7 @@ class MacosPatcherTest < Minitest::Test
 
       assert_equal :aborted, result.fetch(:status)
       assert_equal :write_failed, result.fetch(:reason)
-      assert_operator writes, :>=, 2
+      assert_operator swaps, :>=, 3
       targets.each { |target| assert_equal originals.fetch(target.fetch(:path)), File.binread(target.fetch(:path)) }
     end
   end
@@ -1347,6 +1627,91 @@ class MacosPatcherTest < Minitest::Test
       assert_equal originals.fetch(targets[0].fetch(:path)), File.binread(targets[0].fetch(:path))
       assert_equal originals.fetch(targets[2].fetch(:path)), File.binread(targets[2].fetch(:path))
       refute_equal originals.fetch(targets[1].fetch(:path)), File.binread(targets[1].fetch(:path))
+    end
+  end
+
+  def test_safe_update_reports_lock_time_identity_and_rollback_failures
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "friend.yaml")
+      File.write(path, YAML.dump(base_config.merge("subscription-marker" => "old")))
+      target = { name: "friend", path: path, url: "https://subscriptions.invalid/friend" }
+      arguments = {
+        targets: [target],
+        policy: @policy,
+        backup_root: File.join(directory, "backups"),
+        usage_profile: 3,
+        fetcher: ->(_target) { YAML.dump(base_config.merge("subscription-marker" => "new")) },
+        validator: ->(_candidate) { true },
+        activation: ->(_items) { true }
+      }
+
+      ClashPatch.stub(:locked_profile_current?, false) do
+        result = ClashPatch.safe_update_all(**arguments)
+        assert_equal :aborted, result.fetch(:status)
+        assert_equal :concurrent_change, result.fetch(:reason)
+      end
+
+      File.write(path, YAML.dump(base_config.merge("subscription-marker" => "old")))
+      original_swap = ClashPatch.method(:atomic_swap_paths)
+      failing_swap = lambda do |first, second|
+        raise IOError, "injected commit failure" if File.basename(first).start_with?(".clash-patch-update-swap-")
+
+        original_swap.call(first, second)
+      end
+      ClashPatch.stub(:atomic_swap_paths, failing_swap) do
+        ClashPatch.stub(:rollback_safe_update_items, ["friend"]) do
+          result = ClashPatch.safe_update_all(**arguments)
+          assert_equal :rollback_failed, result.fetch(:status)
+          assert_equal :write_failed, result.fetch(:reason)
+          assert_equal "friend", result.fetch(:failed_profile)
+        end
+      end
+    end
+  end
+
+  def test_safe_update_post_commit_verification_rolls_back_before_reporting
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old"))
+      File.write(path, original)
+      target = { name: "friend", path: path, url: "https://subscriptions.invalid/friend" }
+
+      ClashPatch.stub(:safe_update_item_committed?, false) do
+        result = ClashPatch.safe_update_all(
+          targets: [target], policy: @policy, backup_root: File.join(directory, "backups"),
+          usage_profile: 3,
+          fetcher: ->(_target) { YAML.dump(base_config.merge("subscription-marker" => "new")) },
+          validator: ->(_candidate) { true }, activation: ->(_items) { flunk "must not activate" }
+        )
+        assert_equal :aborted, result.fetch(:status)
+        assert_equal :concurrent_change, result.fetch(:reason)
+        assert_equal original.b, File.binread(path)
+      end
+    end
+  end
+
+  def test_safe_update_distinguishes_invalid_requests_from_unexpected_setup_failures
+    assert_raises(ClashPatch::InvalidConfigError) do
+      ClashPatch.safe_update_all(
+        targets: [], policy: @policy, backup_root: Dir.tmpdir, usage_profile: 0
+      )
+    end
+
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "friend.yaml")
+      File.write(path, YAML.dump(base_config))
+      target = { name: "friend", path: path, url: "https://subscriptions.invalid/friend" }
+      ClashPatch.stub(:build_update_candidate, YAML.dump(base_config)) do
+        File.stub(:stat, ->(_candidate) { raise IOError, "injected identity failure" }) do
+          result = ClashPatch.safe_update_all(
+            targets: [target], policy: @policy, backup_root: File.join(directory, "backups"),
+            usage_profile: 3, fetcher: ->(_target) { YAML.dump(base_config) },
+            validator: ->(_candidate) { true }
+          )
+          assert_equal :aborted, result.fetch(:status)
+          assert_equal :unexpected_error, result.fetch(:reason)
+        end
+      end
     end
   end
 
@@ -2689,9 +3054,14 @@ class MacosPatcherTest < Minitest::Test
   end
 
   def test_generated_profile_passes_installed_mihomo_validation
-    skip "set CLASH_PATCH_RUN_INSTALLED_CORE_TEST=1 to test the locally installed Mihomo core" unless ENV["CLASH_PATCH_RUN_INSTALLED_CORE_TEST"] == "1"
-    core = ClashPatch.mihomo_core_path
-    skip "ClashX Meta Mihomo core is not installed" unless core
+    core = ENV["CLASH_PATCH_TEST_MIHOMO"]
+    if core.to_s.empty?
+      flunk "CI required a real Mihomo core but CLASH_PATCH_TEST_MIHOMO was empty" if ENV["CLASH_PATCH_REQUIRE_REAL_MIHOMO"] == "1"
+      skip "set CLASH_PATCH_RUN_INSTALLED_CORE_TEST=1 to test the locally installed Mihomo core" unless ENV["CLASH_PATCH_RUN_INSTALLED_CORE_TEST"] == "1"
+      core = ClashPatch.mihomo_core_path
+      skip "ClashX Meta Mihomo core is not installed" unless core
+    end
+    assert_equal :supported, ClashPatch.mihomo_core_status(core)
 
     text = <<~YAML
       mixed-port: 7890
@@ -2711,13 +3081,19 @@ class MacosPatcherTest < Minitest::Test
         - MATCH,Main
     YAML
     Dir.mktmpdir do |directory|
-      profile = File.join(directory, "config.yaml")
-      File.write(profile, text)
-      core_args = [core, "-d", ClashPatch.mihomo_validation_directory(profile), "-t", "-f", profile]
-      assert system(*core_args, out: File::NULL, err: File::NULL), "baseline fixture must be valid"
-      result = ClashPatch.patch_path(profile, @policy, validator: ClashPatch.method(:validate_with_mihomo))
-      assert_equal :updated, result.fetch(:status)
-      assert system(*core_args, out: File::NULL, err: File::NULL), "patched fixture must stay valid"
+      [1, 2, 3].each do |usage_profile|
+        profile = File.join(directory, "profile-#{usage_profile}.yaml")
+        File.write(profile, text)
+        assert_equal true, ClashPatch.validate_with_mihomo(profile, core_path: core),
+                     "profile #{usage_profile} baseline fixture must be valid"
+        validator = ->(path) { ClashPatch.validate_with_mihomo(path, core_path: core) }
+        result = ClashPatch.patch_path(
+          profile, @policy, validator: validator, usage_profile: usage_profile
+        )
+        assert_equal :updated, result.fetch(:status), "profile #{usage_profile}"
+        assert_equal true, ClashPatch.validate_with_mihomo(profile, core_path: core),
+                     "profile #{usage_profile} patch must stay valid"
+      end
     end
   end
 
@@ -2886,6 +3262,309 @@ class MacosPatcherTest < Minitest::Test
     refute ClashPatch.dns_runtime_healthy?(requester, "example.invalid")
   end
 
+  def test_process_timeout_helpers_cover_normal_exit_and_kill_fallbacks
+    output, status, timed_out = ClashPatch.run_process_with_timeout(
+      RbConfig.ruby, "-e", "STDOUT.write('fixture-output')", timeout_seconds: 2
+    )
+    assert_equal "fixture-output", output
+    assert status.success?
+    refute timed_out
+
+    signals = []
+    killer = lambda do |signal, pid|
+      signals << [signal, pid]
+      raise Errno::ESRCH
+    end
+    Process.stub(:kill, killer) do
+      Process.stub(:waitpid, ->(_pid) { raise Errno::ECHILD }) do
+        assert_nil ClashPatch.terminate_process_group(12_345)
+      end
+    end
+    assert_equal [["TERM", -12_345], ["KILL", 12_345]], signals
+  end
+
+  def test_mihomo_core_status_covers_supported_old_and_unreadable_results
+    Dir.mktmpdir do |directory|
+      core = File.join(directory, "mihomo")
+      File.write(core, "#!/bin/sh\n")
+      File.chmod(0o700, core)
+      success = Struct.new(:success?).new(true)
+
+      ClashPatch.stub(:run_process_with_timeout, ["Mihomo Meta v1.19.27", success, false]) do
+        assert_equal :supported, ClashPatch.mihomo_core_status(core)
+      end
+      ClashPatch.stub(:run_process_with_timeout, ["Mihomo Meta v1.19.26", success, false]) do
+        assert_equal :too_old, ClashPatch.mihomo_core_status(core)
+      end
+      ClashPatch.stub(:run_process_with_timeout, ->(*_args, **_kwargs) { raise IOError }) do
+        assert_equal :unreadable, ClashPatch.mihomo_core_status(core)
+      end
+
+      expected = File.expand_path(
+        "~/Library/Application Support/com.metacubex.ClashX.meta/.private_core/" \
+          "com.metacubex.ClashX.ProxyConfigHelper.meta"
+      )
+      File.stub(:file?, ->(path) { path == expected }) do
+        File.stub(:executable?, ->(path) { path == expected }) do
+          assert_equal expected, ClashPatch.mihomo_core_path
+        end
+      end
+    end
+  end
+
+  def test_file_transaction_helpers_fail_closed_and_restore_partial_writes
+    handle = Object.new
+    handle.define_singleton_method(:flock) { |_mode| false }
+    times = [0.0, 0.0, 1.0]
+    ClashPatch.stub(:monotonic_now, -> { times.shift }) do
+      ClashPatch.stub(:sleep, nil) do
+        assert_raises(IOError) { ClashPatch.lock_exclusive_with_timeout(handle, timeout_seconds: 0.5) }
+      end
+    end
+
+    missing = File.join(Dir.tmpdir, "missing-clash-patch-identity")
+    refute ClashPatch.same_file_identity?(Struct.new(:dev, :ino).new(1, 1), missing)
+    refute ClashPatch.atomic_compare_and_swap_bytes(missing, "old", "new")
+    refute ClashPatch.locked_source_current?(Tempfile.new("missing-source"), missing, missing)
+
+    Tempfile.create("clash-patch-write") do |file|
+      file.binmode
+      file.write("original")
+      file.flush
+      assert ClashPatch.write_locked_bytes(file, "replacement", "original")
+      file.rewind
+      assert_equal "replacement", file.read
+    end
+
+    failing = Object.new
+    failing.define_singleton_method(:rewind) {}
+    failing.define_singleton_method(:write) { |_bytes| raise IOError, "injected write failure" }
+    error = assert_raises(IOError) { ClashPatch.write_locked_bytes(failing, "new", "old") }
+    assert_includes error.message, "原内容恢复失败"
+  end
+
+  def test_patch_path_reports_non_idempotence_validation_timeout_and_unexpected_errors
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "friend.yaml")
+      File.write(path, YAML.dump(base_config))
+      calls = 0
+      non_idempotent = lambda do |config, _policy, usage_profile:|
+        calls += 1
+        assert_equal 3, usage_profile
+        { changed: true, status: :updated, config: config }
+      end
+      ClashPatch.stub(:patch, non_idempotent) do
+        result = ClashPatch.patch_path(path, @policy, dry_run: true)
+        assert_equal :non_idempotent, result.fetch(:status)
+      end
+      assert_equal 2, calls
+
+      result = ClashPatch.patch_path(path, @policy, validator: ->(_candidate) { :timeout })
+      assert_equal :validation_timeout, result.fetch(:status)
+
+      ClashPatch.stub(:patch_path_once, ->(*_args, **_kwargs) { raise "injected unexpected failure" }) do
+        assert_equal :error, ClashPatch.patch_path(path, @policy).fetch(:status)
+      end
+    end
+  end
+
+  def test_run_rejects_bad_policy
+    Dir.mktmpdir do |directory|
+      invalid_policy = File.join(directory, "policy.json")
+      File.write(invalid_policy, JSON.generate("version" => -1))
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.run(directory: directory, policy_path: invalid_policy)
+      end
+    end
+  end
+
+  def test_runtime_helpers_cover_socket_discovery_and_exception_boundaries
+    Dir.mktmpdir do |home|
+      old_home = ENV["HOME"]
+      ENV["HOME"] = home
+      cache = File.join(home, "Library", "Caches", "com.MetaCubeX.ClashX.meta", "cacheConfigs")
+      FileUtils.mkdir_p(cache)
+      socket_path = File.join(home, "controller.sock")
+      server = UNIXServer.new(socket_path)
+      File.write(File.join(cache, "active.yaml"), YAML.dump("external-controller-unix" => socket_path))
+      assert_equal socket_path, ClashPatch.controller_socket
+    ensure
+      server&.close
+      ENV["HOME"] = old_home
+    end
+
+    Dir.mktmpdir do |home|
+      old_home = ENV["HOME"]
+      ENV["HOME"] = home
+      cache = File.join(home, "Library", "Caches", "com.MetaCubeX.ClashX.meta", "cacheConfigs")
+      FileUtils.mkdir_p(cache)
+      File.write(File.join(cache, "invalid.yaml"), ":\n")
+      assert_nil ClashPatch.controller_socket
+    ensure
+      ENV["HOME"] = old_home
+    end
+
+    Open3.stub(:capture2e, ->(*_args) { raise IOError }) do
+      assert_equal [0, ""], ClashPatch.controller_request("socket", "GET", "/configs")
+    end
+    ClashPatch.stub(:controller_socket, nil) do
+      assert_equal :unknown, ClashPatch.tun_state
+    end
+    ClashPatch.stub(:controller_socket, "socket") do
+      ClashPatch.stub(:controller_request, [200, JSON.generate("tun" => { "enable" => true })]) do
+        assert_equal :enabled, ClashPatch.tun_state
+      end
+    end
+    assert_equal :unknown, ClashPatch.tun_state(requester: ->(*_args) {
+      [200, JSON.generate("tun" => { "enable" => nil })]
+    })
+    Open3.stub(:capture2e, ->(*_args) { raise IOError }) do
+      refute ClashPatch.default_connectivity_healthy?
+    end
+  end
+
+  def test_runtime_rollback_helpers_fail_closed_on_missing_files_and_request_errors
+    missing_result = {
+      path: File.join(Dir.tmpdir, "missing-clash-patch-profile"),
+      rollback_bytes: "old",
+      patched_digest: Digest::SHA256.hexdigest("new")
+    }
+    refute ClashPatch.restore_profile_bytes(missing_result)
+    refute ClashPatch.runtime_health_healthy?(
+      ->(*_args) { raise IOError },
+      selections: {}, expected_tun: :enabled, connectivity_checker: -> { true }
+    )
+
+    ClashPatch.stub(:controller_socket, nil) do
+      ClashPatch.stub(:rollback_after_reload_failure, :reload_failed_restore_pending) do
+        result = ClashPatch.activate_updated_profile(missing_result)
+        assert_equal :reload_failed_restore_pending, result.fetch(:status)
+      end
+    end
+    ClashPatch.stub(:runtime_selections, ->(_requester) { raise IOError }) do
+      ClashPatch.stub(:rollback_after_reload_failure, :reload_failed_restore_pending) do
+        result = ClashPatch.activate_updated_profile(missing_result, requester: ->(*_args) { [200, "{}"] })
+        assert_equal :reload_failed_restore_pending, result.fetch(:status)
+      end
+    end
+    ClashPatch.stub(:controller_socket, "socket") do
+      ClashPatch.stub(:controller_request, [503, ""]) do
+        ClashPatch.stub(:rollback_after_reload_failure, :reload_failed_restore_pending) do
+          result = ClashPatch.activate_updated_profile(missing_result)
+          assert_equal :reload_failed_restore_pending, result.fetch(:status)
+        end
+      end
+    end
+    ClashPatch.stub(:restore_profile_bytes, true) do
+      status = ClashPatch.rollback_after_reload_failure(
+        missing_result, ->(*_args) { raise IOError }, missing_result.fetch(:path),
+        selections: {}, expected_tun: :enabled
+      )
+      assert_equal :reload_failed_restore_pending, status
+    end
+  end
+
+  def test_atomic_replace_restores_the_original_when_commit_verification_fails
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "profile.yaml")
+      File.binwrite(path, "original")
+      identities = [false, true]
+
+      File.open(path, "r+b") do |source|
+        result = ClashPatch.stub(:same_file_identity?, ->(*_args) { identities.shift }) do
+          ClashPatch.atomic_replace_locked(source, path, File.realpath(path), "original", "replacement")
+        end
+        refute result
+      end
+
+      assert_empty identities
+      assert_equal "original", File.binread(path)
+    end
+  end
+
+  def test_safe_update_detects_lock_time_and_post_swap_identity_changes
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old"))
+      File.write(path, original)
+      arguments = {
+        targets: [{ name: "friend", path: path, url: "https://subscriptions.invalid/friend" }],
+        policy: @policy,
+        backup_root: File.join(directory, "backups"),
+        usage_profile: 3,
+        fetcher: ->(_target) { YAML.dump(base_config.merge("subscription-marker" => "new")) },
+        validator: ->(_candidate) { true },
+        activation: ->(_items) { flunk "must not activate" }
+      }
+
+      lock_checks = [true, true, false]
+      result = ClashPatch.stub(:locked_profile_current?, ->(*_args) { lock_checks.shift }) do
+        ClashPatch.safe_update_all(**arguments)
+      end
+      assert_equal :concurrent_change, result.fetch(:reason)
+      assert_empty lock_checks
+      assert_equal original.b, File.binread(path)
+
+      File.binwrite(path, original)
+      identity_checks = [false, true]
+      result = ClashPatch.stub(:same_file_identity?, ->(*_args) { identity_checks.shift }) do
+        ClashPatch.safe_update_all(**arguments)
+      end
+      assert_equal :concurrent_change, result.fetch(:reason)
+      assert_empty identity_checks
+      assert_equal original.b, File.binread(path)
+    end
+  end
+
+  def test_storage_and_application_discovery_cover_local_and_icloud_variants
+    ClashPatch.stub(:storage_mode, :icloud) do
+      assert ClashPatch.icloud_enabled?
+    end
+
+    expected_user_app = File.expand_path("~/Applications/ClashX Meta.app")
+    Dir.stub(:exist?, ->(path) { path == expected_user_app }) do
+      assert_equal [expected_user_app], ClashPatch.clashx_app_paths
+    end
+
+    Dir.mktmpdir do |directory|
+      missing_app = File.join(directory, "Missing.app")
+      valid_app = File.join(directory, "Valid.app")
+      broken_app = File.join(directory, "Broken.app")
+      FileUtils.mkdir_p(File.join(valid_app, "Contents"))
+      FileUtils.mkdir_p(File.join(broken_app, "Contents"))
+      File.write(File.join(valid_app, "Contents", "Info.plist"), "fixture")
+      File.write(File.join(broken_app, "Contents", "Info.plist"), "fixture")
+      success = Struct.new(:success?).new(true)
+      runner = lambda do |*_args|
+        [JSON.generate("NSUbiquitousContainers" => { "iCloud.com.friend" => {} }), success]
+      end
+
+      ids = Open3.stub(:capture2, runner) do
+        ClashPatch.icloud_container_ids([missing_app, valid_app])
+      end
+      assert_includes ids, "iCloud.com.friend"
+
+      Open3.stub(:capture2, ->(*_args) { raise IOError, "injected plist failure" }) do
+        ids = ClashPatch.icloud_container_ids([broken_app])
+        assert_equal %w[iCloud.com.metacubex.ClashX iCloud.com.west2online.ClashX], ids
+      end
+    end
+
+    roots = ["/tmp/cloud", "/tmp/local/.config/clash.meta"]
+    ClashPatch.stub(:profile_paths, []) do
+      ClashPatch.stub(:icloud_enabled?, false) do
+        assert_equal roots.last, ClashPatch.active_profile_root(roots, "friend")
+      end
+    end
+  end
+
+  def test_result_contract_sanitizes_unknown_objects
+    object = Object.new
+    object.define_singleton_method(:to_s) { "token=fixture-secret" }
+
+    assert_equal "[已隐藏]", ClashPatchResult.sanitize(object)
+  end
+
   def test_cli_help_exposes_every_supported_operation_without_touching_profiles
     output, error = capture_io { assert_equal 0, ClashPatch.cli(["--help"]) }
 
@@ -2897,6 +3576,16 @@ class MacosPatcherTest < Minitest::Test
     ClashPatch.stub(:default_profile_directories, []) do
       _output, error = capture_io { assert_equal 2, ClashPatch.cli([]) }
       assert_includes error, "没有找到"
+    end
+
+    Dir.mktmpdir do |directory|
+      ClashPatch.stub(:run, []) do
+        _output, error = capture_io do
+          arguments = ["--profile-dir", directory, "--policy", POLICY_PATH]
+          assert_equal 1, ClashPatch.cli(arguments)
+        end
+        assert_includes error, "没有找到可处理的配置"
+      end
     end
   end
 
@@ -3014,6 +3703,135 @@ class MacosPatcherTest < Minitest::Test
         end
         assert_empty error
         assert_equal "auto_update_restore_failed", JSON.parse(output).fetch("code")
+      end
+    end
+  end
+
+  def test_cli_human_mode_covers_maintenance_success_and_failure_outputs
+    Dir.mktmpdir do |directory|
+      operations = [
+        [:disable_subscription_auto_update, ["--disable-subscription-auto-update"], { status: :disabled }],
+        [:enable_subscription_auto_update, ["--enable-subscription-auto-update"], { status: :enabled }],
+        [
+          :restore_owned_subscription_auto_update,
+          ["--backup-dir", directory, "--restore-owned-subscription-auto-update"],
+          { status: :restored }
+        ]
+      ]
+      operations.each do |method_name, arguments, result|
+        calls = 0
+        behavior = lambda do |*_arguments, **_keywords|
+          calls += 1
+          raise ClashPatch::InvalidConfigError, "injected maintenance failure" if calls == 2
+
+          result
+        end
+        ClashPatch.stub(method_name, behavior) do
+          output, error = capture_io { assert_equal 0, ClashPatch.cli(arguments.dup) }
+          assert_includes output, result.fetch(:status).to_s
+          assert_empty error
+
+          _output, error = capture_io { assert_equal 1, ClashPatch.cli(arguments.dup) }
+          assert_includes error, "injected maintenance failure"
+        end
+      end
+
+      ClashPatch.stub(:snapshot_initial_profiles, ["/private/friend.yaml.backup"]) do
+        output, error = capture_io do
+          assert_equal 0, ClashPatch.cli(["--profile-dir", directory, "--snapshot-initial"])
+        end
+        assert_includes output, "friend.yaml.backup"
+        assert_empty error
+      end
+    end
+  end
+
+  def test_cli_safe_update_covers_every_human_and_json_result_class
+    Dir.mktmpdir do |directory|
+      cases = [
+        [{ status: :updated, count: 2, profiles: %w[first second] }, 0, "已安全更新"],
+        [{ status: :rollback_failed }, 1, "未能恢复"],
+        [{ status: :runtime_restore_pending }, 1, "运行内核恢复失败"],
+        [{ status: :aborted }, 1, "保持原样"]
+      ]
+      cases.each do |result, expected_exit, expected_text|
+        ClashPatch.stub(:remote_subscription_targets, []) do
+          ClashPatch.stub(:selected_profile_name, "friend") do
+            ClashPatch.stub(:safe_update_all, result) do
+              output, error = capture_io do
+                assert_equal expected_exit, ClashPatch.cli([
+                  "--profile-dir", directory, "--safe-update-all", "--usage-profile", "3"
+                ])
+              end
+              assert_includes output + error, expected_text
+            end
+          end
+        end
+      end
+
+      json_cases = [
+        [{ status: :updated, count: 1, profiles: ["friend"] }, "safe_update_completed"],
+        [{ status: :rollback_failed }, "rollback_failed"],
+        [{ status: :aborted }, "safe_update_failed"]
+      ]
+      json_cases.each do |result, expected_code|
+        ClashPatch.stub(:remote_subscription_targets, []) do
+          ClashPatch.stub(:selected_profile_name, "friend") do
+            ClashPatch.stub(:safe_update_all, result) do
+              output, error = capture_io do
+                ClashPatch.cli([
+                  "--json", "--profile-dir", directory, "--safe-update-all", "--usage-profile", "3"
+                ])
+              end
+              assert_empty error
+              assert_equal expected_code, JSON.parse(output).fetch("code")
+            end
+          end
+        end
+      end
+    end
+  end
+
+  def test_cli_human_restore_and_top_level_errors_report_without_sensitive_values
+    Dir.mktmpdir do |directory|
+      [
+        :reload_failed_rolled_back,
+        :reload_failed_rollback_conflict,
+        :invalid_backup
+      ].each do |status|
+        ClashPatch.stub(:restore_backup, { status: status }) do
+          output, error = capture_io do
+            assert_equal 1, ClashPatch.cli(["--profile-dir", directory, "--restore-backup", "backup-id"])
+          end
+          assert_includes output, status.to_s
+          assert_empty error
+        end
+      end
+
+      missing_policy = File.join(directory, "missing-policy.json")
+      _output, error = capture_io do
+        assert_equal 1, ClashPatch.cli(["--profile-dir", directory, "--policy", missing_policy])
+      end
+      assert_includes error, "找不到所需文件"
+
+      invalid_policy = File.join(directory, "invalid-policy.json")
+      File.write(invalid_policy, "{")
+      _output, error = capture_io do
+        assert_equal 1, ClashPatch.cli(["--profile-dir", directory, "--policy", invalid_policy])
+      end
+      assert_includes error, "不是有效的 JSON"
+
+      [
+        [ClashPatch::InvalidConfigError.new("password=fixture-secret"), "Clash 补丁运行失败"],
+        [RuntimeError.new("token=fixture-secret"), "Clash 补丁运行失败"]
+      ].each do |exception, expected_text|
+        ClashPatch.stub(:run, ->(**_arguments) { raise exception }) do
+          _output, error = capture_io do
+            assert_equal 1, ClashPatch.cli(["--profile-dir", directory, "--policy", POLICY_PATH])
+          end
+          assert_includes error, expected_text
+          refute_includes error, "fixture-secret"
+        end
       end
     end
   end
@@ -3197,6 +4015,37 @@ class MacosPatcherTest < Minitest::Test
       assert results.any? { |result| result[:status] == :invalid }
       assert_equal original, File.read(first)
       assert results.any? { |result| result[:status] == :batch_aborted }
+    end
+  end
+
+  def test_normal_batch_restores_an_earlier_real_write_when_a_later_commit_fails
+    Dir.mktmpdir do |directory|
+      first = File.join(directory, "a-first.yaml")
+      second = File.join(directory, "z-second.yaml")
+      File.write(first, YAML.dump(base_config.merge("subscription-marker" => "first-original")))
+      File.write(second, YAML.dump(base_config.merge("subscription-marker" => "second-original")))
+      originals = [first, second].to_h { |path| [path, File.binread(path)] }
+      original_swap = ClashPatch.method(:atomic_swap_paths)
+      swaps = 0
+      fail_second_commit = lambda do |left, right|
+        swaps += 1
+        raise IOError, "injected second profile commit failure" if swaps == 2
+
+        original_swap.call(left, right)
+      end
+
+      results = ClashPatch.stub(:atomic_swap_paths, fail_second_commit) do
+        ClashPatch.run(
+          directory: directory, policy_path: POLICY_PATH,
+          backup_root: File.join(directory, "backups"),
+          validator: ->(_path) { true }, auto_reload: false, usage_profile: 3
+        )
+      end
+
+      assert_equal :batch_rolled_back, results.fetch(0).fetch(:status)
+      assert_equal :io_error, results.fetch(1).fetch(:status)
+      assert_operator swaps, :>=, 3
+      originals.each { |path, original| assert_equal original, File.binread(path), path }
     end
   end
 

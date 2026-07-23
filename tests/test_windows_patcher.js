@@ -4,6 +4,7 @@ const path = require('node:path');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { isDeepStrictEqual } = require('node:util');
+const vm = require('node:vm');
 
 const root = path.resolve(__dirname, '..');
 const enginePath = path.join(root, 'clash-patch/scripts/windows/clash_verge_global.js');
@@ -390,7 +391,23 @@ test('global transform verifies a second pass before returning a candidate', () 
 
   assert.match(source, /function clashPatchApply/);
   assert.match(source, /const secondPass = clashPatchApply\(clashPatchClone\(candidate\)/);
-  assert.match(source, /JSON\.stringify\(candidate\) !== JSON\.stringify\(secondPass\)/);
+  const sandbox = {};
+  vm.runInNewContext(
+    `${source}\n` +
+      'globalThis.clashPatchTestTransform = clashPatchTransform;\n' +
+      'globalThis.clashPatchTestSetApply = function (replacement) { clashPatchApply = replacement; };\n',
+    sandbox
+  );
+  let passes = 0;
+  sandbox.clashPatchTestSetApply((config) => {
+    passes += 1;
+    return { ...config, mutation: passes };
+  });
+  const original = { fixture: true };
+  const result = sandbox.clashPatchTestTransform(original, 'fixture', 3);
+
+  assert.equal(passes, 2);
+  assert.strictEqual(result, original);
 });
 
 test('new AI group lists US home broadband without auto selecting it', { skip: !available }, () => {
