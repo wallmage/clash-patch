@@ -665,6 +665,24 @@ test('PowerShell installer uses the documented global script and app settings', 
   assert.ok(preflight !== -1 && firstBackup !== -1 && preflight < firstBackup, 'all transformations must be prepared before files change');
 });
 
+test('PowerShell safe update checks installed script and proxy-group prerequisites before acceptance', () => {
+  const installer = fs.readFileSync(installerPath, 'utf8');
+  const scriptCheck = installer.indexOf(
+    'Assert-ClashPatchManagedScriptCurrent $scriptText $savedProfile $enginePath $targetScript'
+  );
+  const profileCheck = installer.indexOf(
+    'Assert-ClashPatchProxyGroupCollection $text ([string]$item.File)'
+  );
+  const mihomoCheck = installer.indexOf('Test-MihomoCandidate $core $text $profilesDirectory');
+  const manifestRemoval = installer.indexOf(
+    'Remove-VerifiedOwnedFile $safeUpdateStatePath $manifestSnapshot.Bytes $manifestSnapshot.Identity'
+  );
+  assert.ok(scriptCheck >= 0, 'safe update does not validate the installed global script');
+  assert.ok(profileCheck > scriptCheck, 'proxy-group prerequisites are not checked after the installed script');
+  assert.ok(mihomoCheck > profileCheck, 'Mihomo validation does not run after proxy-group checks');
+  assert.ok(manifestRemoval > mihomoCheck, 'safe-update manifest is removed before validation finishes');
+});
+
 test('PowerShell 5.1 keeps a single remote subscription path as an array', () => {
   const profilesModule = fs.readFileSync(path.join(installerModuleDir, 'profiles.ps1'), 'utf8');
 
@@ -1079,7 +1097,11 @@ test('Windows installer is split into side-effect-free modules with stable funct
       'Get-JavaScriptAnalysis', 'Rename-JavaScriptMain', 'Assert-JavaScriptReservedIdentifiers',
       'Assert-JavaScriptDoesNotBindMain', 'Assert-JavaScriptCanCompose', 'Build-GlobalScript'
     ],
-    'safe_update.ps1': ['Get-BackupTarget', 'Test-RestoreCandidate', 'Get-SafeUpdateRecoveryItems', 'Restore-SafeUpdateFiles']
+    'safe_update.ps1': [
+      'Get-BackupTarget', 'Get-ClashPatchManagedScriptBlock', 'Assert-ClashPatchManagedScriptCurrent',
+      'Test-ClashPatchFlowSequenceHasItem', 'Assert-ClashPatchProxyGroupCollection', 'Test-RestoreCandidate',
+      'Get-SafeUpdateRecoveryItems', 'Restore-SafeUpdateFiles'
+    ]
   };
 
   assert.doesNotMatch(entry, /^function\s+/m, 'entry point still contains library functions');

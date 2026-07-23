@@ -189,6 +189,42 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_safe_update_proxy_group_check_removal_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_windows.ps1",
+        "            Assert-ClashPatchProxyGroupCollection $text ([string]$item.File)\n",
+        ""
+      )
+
+      assert_mutation_is_killed(
+        root,
+        "node", "--test",
+        "--test-name-pattern=PowerShell safe update checks installed script and proxy-group prerequisites before acceptance",
+        "tests/test_windows_patcher.js"
+      )
+    end
+  end
+
+  def test_windows_safe_update_managed_script_check_removal_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_windows.ps1",
+        "        Assert-ClashPatchManagedScriptCurrent $scriptText $savedProfile $enginePath $targetScript\n",
+        ""
+      )
+
+      assert_mutation_is_killed(
+        root,
+        "node", "--test",
+        "--test-name-pattern=PowerShell safe update checks installed script and proxy-group prerequisites before acceptance",
+        "tests/test_windows_patcher.js"
+      )
+    end
+  end
+
   def test_partial_write_recovery_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

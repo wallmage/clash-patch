@@ -1606,6 +1606,10 @@ items:
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), $firstSafeOriginal)
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), $secondSafeOriginal)
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "L-local.yaml"), "local: true`n")
+    $safeUpdateInstall = Invoke-TestPowerShell $installer @(
+        "-AppHome", $safeUpdateCase, "-UsageProfile", "1", "-MihomoPath", $fakeCore
+    )
+    Assert-True ($safeUpdateInstall.ExitCode -eq 0) "safe update fixture install failed; $(Get-TestOutputDiagnostic $safeUpdateInstall.Output)"
     $remoteTargets = @(Get-RemoteSubscriptionTargets $profilesIndexInput $safeUpdateProfiles)
     Assert-True ($remoteTargets.Count -eq 2) "two distinct remote subscriptions were not mapped independently"
     Assert-True ((@($remoteTargets | ForEach-Object { $_.Path } | Sort-Object -Unique)).Count -eq 2) "distinct remote subscriptions were mapped to one file"
@@ -1628,10 +1632,55 @@ items:
     Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-second.yml") -Raw) -eq $secondSafeOriginal) "failed safe update did not restore second remote subscription"
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json"))) "completed rollback left a reusable stale safe-update manifest"
 
+    $noMainSnapshot = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
+    Assert-True ($noMainSnapshot.ExitCode -eq 0) "main-group failure snapshot failed; $(Get-TestOutputDiagnostic $noMainSnapshot.Output)"
+    $noMainUpdated = @'
+mode: rule
+proxies:
+  - name: Node
+    type: ss
+    server: proxy.invalid
+    port: 443
+    cipher: aes-128-gcm
+    password: fixture-secret
+proxy-groups: []
+rules:
+  - MATCH,DIRECT
+'@
+    [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), $noMainUpdated)
+    $noMainUpdatedMultiline = $noMainUpdated.Replace("proxy-groups: []", "proxy-groups: [ # empty flow list`n]")
+    [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), $noMainUpdatedMultiline)
+    $noMainVerify = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-VerifySafeUpdate", "-MihomoPath", $fakeCore)
+    Assert-True ($noMainVerify.ExitCode -eq 1) "safe update accepted subscriptions that the installed global script cannot patch"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-first.yaml") -Raw) -eq $firstSafeOriginal) "main-group validation failure did not restore first remote subscription"
+    Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-second.yml") -Raw) -eq $secondSafeOriginal) "main-group validation failure did not restore second remote subscription"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json"))) "completed main-group rollback left a stale safe-update manifest"
+
     $successSnapshot = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
-    Assert-True ($successSnapshot.ExitCode -eq 0) "second safe update snapshot failed; $(Get-TestOutputDiagnostic $successSnapshot.Output)"
-    $firstSafeUpdated = "mode: rule`nproxies: []`n"
-    $secondSafeUpdated = "mode: global`nproxy-groups: []`n"
+    Assert-True ($successSnapshot.ExitCode -eq 0) "successful safe update snapshot failed; $(Get-TestOutputDiagnostic $successSnapshot.Output)"
+    $firstSafeUpdated = @'
+mode: rule
+proxies:
+  - name: Node
+    type: ss
+    server: proxy.invalid
+    port: 443
+    cipher: aes-128-gcm
+    password: fixture-secret
+proxy-groups:
+  - name: Main
+    type: select
+    proxies:
+      - Node
+rules:
+  - MATCH,Main
+'@
+    $secondSafeUpdated = @'
+mode: global
+proxies: [{ name: "Hong Kong #1", type: ss, server: proxy.invalid, port: 443, cipher: aes-128-gcm, password: fixture-secret }]
+proxy-groups: [{ name: "Main #1", type: select, proxies: ["Hong Kong #1"] }]
+rules: ["MATCH,Main #1"]
+'@
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), $firstSafeUpdated)
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), $secondSafeUpdated)
     $successVerify = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-VerifySafeUpdate", "-MihomoPath", $fakeCore)
@@ -1643,8 +1692,8 @@ items:
     if ($onWindows) {
         $concurrentVerifySnapshot = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
         Assert-True ($concurrentVerifySnapshot.ExitCode -eq 0) "concurrent verification snapshot failed; $(Get-TestOutputDiagnostic $concurrentVerifySnapshot.Output)"
-        [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), "mode: rule`nproxies: []`n")
-        [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), "mode: rule`nproxy-groups: []`n")
+        [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), $firstSafeUpdated)
+        [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), $secondSafeUpdated)
         $env:CLASH_PATCH_MUTATE_TARGET = Join-Path $safeUpdateProfiles "R-first.yaml"
         try {
             $concurrentVerify = Invoke-TestPowerShell $installer @(

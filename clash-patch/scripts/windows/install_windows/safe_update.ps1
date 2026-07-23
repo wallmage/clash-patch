@@ -20,6 +20,107 @@
     return [pscustomobject]@{ BackupPath = $backupPath; TargetPath = $matches[0] }
 }
 
+function Get-ClashPatchManagedScriptBlock([string]$ScriptText, [int]$UsageProfile) {
+    $analysis = Get-JavaScriptAnalysis $ScriptText
+    $beginMarkers = @($analysis.Markers | Where-Object { $_.Kind -eq "begin" })
+    $endMarkers = @($analysis.Markers | Where-Object { $_.Kind -eq "end" })
+    if ($beginMarkers.Count -ne 1 -or $endMarkers.Count -ne 1 -or $endMarkers[0].Start -lt $beginMarkers[0].Start) {
+        throw "已安装的全局扩展脚本缺少唯一完整的 Clash Patch 区块。"
+    }
+    $managed = $ScriptText.Substring(
+        $beginMarkers[0].Start,
+        $endMarkers[0].End - $beginMarkers[0].Start
+    )
+    if (-not $managed.Contains("function clashPatchTransform") -or
+        -not $managed.Contains("function clashPatchDetectMain")) {
+        throw "已安装的全局扩展脚本缺少转换入口。"
+    }
+    $profileMatches = [regex]::Matches($managed, 'const\s+CLASH_PATCH_USAGE_PROFILE\s*=\s*([123])\s*;')
+    if ($profileMatches.Count -ne 1 -or [int]$profileMatches[0].Groups[1].Value -ne $UsageProfile) {
+        throw "已安装的全局扩展脚本与当前用途档位不一致。"
+    }
+    return $managed
+}
+
+function Assert-ClashPatchManagedScriptCurrent(
+    [string]$ScriptText,
+    [int]$UsageProfile,
+    [string]$EnginePath,
+    [string]$TargetPath
+) {
+    $managed = Get-ClashPatchManagedScriptBlock $ScriptText $UsageProfile
+    $expectedScript = Build-GlobalScript $EnginePath $TargetPath $UsageProfile $ScriptText
+    $expectedManaged = Get-ClashPatchManagedScriptBlock $expectedScript $UsageProfile
+    if ($managed -cne $expectedManaged) {
+        throw "已安装的全局扩展脚本与当前安装包不一致。"
+    }
+}
+
+function Test-ClashPatchFlowSequenceHasItem([string]$Text) {
+    $inside = $false
+    $comment = $false
+    foreach ($character in $Text.ToCharArray()) {
+        if ($comment) {
+            if ($character -eq "`r" -or $character -eq "`n") { $comment = $false }
+            continue
+        }
+        if (-not $inside) {
+            if ($character -eq "[") { $inside = $true }
+            continue
+        }
+        if ($character -eq "#") {
+            $comment = $true
+            continue
+        }
+        if ($character -eq "]") { return $false }
+        if (-not [char]::IsWhiteSpace($character) -and $character -ne ",") { return $true }
+    }
+    return $true
+}
+
+function Assert-ClashPatchProxyGroupCollection([string]$Text, [string]$Label) {
+    $lines = @(Split-YamlLines $Text)
+    $groupsNode = Find-YamlMappingNode $lines "proxy-groups" 0 0 $lines.Count
+    if ($null -eq $groupsNode) {
+        throw "$Label 缺少代理组，无法应用全局扩展脚本。"
+    }
+
+    $inline = ([string]$groupsNode.Value).Trim()
+    if ($inline -match '^\[') {
+        $flowLines = @([string]$groupsNode.Value)
+        if ($groupsNode.Start + 1 -lt $groupsNode.End) {
+            $flowLines += @($lines[($groupsNode.Start + 1)..($groupsNode.End - 1)])
+        }
+        if (-not (Test-ClashPatchFlowSequenceHasItem ($flowLines -join "`n"))) {
+            throw "$Label 的代理组为空，无法应用全局扩展脚本。"
+        }
+        return
+    }
+    if (-not [string]::IsNullOrWhiteSpace($inline) -and -not $inline.StartsWith("#")) {
+        throw "$Label 的代理组结构无法安全确认。"
+    }
+
+    $children = @()
+    for ($lineIndex = $groupsNode.Start + 1; $lineIndex -lt $groupsNode.End; $lineIndex++) {
+        $line = $lines[$lineIndex]
+        if ([string]::IsNullOrWhiteSpace($line) -or $line.TrimStart().StartsWith("#")) { continue }
+        $children += [pscustomobject]@{
+            Indent = Get-YamlIndent $line
+            Text = $line.TrimStart()
+        }
+    }
+    if ($children.Count -eq 0) {
+        throw "$Label 的代理组为空，无法应用全局扩展脚本。"
+    }
+    $itemIndent = ($children | Measure-Object -Property Indent -Minimum).Minimum
+    $items = @($children | Where-Object {
+        $_.Indent -eq $itemIndent -and ($_.Text -eq "-" -or $_.Text.StartsWith("- "))
+    })
+    if ($items.Count -eq 0) {
+        throw "$Label 的代理组结构无法安全确认。"
+    }
+}
+
 function Test-RestoreCandidate([string]$TargetPath, [byte[]]$Bytes) {
     $leaf = Split-Path -Leaf $TargetPath
     $extension = [System.IO.Path]::GetExtension($TargetPath).ToLowerInvariant()

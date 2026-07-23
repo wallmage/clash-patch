@@ -98,6 +98,7 @@ $autoUpdateStatePath = Join-Path $AppHome "clash-patch-auto-update-state.json"
 $usageStatePath = Join-Path $AppHome "clash-patch-usage-profile.json"
 $safeUpdateStatePath = Join-Path $AppHome "clash-patch-safe-update.json"
 $targetScript = Join-Path $profilesDirectory "Script.js"
+$enginePath = Join-Path (Join-Path $PSScriptRoot "windows") "clash_verge_global.js"
 
 $mutationLock = $null
 try {
@@ -173,6 +174,13 @@ if ($VerifySafeUpdate) {
         $indexText = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($indexSnapshot.Bytes)
         $currentTargets = @(Get-RemoteSubscriptionTargets $indexText $profilesDirectory)
         if ($currentTargets.Count -ne $recoveryItems.Count) { throw "远程订阅清单在更新期间发生变化。" }
+        $savedProfile = Get-SavedUsageProfile $usageStatePath
+        if ($savedProfile -notin @(1, 2, 3)) { throw "没有可用于安全更新验收的用途档位。" }
+        $scriptSnapshot = Get-OptionalFileSnapshot $targetScript "全局扩展脚本"
+        if (-not $scriptSnapshot.Exists) { throw "没有找到已安装的全局扩展脚本。" }
+        $strictUtf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        $scriptText = $strictUtf8.GetString($scriptSnapshot.Bytes)
+        Assert-ClashPatchManagedScriptCurrent $scriptText $savedProfile $enginePath $targetScript
         $core = Find-MihomoCore $MihomoPath
         foreach ($item in @($manifest.Profiles)) {
             $target = @($currentTargets | Where-Object { $_.Uid -eq [string]$item.Uid -and (Split-Path -Leaf $_.Path) -eq [string]$item.File })
@@ -181,6 +189,7 @@ if ($VerifySafeUpdate) {
             $validatedHash = Get-BytesSha256 $validatedBytes
             $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($validatedBytes)
             Test-GeneratedYaml $text ([string]$item.File) | Out-Null
+            Assert-ClashPatchProxyGroupCollection $text ([string]$item.File)
             Test-MihomoCandidate $core $text $profilesDirectory
             if ((Get-FileSha256 $target[0].Path) -ne $validatedHash) {
                 throw "订阅在验收期间再次发生变化。"
@@ -191,7 +200,6 @@ if ($VerifySafeUpdate) {
                 ValidatedSha256 = $validatedHash
             }
         }
-        $savedProfile = Get-SavedUsageProfile $usageStatePath
         if ($savedProfile -eq 3) { Assert-RemoteSubscriptionAutoUpdateDisabled $indexText | Out-Null }
         $versionGuards = @()
         try {
@@ -217,6 +225,16 @@ if ($VerifySafeUpdate) {
             if ((Get-BytesSha256 (Get-StreamBytes $indexGuard)) -ne (Get-BytesSha256 $indexSnapshot.Bytes)) {
                 throw "远程订阅清单在验收期间发生变化。"
             }
+            $scriptGuard = [System.IO.File]::Open(
+                $targetScript,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::Read
+            )
+            $versionGuards += $scriptGuard
+            if ((Get-BytesSha256 (Get-StreamBytes $scriptGuard)) -ne (Get-BytesSha256 $scriptSnapshot.Bytes)) {
+                throw "全局扩展脚本在验收期间发生变化。"
+            }
             Remove-VerifiedOwnedFile $safeUpdateStatePath $manifestSnapshot.Bytes $manifestSnapshot.Identity
         } finally {
             foreach ($guard in $versionGuards) { $guard.Dispose() }
@@ -234,8 +252,8 @@ if ($VerifySafeUpdate) {
         $changed = (Get-FileSha256 $entry.Target.Path) -ne [string]$entry.Manifest.BeforeSha256
         Write-Info ($(if ($changed) { "已更新并通过检查：" } else { "内容未变化并通过检查：" }) + $(if ([string]::IsNullOrWhiteSpace($entry.Target.Name)) { $entry.Target.Uid } else { $entry.Target.Name }))
     }
-    Write-Info "全部远程订阅已逐份通过 YAML 与 Mihomo 检查。"
-    Complete-InstallResult 0 "ok" "safe_update_verified" "全部远程订阅已逐份通过检查。" @() @("yaml", "mihomo", "auto_update")
+    Write-Info "全部远程订阅已逐份通过全局脚本、代理组、YAML 与 Mihomo 检查。"
+    Complete-InstallResult 0 "ok" "safe_update_verified" "全部远程订阅已逐份通过检查。" @() @("global_script", "yaml", "mihomo", "auto_update")
 }
 
 if ($ListBackups) {
@@ -313,8 +331,6 @@ if (-not [string]::IsNullOrWhiteSpace($RestoreBackup)) {
     }
     throw
 }
-$enginePath = Join-Path (Join-Path $PSScriptRoot "windows") "clash_verge_global.js"
-
 try {
     $savedUsageProfile = Get-SavedUsageProfile $usageStatePath
 } catch {
