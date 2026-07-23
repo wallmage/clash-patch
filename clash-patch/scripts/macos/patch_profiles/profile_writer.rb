@@ -167,11 +167,12 @@ module ClashPatch
     true
   end
 
-  def recover_profile_transaction(backup_root, roots:)
+  def recover_profile_transaction(backup_root, roots:, allow_concurrent_paths: [])
     path = profile_transaction_path(backup_root)
     return true unless File.exist?(path) || File.symlink?(path)
 
     snapshot = regular_file_snapshot_once(path, "配置事务记录")
+    allowed_concurrent_paths = allow_concurrent_paths.map { |item| File.expand_path(item) }.to_h { |item| [item, true] }
     text = snapshot.fetch(:bytes).dup.force_encoding(Encoding::UTF_8)
     raise InvalidConfigError, "配置事务记录无效" unless text.valid_encoding?
 
@@ -200,8 +201,11 @@ module ClashPatch
       current_digest = Digest::SHA256.hexdigest(current)
       original_digest = Digest::SHA256.hexdigest(original)
       next if current_digest == original_digest
-      raise InvalidConfigError, "配置事务目标包含新的并发修改" unless
-        current_digest == item.fetch("CandidateSha256")
+      unless current_digest == item.fetch("CandidateSha256")
+        next if allowed_concurrent_paths[File.expand_path(item.fetch("Path"))]
+
+        raise InvalidConfigError, "配置事务目标包含新的并发修改"
+      end
       restored = atomic_compare_and_swap_bytes(
         item.fetch("Path"), current, original, expected_path: item.fetch("WritePath")
       )
@@ -240,18 +244,29 @@ module ClashPatch
     regular_file_snapshot_once(path, "配置事务记录")
   end
 
-  def patch_path_once(path, policy, dry_run:, backup_root:, validator:, usage_profile: 3)
+  def patch_path_once(path, policy, dry_run:, backup_root:, validator:, usage_profile: 3,
+                      capture_transaction: false, expected_original: nil)
     write_path = File.realpath(path)
     outcome = nil
     File.open(write_path, dry_run ? "rb" : "r+b") do |source|
       lock_exclusive_with_timeout(source)
       original_bytes = source.read
+      if expected_original && original_bytes.b != expected_original.b
+        return base_result(nil, :concurrent_change).merge(path: path, transaction_commit: false)
+      end
       original_text = original_bytes.dup.force_encoding(Encoding::UTF_8)
       raise InvalidConfigError, "配置不是有效的 UTF-8" unless original_text.valid_encoding?
 
       config = load_yaml(original_text, path)
       result = patch(config, policy, usage_profile: usage_profile)
-      return result.merge(path: path) unless result[:changed]
+      unless result[:changed]
+        preview = result.merge(path: path)
+        if dry_run && capture_transaction
+          preview[:transaction_original] = original_bytes.b
+          preview[:transaction_candidate] = original_bytes.b
+        end
+        return preview
+      end
 
       patched_text = dump_config(result[:config])
       candidate_config = load_yaml(patched_text, path)
@@ -273,7 +288,14 @@ module ClashPatch
             return base_result(config, :validation_failed).merge(path: path)
           end
         end
-        return result.merge(path: path, dry_run: true) if dry_run
+        if dry_run
+          preview = result.merge(path: path, dry_run: true)
+          if capture_transaction
+            preview[:transaction_original] = original_bytes.b
+            preview[:transaction_candidate] = patched_text.b
+          end
+          return preview
+        end
 
         source.rewind
         if !locked_source_current?(source, path, write_path) || source.read != original_bytes
@@ -305,11 +327,14 @@ module ClashPatch
     outcome
   end
 
-  def patch_path(path, policy, dry_run: false, backup_root: nil, validator: nil, usage_profile: 3)
+  def patch_path(path, policy, dry_run: false, backup_root: nil, validator: nil, usage_profile: 3,
+                 capture_transaction: false, expected_original: nil)
     MAX_PATCH_ATTEMPTS.times do
       outcome = patch_path_once(
         path, policy, dry_run: dry_run, backup_root: backup_root,
-        validator: validator, usage_profile: usage_profile
+        validator: validator, usage_profile: usage_profile,
+        capture_transaction: capture_transaction,
+        expected_original: expected_original
       )
       return outcome unless outcome == :retry
     end
@@ -360,72 +385,102 @@ module ClashPatch
         end
       end
 
-      preflight = work_items.map do |item|
-        result = patch_path(
-          item.fetch(:path), policy, dry_run: true, backup_root: nil,
-          validator: validator, usage_profile: usage_profile
-        )
-        result[:active] = item.fetch(:active)
-        result
-      end
-      return preflight if dry_run
-
-      unless preflight.all? { |result| %i[updated unchanged].include?(result[:status]) }
-        return preflight.map do |result|
-          result[:status] == :updated ? result.merge(status: :batch_aborted, dry_run: false) : result
-        end
-      end
-
-      transaction = nil
-      if backup_root
-        transaction_items = work_items.zip(preflight).each_with_object([]) do |(item, preview), output|
-          next unless preview.fetch(:status) == :updated
-          output << {
-            path: item.fetch(:path),
-            original: File.binread(File.realpath(item.fetch(:path))),
-            candidate: dump_config(preview.fetch(:config)).b
-          }
-        end
-        transaction = prepare_profile_transaction(transaction_items, backup_root) unless transaction_items.empty?
-      end
-
-      results = []
-      work_items.sort_by { |item| item.fetch(:active) ? 1 : 0 }.each do |item|
-        path = item.fetch(:path)
-        result = patch_path(
-          path, policy, dry_run: dry_run, backup_root: backup_root,
-          validator: validator, usage_profile: usage_profile
-        )
-        result[:active] = item.fetch(:active)
-        if auto_reload && !dry_run && result[:active] && result[:status] == :updated
-          result = activate_updated_profile(
-            result,
-            socket: socket,
-            requester: requester,
-            connectivity_checker: connectivity_checker,
-            require_tun: usage_profile >= 2
+      results = nil
+      MAX_PATCH_ATTEMPTS.times do |batch_attempt|
+        preflight = work_items.map do |item|
+          result = patch_path(
+            item.fetch(:path), policy, dry_run: true, backup_root: nil,
+            validator: validator, usage_profile: usage_profile,
+            capture_transaction: !dry_run && !backup_root.nil?
           )
+          result[:active] = item.fetch(:active)
+          result
         end
-        results << result
-        next if %i[updated unchanged].include?(result[:status])
+        return preflight if dry_run
 
-        results.reverse_each do |prior|
-          next unless prior[:status] == :updated
-
-          prior[:status] = restore_profile_bytes(prior) ? :batch_rolled_back : :batch_rollback_failed
+        unless preflight.all? { |result| %i[updated unchanged].include?(result[:status]) }
+          return preflight.map do |result|
+            result[:status] == :updated ? result.merge(status: :batch_aborted, dry_run: false) : result
+          end
         end
-        break
+
+        transaction = nil
+        if backup_root
+          transaction_items = work_items.zip(preflight).each_with_object([]) do |(item, preview), output|
+            next unless preview.fetch(:status) == :updated
+            output << {
+              path: item.fetch(:path),
+              original: preview.fetch(:transaction_original),
+              candidate: preview.fetch(:transaction_candidate)
+            }
+          end
+          transaction = prepare_profile_transaction(transaction_items, backup_root) unless transaction_items.empty?
+        end
+
+        results = []
+        transaction_expectations = if backup_root
+                                     work_items.zip(preflight).to_h do |item, preview|
+                                       [
+                                         File.expand_path(item.fetch(:path)),
+                                         {
+                                           original: preview.fetch(:transaction_original)
+                                         }
+                                       ]
+                                     end
+                                   else
+                                     {}
+                                   end
+        work_items.sort_by { |item| item.fetch(:active) ? 1 : 0 }.each do |item|
+          path = item.fetch(:path)
+          expectation = transaction_expectations[File.expand_path(path)]
+          result = patch_path(
+            path, policy, dry_run: dry_run, backup_root: backup_root,
+            validator: validator, usage_profile: usage_profile,
+            expected_original: expectation&.fetch(:original)
+          )
+          result[:active] = item.fetch(:active)
+          if auto_reload && !dry_run && result[:active] && result[:status] == :updated
+            result = activate_updated_profile(
+              result,
+              socket: socket,
+              requester: requester,
+              connectivity_checker: connectivity_checker,
+              require_tun: usage_profile >= 2
+            )
+          end
+          results << result
+          next if %i[updated unchanged].include?(result[:status])
+
+          results.reverse_each do |prior|
+            next unless prior[:status] == :updated
+
+            prior[:status] = restore_profile_bytes(prior) ? :batch_rolled_back : :batch_rollback_failed
+          end
+          break
+        end
+
+        if transaction
+          if results.length == work_items.length &&
+             results.all? { |result| %i[updated unchanged].include?(result.fetch(:status)) }
+            remove_profile_transaction(transaction)
+          else
+            allowed_concurrent_paths = results.each_with_object([]) do |result, paths|
+              if result[:status] == :concurrent_change && result[:transaction_commit] == false
+                paths << result.fetch(:path)
+              end
+            end
+            recover_profile_transaction(
+              backup_root, roots: roots, allow_concurrent_paths: allowed_concurrent_paths
+            )
+          end
+        end
+
+        retryable = results.any? do |result|
+          result[:status] == :concurrent_change && result[:transaction_commit] == false
+        end
+        retryable &&= results.none? { |result| result[:status] == :batch_rollback_failed }
+        return results unless retryable && batch_attempt + 1 < MAX_PATCH_ATTEMPTS
       end
-
-      if transaction
-        if results.length == work_items.length &&
-           results.all? { |result| %i[updated unchanged].include?(result.fetch(:status)) }
-          remove_profile_transaction(transaction)
-        else
-          recover_profile_transaction(backup_root, roots: roots)
-        end
-      end
-      results
     ensure
       operation_lock&.close
     end

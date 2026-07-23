@@ -110,6 +110,131 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_normal_batch_replans_a_refresh_before_journal_and_recovers_a_later_commit_failure
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config.merge("subscription-marker" => "original"))
+      refreshed = YAML.dump(base_config.merge("subscription-marker" => "refreshed"))
+      backup_root = File.join(directory, "backups")
+      File.binwrite(path, original)
+
+      real_prepare = ClashPatch.method(:prepare_profile_transaction)
+      refresh_injected = false
+      prepare_after_refresh = lambda do |items, root|
+        unless refresh_injected
+          File.binwrite(path, refreshed)
+          refresh_injected = true
+        end
+        real_prepare.call(items, root)
+      end
+
+      real_replace = ClashPatch.method(:atomic_replace_locked)
+      commit_injected = false
+      fail_after_commit = lambda do |*arguments|
+        result = real_replace.call(*arguments)
+        if result && !commit_injected
+          commit_injected = true
+          raise IOError, "injected after the durable commit"
+        end
+        result
+      end
+
+      results = ClashPatch.stub(:prepare_profile_transaction, prepare_after_refresh) do
+        ClashPatch.stub(:atomic_replace_locked, fail_after_commit) do
+          ClashPatch.run(
+            directory: directory, policy_path: POLICY_PATH,
+            backup_root: backup_root, selected_name: "none",
+            validator: ->(_path) { true }, auto_reload: false, usage_profile: 1
+          )
+        end
+      end
+
+      assert refresh_injected
+      assert commit_injected
+      refute results.all? { |result| %i[updated unchanged].include?(result.fetch(:status)) }
+      assert_equal refreshed.b, File.binread(path)
+      refute File.exist?(ClashPatch.profile_transaction_path(backup_root))
+    end
+  end
+
+  def test_normal_batch_binds_unchanged_preflight_items_before_committing_other_profiles
+    Dir.mktmpdir do |directory|
+      unchanged_path = File.join(directory, "a-unchanged.yaml")
+      changed_path = File.join(directory, "z-changed.yaml")
+      unchanged = YAML.dump(ClashPatch.patch(base_config, @policy, usage_profile: 1).fetch(:config))
+      refreshed = YAML.dump(base_config.merge("subscription-marker" => "refreshed"))
+      changed_original = YAML.dump(base_config.merge("subscription-marker" => "unchanged-source"))
+      backup_root = File.join(directory, "backups")
+      File.binwrite(unchanged_path, unchanged)
+      File.binwrite(changed_path, changed_original)
+
+      real_prepare = ClashPatch.method(:prepare_profile_transaction)
+      prepare_after_refresh = lambda do |items, root|
+        File.binwrite(unchanged_path, refreshed)
+        real_prepare.call(items, root)
+      end
+      real_replace = ClashPatch.method(:atomic_replace_locked)
+      commit_injected = false
+      fail_after_commit = lambda do |*arguments|
+        result = real_replace.call(*arguments)
+        if result && !commit_injected
+          commit_injected = true
+          raise IOError, "injected after an unjournaled durable commit"
+        end
+        result
+      end
+
+      results = ClashPatch.stub(:prepare_profile_transaction, prepare_after_refresh) do
+        ClashPatch.stub(:atomic_replace_locked, fail_after_commit) do
+          ClashPatch.run(
+            directory: directory, policy_path: POLICY_PATH,
+            backup_root: backup_root, selected_name: "none",
+            validator: ->(_path) { true }, auto_reload: false, usage_profile: 1
+          )
+        end
+      end
+
+      assert commit_injected
+      refute results.all? { |result| %i[updated unchanged].include?(result.fetch(:status)) }
+      assert_equal refreshed.b, File.binread(unchanged_path)
+      assert_equal changed_original.b, File.binread(changed_path)
+      refute File.exist?(ClashPatch.profile_transaction_path(backup_root))
+    end
+  end
+
+  def test_normal_batch_stops_after_repeated_refreshes_and_preserves_the_latest_bytes
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "friend.yaml")
+      backup_root = File.join(directory, "backups")
+      File.binwrite(path, YAML.dump(base_config))
+      real_prepare = ClashPatch.method(:prepare_profile_transaction)
+      refreshes = 0
+      prepare_after_refresh = lambda do |items, root|
+        refreshes += 1
+        File.binwrite(
+          path,
+          YAML.dump(base_config.merge("subscription-marker" => "refresh-#{refreshes}"))
+        )
+        real_prepare.call(items, root)
+      end
+
+      results = ClashPatch.stub(:prepare_profile_transaction, prepare_after_refresh) do
+        ClashPatch.run(
+          directory: directory, policy_path: POLICY_PATH,
+          backup_root: backup_root, selected_name: "none",
+          validator: ->(_path) { true }, auto_reload: false, usage_profile: 1
+        )
+      end
+
+      assert_equal ClashPatch::MAX_PATCH_ATTEMPTS, refreshes
+      assert_equal :concurrent_change, results.fetch(0).fetch(:status)
+      written = ClashPatch.load_yaml(File.binread(path))
+      assert_equal "refresh-#{refreshes}", written.fetch("subscription-marker")
+      refute written.dig("rule-providers", "clash-patch-cn-domain")
+      refute File.exist?(ClashPatch.profile_transaction_path(backup_root))
+    end
+  end
+
   def test_production_probe_safe_update_restores_a_swap_when_bookkeeping_raises
     require_production_probe!
     Dir.mktmpdir do |directory|
@@ -4222,6 +4347,31 @@ class MacosPatcherTest < Minitest::Test
       assert_raises(ClashPatch::InvalidConfigError) do
         ClashPatch.recover_profile_transaction(root, roots: [directory])
       end
+    end
+
+    Dir.mktmpdir do |directory|
+      root = File.join(directory, "backups")
+      FileUtils.mkdir_p(root)
+      File.chmod(0o700, root)
+      profile = File.join(directory, "friend.yaml")
+      File.binwrite(profile, "external-refresh")
+      transaction = {
+        "Version" => 1,
+        "Items" => [{
+          "Path" => profile,
+          "WritePath" => File.realpath(profile),
+          "OriginalBase64" => Base64.strict_encode64("original"),
+          "CandidateSha256" => Digest::SHA256.hexdigest("candidate")
+        }]
+      }
+      transaction_path = File.join(root, ClashPatch::PROFILE_TRANSACTION_BASENAME)
+      File.binwrite(transaction_path, JSON.generate(transaction))
+
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.recover_profile_transaction(root, roots: [directory])
+      end
+      assert_equal "external-refresh", File.binread(profile)
+      assert File.exist?(transaction_path)
     end
   end
 
