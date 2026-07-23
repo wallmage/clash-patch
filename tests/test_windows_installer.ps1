@@ -377,6 +377,14 @@ function Test-PrivateWindowsFileAcl([string]$Path) {
     return $security.AreAccessRulesProtected -and $unsafeRules.Count -eq 0
 }
 
+function Get-WindowsShortPath([string]$Path) {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return "" }
+    $command = 'for %I in ("' + $Path.Replace('"', '""') + '") do @echo %~sI'
+    $output = @(& $env:ComSpec /d /c $command 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $output.Count -ne 1) { return "" }
+    return ([string]$output[0]).Trim()
+}
+
 function Assert-JsonResult([object]$Invocation, [string]$Command, [int]$ExitCode) {
     $text = $Invocation.Output.Trim()
     $diagnostic = Get-TestOutputDiagnostic $text
@@ -526,10 +534,13 @@ fs.writeFileSync(process.argv[4], JSON.stringify(output));
   "rules": ["MATCH,Main"]
 }
 '@
+            $realCoreIndex = 0
             foreach ($realMihomoPath in $RealMihomoPaths) {
+                $realCoreIndex++
                 Assert-True (Test-Path -LiteralPath $realMihomoPath -PathType Leaf) "real Mihomo path is missing"
                 Assert-True (Test-MihomoVersion $realMihomoPath) "real Mihomo version gate failed"
                 foreach ($realUsageProfile in @(1, 2, 3)) {
+                    try {
                     $realCase = Join-Path $sandbox (
                         "real-mihomo-" + $realUsageProfile + "-" + [Guid]::NewGuid().ToString("N")
                     )
@@ -581,7 +592,18 @@ fs.writeFileSync(process.argv[4], JSON.stringify(output));
                     Assert-True (
                         $realTransformedValidation.ExitCode -eq 0
                     ) "real Mihomo rejected the installed Script.js output"
+                    } catch {
+                        [void]$script:deferredProbeFailures.Add((
+                            "real Mihomo core #{0} profile {1}: {2}" -f
+                                $realCoreIndex,
+                                $realUsageProfile,
+                                $_.Exception.Message
+                        ))
+                    }
                 }
+            }
+            if ($script:deferredProbeFailures.Count -gt 0) {
+                throw ("deferred production probes failed:`n- " + ($script:deferredProbeFailures -join "`n- "))
             }
             Write-Host "Windows real Mihomo public-entry cases passed"
             return
@@ -738,6 +760,33 @@ fs.writeFileSync(process.argv[4], JSON.stringify(output));
                 $unsafeTransactionJournals.Count -eq 0
             ) "public entry accepted or changed malformed transaction journals: $($unsafeTransactionJournals -join ', ')"
         }
+
+        Invoke-DeferredProbe "new-file transaction journal empty original bytes" {
+            $newFileTransactionHome = Join-Path $sandbox "new-file-transaction-home"
+            $newFileTransactionTarget = Join-Path $newFileTransactionHome "created.txt"
+            New-Item -ItemType Directory -Path $newFileTransactionHome -Force | Out-Null
+            $newFileTransactionLock = Enter-AppHomeMutationLock $newFileTransactionHome
+            try {
+                Invoke-VerifiedFileTransaction @(
+                    [pscustomobject]@{
+                        Path = $newFileTransactionTarget
+                        Bytes = [System.Text.Encoding]::UTF8.GetBytes("created")
+                        Existed = $false
+                        OriginalBytes = $null
+                        OriginalIdentity = $null
+                    }
+                )
+            } finally {
+                Exit-AppHomeMutationLock $newFileTransactionLock
+            }
+            Assert-True (
+                (Test-Path -LiteralPath $newFileTransactionTarget -PathType Leaf) -and
+                (Get-Content -LiteralPath $newFileTransactionTarget -Raw) -ceq "created"
+            ) "new-file transaction could not journal an empty original byte sequence"
+            Assert-True (
+                -not (Test-Path -LiteralPath (Join-Path $newFileTransactionHome ".clash-patch-transaction.json"))
+            ) "new-file transaction left a stale journal"
+        }
     }
     if ($onWindows) {
         $hangingCoreText = "@echo off`r`nping 127.0.0.1 -n 6 >nul`r`nexit /b 0`r`n"
@@ -837,6 +886,30 @@ try {
                 Assert-True ($aliasInstallJson.code -eq "operation_in_progress") "extended-path alias bypassed the shared AppHome lock"
             }
 
+            Invoke-DeferredProbe "SUBST AppHome lock alias" {
+                $substDriveName = @("Z", "Y", "X", "W", "V", "U", "T") |
+                    Where-Object { -not (Test-Path -LiteralPath ("${_}:\")) } |
+                    Select-Object -First 1
+                Assert-True (-not [string]::IsNullOrWhiteSpace($substDriveName)) "no free drive letter was available for the SUBST alias fixture"
+                $substRoot = Split-Path -Parent $mutexCase
+                & (Join-Path $env:SystemRoot "System32\subst.exe") "${substDriveName}:" $substRoot
+                Assert-True ($LASTEXITCODE -eq 0) "SUBST alias fixture could not map its drive"
+                try {
+                    $substMutexCase = Join-Path "${substDriveName}:\" (Split-Path -Leaf $mutexCase)
+                    $substInstall = Invoke-TestPowerShell $installer @(
+                        "-AppHome", $substMutexCase,
+                        "-UsageProfile", "1",
+                        "-MihomoPath", $fakeCore,
+                        "-Json"
+                    )
+                    $substInstallJson = Assert-JsonResult $substInstall "install" 1
+                    Assert-True ($substInstallJson.code -eq "operation_in_progress") "SUBST alias bypassed the shared AppHome lock"
+                    Assert-True ((Get-TreeContentSnapshot $mutexCase) -ceq $mutexBefore) "rejected SUBST alias install changed AppHome"
+                } finally {
+                    & (Join-Path $env:SystemRoot "System32\subst.exe") "${substDriveName}:" /d
+                }
+            }
+
             $renamedMutexCase = Join-Path $sandbox "app-home-mutex-renamed"
             $renameBlocked = $false
             try { [System.IO.Directory]::Move($mutexCase, $renamedMutexCase) } catch { $renameBlocked = $true }
@@ -877,15 +950,17 @@ try {
             (Join-Path $releaseAppHome "profiles.yaml"),
             "items:`n- uid: R-release`n  type: remote`n  option:`n    allow_auto_update: true`n"
         )
-        $releaseInstallResult = Invoke-TestPowerShell $releaseInstaller @(
-            "-AppHome", $releaseAppHome,
-            "-UsageProfile", "1",
-            "-MihomoPath", $fakeCore,
-            "-Json"
-        )
-        $releaseInstallJson = Assert-JsonResult $releaseInstallResult "install" 0
-        Assert-True ($releaseInstallJson.code -eq "installed_common_baseline") "relocated release did not complete a real install"
-        Assert-True (Test-Path -LiteralPath (Join-Path $releaseProfiles "Script.js") -PathType Leaf) "relocated release omitted Script.js"
+        Invoke-DeferredProbe "release archive public install" {
+            $releaseInstallResult = Invoke-TestPowerShell $releaseInstaller @(
+                "-AppHome", $releaseAppHome,
+                "-UsageProfile", "1",
+                "-MihomoPath", $fakeCore,
+                "-Json"
+            )
+            $releaseInstallJson = Assert-JsonResult $releaseInstallResult "install" 0
+            Assert-True ($releaseInstallJson.code -eq "installed_common_baseline") "relocated release did not complete a real install"
+            Assert-True (Test-Path -LiteralPath (Join-Path $releaseProfiles "Script.js") -PathType Leaf) "relocated release omitted Script.js"
+        }
 
         $incompleteReleaseHome = Join-Path $sandbox "incomplete-release-home"
         New-Item -ItemType Directory -Path $incompleteReleaseHome -Force | Out-Null
@@ -1883,6 +1958,20 @@ Test-MihomoCandidate $CorePath "proxies:`n  - name: fixture-private-marker" $Dir
             $stableKeyExtendedAlias = Get-PathKey ("\\?\" + $stableKeyTarget)
             Assert-True ($stableKeyBeforeRename -eq $stableKeyCaseAlias) "backup identity changed across a case-only path alias"
             Assert-True ($stableKeyBeforeRename -eq $stableKeyExtendedAlias) "backup identity changed across an extended path alias"
+            Invoke-DeferredProbe "short-path backup identity alias" {
+                $stableKeyShortTarget = Get-WindowsShortPath $stableKeyTarget
+                if ([string]::IsNullOrWhiteSpace($stableKeyShortTarget) -or
+                    [string]::Equals(
+                        $stableKeyShortTarget,
+                        $stableKeyTarget,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )) {
+                    Write-Host "8.3 short-path aliases are unavailable on this runner; short-path identity case skipped"
+                    return
+                }
+                $stableKeyShortAlias = Get-PathKey $stableKeyShortTarget
+                Assert-True ($stableKeyBeforeRename -eq $stableKeyShortAlias) "backup identity changed across an 8.3 short-path alias"
+            }
         } finally {
             Exit-AppHomeMutationLock $stableKeyLock
         }
@@ -2377,6 +2466,107 @@ try {
         Assert-True ((Get-Content -LiteralPath (Join-Path $publicCrashHome "profiles.yaml") -Raw) -ceq $publicCrashProfilesIndex) "public-entry recovery changed original profiles.yaml"
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $publicCrashProfiles "Script.js"))) "public-entry recovery retained a partially installed Script.js"
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $publicCrashHome ".clash-patch-transaction.json"))) "public uninstaller left the recovered transaction journal"
+
+        $publicUninstallCrashHome = Join-Path $sandbox "public-uninstaller-crash-home"
+        $publicUninstallCrashProfiles = Join-Path $publicUninstallCrashHome "profiles"
+        $publicUninstallCrashReady = Join-Path $sandbox "public-uninstaller-crash.ready"
+        New-Item -ItemType Directory -Path $publicUninstallCrashProfiles -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $publicUninstallCrashHome "config.yaml"), $publicCrashConfig)
+        [System.IO.File]::WriteAllText((Join-Path $publicUninstallCrashHome "verge.yaml"), $publicCrashVerge)
+        [System.IO.File]::WriteAllText((Join-Path $publicUninstallCrashHome "profiles.yaml"), $publicCrashProfilesIndex)
+        $publicUninstallSetup = Invoke-TestPowerShell $publicCrashInstaller @(
+            "-AppHome", $publicUninstallCrashHome,
+            "-UsageProfile", "1",
+            "-MihomoPath", $fakeCore,
+            "-Json"
+        )
+        Assert-JsonResult $publicUninstallSetup "install" 0 | Out-Null
+        $publicUninstallTargets = @(
+            "config.yaml",
+            "verge.yaml",
+            "profiles.yaml",
+            "profiles\Script.js",
+            "clash-patch-install-state.json",
+            "clash-patch-usage-profile.json"
+        ) | ForEach-Object { Join-Path $publicUninstallCrashHome $_ }
+        $publicUninstallSnapshots = @{}
+        foreach ($publicUninstallTarget in $publicUninstallTargets) {
+            Assert-True (Test-Path -LiteralPath $publicUninstallTarget -PathType Leaf) "public uninstall crash fixture omitted an installed target"
+            $publicUninstallSnapshots[$publicUninstallTarget] = [Convert]::ToBase64String(
+                [System.IO.File]::ReadAllBytes($publicUninstallTarget)
+            )
+        }
+        $publicUninstallTransactionText = [System.IO.File]::ReadAllText($publicCrashTransaction)
+        $publicUninstallFunctionOffset = $publicUninstallTransactionText.IndexOf(
+            "function Set-VerifiedDeleteDisposition("
+        )
+        $publicUninstallDeleteNeedle = '    [ClashPatch.VerifiedDeleteNative]::SetDeleteDisposition($Stream.SafeFileHandle, $DeleteFile)'
+        $publicUninstallDeleteOffset = $publicUninstallTransactionText.IndexOf(
+            $publicUninstallDeleteNeedle,
+            $publicUninstallFunctionOffset
+        )
+        Assert-True ($publicUninstallFunctionOffset -ge 0 -and $publicUninstallDeleteOffset -ge 0) "public uninstall crash fixture could not find the durable delete boundary"
+        $publicUninstallDeleteEnd = $publicUninstallDeleteOffset + $publicUninstallDeleteNeedle.Length
+        $publicUninstallHook = @'
+
+    if ($DeleteFile -and
+        -not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_UNINSTALL_CRASH_READY) -and
+        -not (Test-Path -LiteralPath $env:CLASH_PATCH_TEST_UNINSTALL_CRASH_READY)) {
+        [System.IO.File]::WriteAllText($env:CLASH_PATCH_TEST_UNINSTALL_CRASH_READY, "ready")
+        Start-Sleep -Seconds 30
+    }
+'@
+        $publicUninstallTransactionText = $publicUninstallTransactionText.Insert(
+            $publicUninstallDeleteEnd,
+            $publicUninstallHook
+        )
+        [System.IO.File]::WriteAllText(
+            $publicCrashTransaction,
+            $publicUninstallTransactionText,
+            (New-Object System.Text.UTF8Encoding($true))
+        )
+        $env:CLASH_PATCH_TEST_UNINSTALL_CRASH_READY = $publicUninstallCrashReady
+        $publicUninstallCrashChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+            "-NoLogo", "-NoProfile", "-File", $publicCrashUninstaller,
+            "-AppHome", $publicUninstallCrashHome
+        ) -PassThru
+        try {
+            $publicUninstallCrashDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while (-not (Test-Path -LiteralPath $publicUninstallCrashReady -PathType Leaf) -and
+                -not $publicUninstallCrashChild.HasExited -and
+                [DateTime]::UtcNow -lt $publicUninstallCrashDeadline) {
+                Start-Sleep -Milliseconds 25
+            }
+            Assert-True (Test-Path -LiteralPath $publicUninstallCrashReady -PathType Leaf) "public uninstaller did not reach its first durable deletion"
+            Stop-Process -Id $publicUninstallCrashChild.Id -Force
+            $publicUninstallCrashChild.WaitForExit()
+        } finally {
+            $env:CLASH_PATCH_TEST_UNINSTALL_CRASH_READY = $null
+            if (-not $publicUninstallCrashChild.HasExited) {
+                Stop-Process -Id $publicUninstallCrashChild.Id -Force
+            }
+        }
+        Assert-True (Test-Path -LiteralPath (Join-Path $publicUninstallCrashHome ".clash-patch-transaction.json") -PathType Leaf) "public uninstaller crash did not leave a recoverable transaction journal"
+        $publicUninstallRecovery = Invoke-TestPowerShell $publicCrashInstaller @(
+            "-AppHome", $publicUninstallCrashHome,
+            "-ShowUsageProfile",
+            "-Json"
+        )
+        $publicUninstallRecoveryJson = Assert-JsonResult $publicUninstallRecovery "install" 0
+        Assert-True ([int]$publicUninstallRecoveryJson.profile -eq 1) "public installer did not recover the saved profile after an interrupted uninstall"
+        foreach ($publicUninstallTarget in $publicUninstallTargets) {
+            Assert-True (
+                (Test-Path -LiteralPath $publicUninstallTarget -PathType Leaf) -and
+                [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($publicUninstallTarget)) -ceq
+                    $publicUninstallSnapshots[$publicUninstallTarget]
+            ) "public installer did not restore an interrupted uninstall target"
+        }
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $publicUninstallCrashHome ".clash-patch-transaction.json"))) "public installer left the recovered uninstall journal"
+        $publicUninstallCompletion = Invoke-TestPowerShell $publicCrashUninstaller @(
+            "-AppHome", $publicUninstallCrashHome,
+            "-Json"
+        )
+        Assert-JsonResult $publicUninstallCompletion "uninstall" 0 | Out-Null
 
         Invoke-DeferredProbe "public restore strong-kill atomicity" {
             $publicRestorePackageParent = Join-Path $sandbox "public-restore-crash-package"

@@ -1184,7 +1184,7 @@ class SkillContractTest < Minitest::Test
     assert_includes source, "Set-Variable"
     assert_includes source, "Invoke-DeferredProbe"
     assert_match(
-      /if \(\$script:deferredProbeFailures\.Count -gt 0\) \{\s*throw \("deferred production probes failed:/,
+      /^    if \(\$script:deferredProbeFailures\.Count -gt 0\) \{\n        throw \("deferred production probes failed:/,
       source
     )
     assert_includes source, "Compress-Archive"
@@ -1228,14 +1228,18 @@ class SkillContractTest < Minitest::Test
     expected_windows = [
       "Mihomo candidate privacy and cleanup after caller death",
       "Mihomo timeout terminates descendants",
+      "SUBST AppHome lock alias",
       "duplicate transaction action field",
       "extended-path AppHome lock alias",
       "installer and uninstaller shared AppHome lock",
       "interrupted transaction same-byte identity replacement",
+      "new-file transaction journal empty original bytes",
       "non-proxy route termini",
       "private transaction journal ACL",
       "public restore strong-kill atomicity",
       "public restore same-byte identity replacement",
+      "release archive public install",
+      "short-path backup identity alias",
       "strict transaction journal byte schema",
       "strict UTF-8 safe-update validation",
       "strict safe-update manifest schema"
@@ -1254,6 +1258,11 @@ class SkillContractTest < Minitest::Test
       trailing-dot
       trailing-space
     ].sort
+    expected_public_kill_markers = %w[
+      CLASH_PATCH_TEST_PUBLIC_CRASH_READY
+      CLASH_PATCH_TEST_RESTORE_CRASH_READY
+      CLASH_PATCH_TEST_UNINSTALL_CRASH_READY
+    ].sort
 
     assert_equal expected_macos,
                  patcher_source.scan(/^  def (test_production_probe_[a-z0-9_]+)/).flatten.sort
@@ -1267,6 +1276,13 @@ class SkillContractTest < Minitest::Test
     refute_nil journal_matrix
     assert_equal expected_transaction_journal_cases,
                  journal_matrix.scan(/Name = "([^"]+)"/).flatten.sort
+    assert_equal expected_public_kill_markers,
+                 windows_source.scan(/\$env:(CLASH_PATCH_TEST_[A-Z_]+CRASH_READY)/).flatten.uniq.sort
+    armed_public_kill_markers = windows_source.scan(
+      /\$env:(CLASH_PATCH_TEST_[A-Z_]+CRASH_READY)\s*=\s*\$([A-Za-z][A-Za-z0-9]*)/
+    ).reject { |_, value| value == "null" }.map(&:first).uniq.sort
+    assert_equal expected_public_kill_markers, armed_public_kill_markers
+    assert_includes windows_source, '"real Mihomo core #{0} profile {1}: {2}"'
     assert_includes workflow, "/usr/bin/ruby tests/test_macos_patcher.rb --name /production_probe/"
     assert_includes workflow, "/usr/bin/ruby tests/test_macos_wrappers.rb --name /production_probe/"
     assert_match(

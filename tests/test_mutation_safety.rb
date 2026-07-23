@@ -393,8 +393,10 @@ class MutationSafetyTest < Minitest::Test
       replace_once(
         root,
         "tests/test_windows_installer.ps1",
-        '        throw ("deferred production probes failed:',
-        '        Write-Host ("deferred production probes failed:'
+        '    if ($script:deferredProbeFailures.Count -gt 0) {' + "\n" +
+          '        throw ("deferred production probes failed:',
+        '    if ($script:deferredProbeFailures.Count -gt 0) {' + "\n" +
+          '        Write-Host ("deferred production probes failed:'
       )
 
       assert_mutation_is_killed(
@@ -480,6 +482,23 @@ class MutationSafetyTest < Minitest::Test
         "tests/test_windows_installer.ps1",
         '                    Name = "alternate-data-stream"',
         '                    Name = "alternate-stream-removed"'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_production_probe_inventory_and_ci_aggregation_are_fixed"
+      )
+    end
+  end
+
+  def test_windows_public_uninstall_kill_probe_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "tests/test_windows_installer.ps1",
+        '        $env:CLASH_PATCH_TEST_UNINSTALL_CRASH_READY = $publicUninstallCrashReady',
+        '        $env:CLASH_PATCH_TEST_UNINSTALL_PROBE_REMOVED = $publicUninstallCrashReady'
       )
 
       assert_mutation_is_killed(
