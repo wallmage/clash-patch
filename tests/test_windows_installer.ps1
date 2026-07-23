@@ -330,7 +330,7 @@ function Get-TreeContentSnapshot([string]$Path) {
         } else {
             "F:${relative}:" + [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($_.FullName))
         }
-    })) -join "`n")
+    })) -join "`n"
 }
 
 function Assert-JsonResult([object]$Invocation, [string]$Command, [int]$ExitCode) {

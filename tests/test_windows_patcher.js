@@ -28,6 +28,104 @@ const available = fs.existsSync(enginePath) && fs.existsSync(policyPath);
 const fixturesAvailable = available && fs.existsSync(fixturePath);
 const engine = available ? require(enginePath) : null;
 
+function assertBalancedPowerShellDelimiters(source, displayName) {
+  const opening = new Map([['(', ')'], ['[', ']'], ['{', '}']]);
+  const closing = new Set(opening.values());
+  const stack = [];
+  let state = 'code';
+  let line = 1;
+  let lineStart = 0;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    const next = source[index + 1] || '';
+    if (character === '\n') {
+      line += 1;
+      lineStart = index + 1;
+      if (state === 'line-comment') state = 'code';
+      continue;
+    }
+    if (state === 'line-comment') continue;
+    if (state === 'block-comment') {
+      if (character === '#' && next === '>') {
+        state = 'code';
+        index += 1;
+      }
+      continue;
+    }
+    if (state === 'single-quoted') {
+      if (character === "'" && next === "'") {
+        index += 1;
+      } else if (character === "'") {
+        state = 'code';
+      }
+      continue;
+    }
+    if (state === 'double-quoted') {
+      if (character === '`') {
+        index += 1;
+      } else if (character === '"') {
+        state = 'code';
+      }
+      continue;
+    }
+    if (state === 'single-here' || state === 'double-here') {
+      if (index === lineStart) {
+        const lineEnd = source.indexOf('\n', index);
+        const currentLine = source.slice(index, lineEnd === -1 ? source.length : lineEnd);
+        const terminator = state === 'single-here' ? "'@" : '"@';
+        if (currentLine.trimStart().startsWith(terminator)) {
+          state = 'code';
+          index += currentLine.indexOf(terminator) + 1;
+        }
+      }
+      continue;
+    }
+
+    if (character === '#') {
+      state = 'line-comment';
+      continue;
+    }
+    if (character === '<' && next === '#') {
+      state = 'block-comment';
+      index += 1;
+      continue;
+    }
+    if (character === '@' && (next === "'" || next === '"')) {
+      const lineEnd = source.indexOf('\n', index);
+      const remainder = source.slice(index + 2, lineEnd === -1 ? source.length : lineEnd);
+      if (remainder.trim() === '') {
+        state = next === "'" ? 'single-here' : 'double-here';
+        index += 1;
+        continue;
+      }
+    }
+    if (character === "'") {
+      state = 'single-quoted';
+      continue;
+    }
+    if (character === '"') {
+      state = 'double-quoted';
+      continue;
+    }
+    if (character === '`') {
+      index += 1;
+      continue;
+    }
+    if (opening.has(character)) {
+      stack.push({ character, line });
+      continue;
+    }
+    if (closing.has(character)) {
+      const expected = stack.length > 0 ? opening.get(stack[stack.length - 1].character) : null;
+      assert.equal(character, expected, `${displayName}:${line}: unexpected ${character}`);
+      stack.pop();
+    }
+  }
+  assert.equal(state, 'code', `${displayName}:${line}: unterminated ${state}`);
+  assert.equal(stack.length, 0, `${displayName}:${stack.at(-1)?.line || line}: unclosed ${stack.at(-1)?.character || 'delimiter'}`);
+}
+
 test('Windows engine files exist', () => {
   assert.equal(fs.existsSync(enginePath), true, 'Windows enhancement script is missing');
   assert.equal(fs.existsSync(policyPath), true, 'canonical policy is missing');
@@ -1002,6 +1100,31 @@ test('all shipped and test PowerShell scripts are strict UTF-8 with a BOM', () =
     const bytes = fs.readFileSync(entry);
     assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf], entry);
     assert.doesNotThrow(() => decoder.decode(bytes), entry);
+  }
+});
+
+test('PowerShell files have balanced syntax delimiters before Windows CI', () => {
+  assert.doesNotThrow(() => assertBalancedPowerShellDelimiters(
+    "function Test-Example {`n  @(')', ']') | ForEach-Object { $_ }`n}`n",
+    'balanced-fixture'
+  ));
+  assert.throws(() => assertBalancedPowerShellDelimiters(
+    'function Test-Broken { return (@(1, 2)) -join "`n") }',
+    'broken-fixture'
+  ));
+
+  const pending = [path.join(root, 'clash-patch/scripts')];
+  const powershellFiles = [path.join(root, 'tests/test_windows_installer.ps1')];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(entryPath);
+      if (entry.isFile() && entry.name.endsWith('.ps1')) powershellFiles.push(entryPath);
+    }
+  }
+  for (const entry of powershellFiles) {
+    assertBalancedPowerShellDelimiters(fs.readFileSync(entry, 'utf8'), path.relative(root, entry));
   }
 });
 
