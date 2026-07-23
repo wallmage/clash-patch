@@ -459,6 +459,7 @@ try {
 
         $mutexCase = Join-Path $sandbox "app-home-mutex-case"
         $mutexReadyPath = Join-Path $sandbox "app-home-mutex.ready"
+        $mutexReleasePath = Join-Path $sandbox "app-home-mutex.release"
         $mutexHolderPath = Join-Path $sandbox "app-home-mutex-holder.ps1"
         New-Item -ItemType Directory -Path $mutexCase -Force | Out-Null
         [System.IO.File]::WriteAllText(
@@ -469,13 +470,18 @@ try {
 param(
     [string]$ModulePath,
     [string]$AppHome,
-    [string]$ReadyPath
+    [string]$ReadyPath,
+    [string]$ReleasePath
 )
 . $ModulePath
 $held = Enter-AppHomeMutationLock $AppHome
 try {
     [System.IO.File]::WriteAllText($ReadyPath, "ready")
-    Start-Sleep -Seconds 10
+    $deadline = [DateTime]::UtcNow.AddSeconds(60)
+    while (-not (Test-Path -LiteralPath $ReleasePath -PathType Leaf) -and
+        [DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Milliseconds 25
+    }
 } finally {
     Exit-AppHomeMutationLock $held
 }
@@ -485,7 +491,8 @@ try {
             "-NoLogo", "-NoProfile", "-File", $mutexHolderPath,
             "-ModulePath", (Join-Path $installerModuleRoot "transaction.ps1"),
             "-AppHome", $mutexCase,
-            "-ReadyPath", $mutexReadyPath
+            "-ReadyPath", $mutexReadyPath,
+            "-ReleasePath", $mutexReleasePath
         ) -PassThru
         try {
             $mutexDeadline = [DateTime]::UtcNow.AddSeconds(5)
@@ -528,7 +535,10 @@ try {
             Assert-True ($mutexUninstallJson.code -eq "operation_in_progress") "parallel uninstall did not share the installer AppHome lock"
             Assert-True ((Get-TreeContentSnapshot $mutexCase) -ceq $mutexBefore) "rejected parallel uninstall changed AppHome"
         } finally {
-            if (-not $mutexHolder.HasExited) { Stop-Process -Id $mutexHolder.Id -Force }
+            [System.IO.File]::WriteAllText($mutexReleasePath, "release")
+            if (-not $mutexHolder.WaitForExit(5000)) {
+                Stop-Process -Id $mutexHolder.Id -Force
+            }
         }
     }
     [System.IO.File]::WriteAllText($hangingCore, $hangingCoreText, [System.Text.Encoding]::ASCII)
