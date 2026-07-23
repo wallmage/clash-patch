@@ -781,9 +781,6 @@ function Get-InterruptedTransactionRecoveryPlan([object[]]$Actions) {
                 $plan += [pscustomobject]@{ Operation = "write"; Action = $action; Snapshot = $snapshot }
             }
         } elseif ($action.Action -eq "write") {
-            if ($snapshot.Exists -and $currentHash -ne $replacementHash) {
-                throw "中断事务新建目标有无法自动合并的新改动：$($action.Path)"
-            }
             if ($snapshot.Exists) {
                 $plan += [pscustomobject]@{ Operation = "delete"; Action = $action; Snapshot = $snapshot }
             }

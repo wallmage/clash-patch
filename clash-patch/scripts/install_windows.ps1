@@ -145,10 +145,14 @@ if ($VerifySafeUpdate) {
     $manifestText = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($manifestSnapshot.Bytes)
     $manifest = $manifestText | ConvertFrom-Json
     $manifestProperties = @($manifest.PSObject.Properties.Name | Sort-Object)
+    $createdAtIsJsonString = [regex]::Matches(
+        $manifestText,
+        '(?i)"CreatedAt"\s*:\s*"(?:[^"\\]|\\.)*"'
+    ).Count -eq 1
     if (($manifestProperties -join ",") -cne "CreatedAt,Profiles,Version" -or
         -not ($manifest.Version -is [int] -or $manifest.Version -is [long]) -or
         [long]$manifest.Version -ne 1 -or
-        -not ($manifest.CreatedAt -is [string]) -or
+        -not $createdAtIsJsonString -or
         @($manifest.Profiles).Count -eq 0) {
         throw "安全更新准备记录无效。"
     }
