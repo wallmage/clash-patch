@@ -233,6 +233,26 @@ class SkillContractTest < Minitest::Test
     end
   end
 
+  def test_adguard_certificate_failures_preserve_the_global_tun_compatibility_path
+    readme = File.read(File.join(ROOT, "README.md"))
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+
+    [readme, skill, policy, design].each do |document|
+      assert_includes document, "禁止按应用调整 AdGuard 过滤范围"
+      assert_includes document, "Clash TUN 存在时不得把 AdGuard 改为 `Network Extension`"
+      assert_includes document, "系统代理所有权"
+      assert_includes document, "PAC 查询中断"
+    end
+
+    [skill, policy, design].each do |document|
+      assert_includes document, "`ProxyConfigHelper`"
+      refute_includes document, "排除出错的非浏览器应用"
+      refute_includes document, "调整应用过滤范围"
+    end
+  end
+
   def test_saved_profile_bounds_diagnostics_repairs_and_regression_checks
     readme = File.read(File.join(ROOT, "README.md"))
     skill = File.read(File.join(SKILL, "SKILL.md"))

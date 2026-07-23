@@ -27,7 +27,7 @@ function Get-PathKey([string]$Path) {
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($absolute)
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        return (($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString("x2") }) -join '').Substring(0, 16)
+        return (($sha.ComputeHash($bytes, 0, $bytes.Length) | ForEach-Object { $_.ToString("x2") }) -join '').Substring(0, 16)
     } finally {
         $sha.Dispose()
     }
@@ -113,7 +113,7 @@ function Write-Utf8Atomic([string]$Path, [string]$Content) {
 function Get-BytesSha256([byte[]]$Bytes) {
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
+        return ([System.BitConverter]::ToString($sha.ComputeHash($Bytes, 0, $Bytes.Length))).Replace("-", "").ToLowerInvariant()
     } finally {
         $sha.Dispose()
     }
