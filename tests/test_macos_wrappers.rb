@@ -209,6 +209,155 @@ class MacosWrapperTest < Minitest::Test
     end
   end
 
+  def test_uninstaller_resumes_after_kill_during_file_restore
+    patcher = <<~'RUBY'
+      backup_dir = ARGV[ARGV.index("--backup-dir") + 1] if ARGV.include?("--backup-dir")
+      ownership = File.join(backup_dir, "clashx-meta-kAutoUpdateEnable.state.json") if backup_dir
+      if ARGV.include?("--restore-owned-subscription-auto-update")
+        exit 1
+      end
+      if ARGV.include?("--disable-subscription-auto-update")
+        File.write(ownership, "{}") unless File.exist?(ownership)
+        puts "disabled"
+        exit 0
+      end
+      exit 1
+    RUBY
+    with_uninstaller_package(patcher_source: patcher) do |uninstaller|
+      Dir.mktmpdir do |home|
+        install_dir = File.join(home, "Library", "Application Support", "ClashPatch")
+        backup_dir = File.join(install_dir, "backups")
+        FileUtils.mkdir_p(backup_dir)
+        installed_patcher = File.join(install_dir, "patch_profiles.rb")
+        state = File.join(home, "usage-profile.plist")
+        ownership = File.join(backup_dir, "clashx-meta-kAutoUpdateEnable.state.json")
+        original = ("owned-patcher-" * 65_536).b
+        File.binwrite(installed_patcher, original)
+        File.binwrite(state, "owned-state")
+        File.binwrite(ownership, "{}")
+        ready = File.join(home, "restore-ready")
+        source = File.binread(uninstaller)
+        old_restore = '  /bin/cp -p "$slot" "$destination"' + "\n"
+        atomic_restore =
+          "  if /bin/ln \"$slot\" \"$destination\"; then\n" \
+          "    return 0\n" \
+          "  fi\n"
+        direct_copy_restore = false
+        if source.include?(old_restore)
+          direct_copy_restore = true
+          injected = <<~'SH'
+            /usr/bin/ruby -e '
+              source, destination, ready = ARGV
+              bytes = File.binread(source)
+              File.open(destination, "wb") do |file|
+                file.write(bytes.byteslice(0, bytes.bytesize / 2))
+                file.flush
+                file.fsync
+                File.write(ready, "ready")
+                sleep 30
+              end
+            ' "$slot" "$destination" "$CLASH_PATCH_TEST_RESTORE_READY"
+          SH
+          source = source.sub(old_restore, injected)
+        elsif source.include?(atomic_restore)
+          instrumented = atomic_restore.sub(
+            "    return 0\n",
+            "    /usr/bin/touch \"$CLASH_PATCH_TEST_RESTORE_READY\"\n" \
+            "    while :; do /bin/sleep 1; done\n"
+          )
+          source = source.sub(atomic_restore, instrumented)
+        else
+          flunk "uninstaller restore publication is not recognized"
+        end
+        File.binwrite(uninstaller, source)
+        env = {
+          "HOME" => home,
+          "CLASH_PATCH_USAGE_STATE_PATH" => state,
+          "CLASH_PATCH_USAGE_PROFILE" => nil,
+          "CLASH_PATCH_PROFILE_DIR" => nil,
+          "CLASH_PATCH_TEST_RESTORE_READY" => ready
+        }
+        process_thread = nil
+        readers = []
+        begin
+          Open3.popen3(env, "/bin/sh", uninstaller, "--json", pgroup: true) do |stdin, out, error, thread|
+            process_thread = thread
+            stdin.close
+            readers << Thread.new { out.read rescue nil }
+            readers << Thread.new { error.read rescue nil }
+            deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+            until File.exist?(ready)
+              raise "uninstaller never reached restore publication" if
+                Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+              sleep 0.01
+            end
+            Process.kill("KILL", -thread.pid)
+            raise "uninstaller did not stop after restore kill" unless thread.join(10)
+          end
+        ensure
+          Process.kill("KILL", -process_thread.pid) rescue nil
+          process_thread&.join
+          readers.each(&:join)
+        end
+
+        if direct_copy_restore
+          refute_equal original, File.binread(installed_patcher),
+                       "fault injection must interrupt the old direct-copy restore"
+        else
+          assert File.binread(installed_patcher) == original
+        end
+        recovery_entry = "restore_uncommitted_uninstall\n\nremove_owned_agent"
+        resume_source = File.binread(UNINSTALLER)
+        assert_equal 1, resume_source.scan(recovery_entry).length
+        File.binwrite(
+          uninstaller,
+          resume_source.sub(
+            recovery_entry,
+            "restore_uncommitted_uninstall\nexit 99\n\nremove_owned_agent"
+          )
+        )
+        _stdout, _stderr, status, = run_script(uninstaller, home: home)
+
+        assert_equal 99, status.exitstatus
+        assert File.binread(installed_patcher) == original,
+               "interrupted uninstall did not restore the original patcher bytes"
+        assert_equal "owned-state", File.binread(state)
+      end
+    end
+  end
+
+  def test_uninstaller_discards_a_stage_killed_before_ready
+    with_uninstaller_package(patcher_source: "exit 1\n") do |uninstaller|
+      Dir.mktmpdir do |home|
+        install_dir = File.join(home, "Library", "Application Support", "ClashPatch")
+        staging = File.join(install_dir, ".clash-patch-uninstall-staging")
+        installed_patcher = File.join(install_dir, "patch_profiles.rb")
+        original = "owned-patcher".b
+        FileUtils.mkdir_p(staging)
+        File.binwrite(installed_patcher, original)
+        File.binwrite(File.join(staging, "patcher"), "partial")
+        File.binwrite(File.join(staging, "patcher.meta"), "present:incomplete\n")
+
+        recovery_entry = "restore_uncommitted_uninstall\n\nremove_owned_agent"
+        source = File.binread(uninstaller)
+        assert_equal 1, source.scan(recovery_entry).length
+        File.binwrite(
+          uninstaller,
+          source.sub(
+            recovery_entry,
+            "restore_uncommitted_uninstall\nexit 99\n\nremove_owned_agent"
+          )
+        )
+
+        _stdout, _stderr, status, = run_script(uninstaller, home: home)
+
+        assert_equal 99, status.exitstatus
+        refute File.exist?(staging)
+        assert File.binread(installed_patcher) == original
+      end
+    end
+  end
+
   def test_installer_json_mode_returns_one_contract_object_for_help_and_errors
     Dir.mktmpdir do |home|
       stdout, stderr, status = run_script(INSTALLER, "--help", "--json", home: home)

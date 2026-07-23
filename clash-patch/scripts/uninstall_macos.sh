@@ -124,6 +124,10 @@ restore_uncommitted_uninstall() {
     /bin/rm -rf "$UNINSTALL_STAGING"
     return 0
   fi
+  if [ ! -f "$UNINSTALL_STAGING/READY" ]; then
+    /bin/rm -rf "$UNINSTALL_STAGING"
+    return 0
+  fi
   if [ -f "$UNINSTALL_STAGING/AUTO_UPDATE_WAS_OWNED" ]; then
     [ -f "$PATCHER_SOURCE" ] ||
       finish 6 failed incomplete_package "安装包不完整，无法恢复未完成的安全卸载。"
@@ -157,7 +161,15 @@ restore_slot() {
     return 0
   fi
   /bin/mkdir -p "$(/usr/bin/dirname "$destination")"
-  /bin/cp -p "$slot" "$destination"
+  if /bin/ln "$slot" "$destination"; then
+    return 0
+  fi
+  if [ -e "$destination" ] || [ -L "$destination" ]; then
+    /usr/bin/cmp -s "$slot" "$destination" ||
+      finish 1 failed uninstall_restore_conflict "卸载中断后检测到新文件；未覆盖。"
+    return 0
+  fi
+  finish 1 failed uninstall_restore_failed "卸载文件无法原子恢复；保留恢复目录以便重试。"
 }
 
 stage_slot() {

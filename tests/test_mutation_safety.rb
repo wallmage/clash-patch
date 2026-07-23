@@ -952,6 +952,45 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_macos_uninstall_atomic_restore_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/uninstall_macos.sh",
+        "  if /bin/ln \"$slot\" \"$destination\"; then\n" \
+        "    return 0\n" \
+        "  fi\n",
+        "  /bin/cp -p \"$slot\" \"$destination\"\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_wrappers.rb",
+        "--name", "test_uninstaller_resumes_after_kill_during_file_restore"
+      )
+    end
+  end
+
+  def test_macos_uninstall_incomplete_stage_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/uninstall_macos.sh",
+        "  if [ ! -f \"$UNINSTALL_STAGING/READY\" ]; then\n" \
+        "    /bin/rm -rf \"$UNINSTALL_STAGING\"\n" \
+        "    return 0\n" \
+        "  fi\n",
+        ""
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_wrappers.rb",
+        "--name", "test_uninstaller_discards_a_stage_killed_before_ready"
+      )
+    end
+  end
+
   def test_macos_production_probe_inventory_mutation_is_killed
     with_repo_copy do |root|
       replace_once(
