@@ -9,7 +9,8 @@
     [int]$ExpectedPSMajor,
     [string[]]$RealMihomoPaths = @(),
     [switch]$RealMihomoOnly,
-    [string]$CompletionReceiptPath
+    [string]$CompletionReceiptPath,
+    [string]$CompletionReceiptNonce
 )
 
 $ErrorActionPreference = "Stop"
@@ -541,6 +542,7 @@ fs.writeFileSync(process.argv[4], JSON.stringify(output));
 }
 '@
             $realCoreIndex = 0
+            $realCompletedCases = New-Object System.Collections.ArrayList
             foreach ($realMihomoPath in $RealMihomoPaths) {
                 $realCoreIndex++
                 Assert-True (Test-Path -LiteralPath $realMihomoPath -PathType Leaf) "real Mihomo path is missing"
@@ -598,6 +600,7 @@ fs.writeFileSync(process.argv[4], JSON.stringify(output));
                     Assert-True (
                         $realTransformedValidation.ExitCode -eq 0
                     ) "real Mihomo rejected the installed Script.js output"
+                    [void]$realCompletedCases.Add([ordered]@{ Core = $realCoreIndex; Profile = $realUsageProfile })
                     } catch {
                         [void]$script:deferredProbeFailures.Add((
                             "real Mihomo core #{0} profile {1}: {2}" -f
@@ -610,6 +613,24 @@ fs.writeFileSync(process.argv[4], JSON.stringify(output));
             }
             if ($script:deferredProbeFailures.Count -gt 0) {
                 throw ("deferred production probes failed:`n- " + ($script:deferredProbeFailures -join "`n- "))
+            }
+            if (-not [string]::IsNullOrWhiteSpace($CompletionReceiptPath)) {
+                Assert-True (
+                    -not [string]::IsNullOrWhiteSpace($CompletionReceiptNonce)
+                ) "real Mihomo completion receipt nonce is required"
+                $realCompletionReceipt = [ordered]@{
+                    Mode = "RealMihomo"
+                    PSEdition = $ExpectedPSEdition
+                    PSMajor = $ExpectedPSMajor
+                    Nonce = $CompletionReceiptNonce
+                    CoreCount = $RealMihomoPaths.Count
+                    Cases = @($realCompletedCases)
+                } | ConvertTo-Json -Compress -Depth 4
+                [System.IO.File]::WriteAllText(
+                    $CompletionReceiptPath,
+                    $realCompletionReceipt,
+                    (New-Object System.Text.UTF8Encoding($false))
+                )
             }
             Write-Host "Windows real Mihomo public-entry cases passed"
             return

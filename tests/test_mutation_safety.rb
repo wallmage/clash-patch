@@ -839,6 +839,23 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_real_mihomo_profile_receipt_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "tests/test_windows_installer.ps1",
+        '                foreach ($realUsageProfile in @(1, 2, 3)) {',
+        '                foreach ($realUsageProfile in @(1)) {'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_windows_real_mihomo_jobs_require_case_completion_receipts"
+      )
+    end
+  end
+
   def test_macos_production_probe_failure_aggregation_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

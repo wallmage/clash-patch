@@ -1249,6 +1249,61 @@ class SkillContractTest < Minitest::Test
     assert_match(/WriteAllText\(\s*\$CompletionReceiptPath,/m, windows_tests)
   end
 
+  def test_windows_real_mihomo_jobs_require_case_completion_receipts
+    workflow = File.read(File.join(ROOT, ".github/workflows/test.yml"))
+    windows_tests = File.binread(File.join(ROOT, "tests/test_windows_installer.ps1")).force_encoding("UTF-8")
+    job = workflow[/^  windows-mihomo:\n(?:(?!^  \S).*\n)*/]
+
+    refute_nil job
+    assert_includes job, '$receipt = Join-Path $env:RUNNER_TEMP "clash-patch-windows-mihomo.json"'
+    assert_includes job, 'Remove-Item -LiteralPath $receipt -Force -ErrorAction SilentlyContinue'
+    assert_includes job, '$nonce = [Guid]::NewGuid().ToString("N")'
+    assert_includes job, '-CompletionReceiptPath $receipt'
+    assert_includes job, '-CompletionReceiptNonce $nonce'
+    assert_includes job, 'Test-Path -LiteralPath $receipt -PathType Leaf'
+    assert_includes job, 'Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json'
+    assert_includes job, '$completed.Mode -ne "RealMihomo"'
+    assert_includes job, "$completed.PSEdition -ne '${{ matrix.edition }}'"
+    assert_includes job, "[int]$completed.PSMajor -ne ${{ matrix.major }}"
+    assert_includes job, '$completed.Nonce -ne $nonce'
+    assert_includes job, '[int]$completed.CoreCount -ne $core.Count'
+    assert_includes job, '@($completed.Cases | ForEach-Object { "$($_.Core):$($_.Profile)" })'
+    assert_includes job, '@("1:1", "1:2", "1:3")'
+
+    assert_includes windows_tests, "[string]$CompletionReceiptNonce"
+    assert_includes windows_tests, '$realCompletedCases = New-Object System.Collections.ArrayList'
+    assert_includes windows_tests,
+                    '[void]$realCompletedCases.Add([ordered]@{ Core = $realCoreIndex; Profile = $realUsageProfile })'
+    assert_includes windows_tests, 'Mode = "RealMihomo"'
+    assert_includes windows_tests, "PSEdition = $ExpectedPSEdition"
+    assert_includes windows_tests, "PSMajor = $ExpectedPSMajor"
+    assert_includes windows_tests, "Nonce = $CompletionReceiptNonce"
+    assert_includes windows_tests, "CoreCount = $RealMihomoPaths.Count"
+    assert_includes windows_tests, "Cases = @($realCompletedCases)"
+    assert_includes windows_tests, 'foreach ($realUsageProfile in @(1, 2, 3))'
+
+    branch = windows_tests[/        if \(\$RealMihomoOnly\) \{.*?^        \}/m]
+    refute_nil branch
+    transformed_validation = branch.index(
+      'Assert-True (' + "\n" +
+      '                        $realTransformedValidation.ExitCode -eq 0'
+    )
+    completed_case = branch.index(
+      '[void]$realCompletedCases.Add([ordered]@{ Core = $realCoreIndex; Profile = $realUsageProfile })'
+    )
+    receipt = branch.index('Mode = "RealMihomo"')
+    failure_gate = branch.index('if ($script:deferredProbeFailures.Count -gt 0)')
+    return_statement = branch.rindex("            return")
+    refute_nil transformed_validation
+    refute_nil completed_case
+    refute_nil receipt
+    refute_nil failure_gate
+    refute_nil return_statement
+    assert_operator transformed_validation, :<, completed_case
+    assert_operator failure_gate, :<, receipt
+    assert_operator receipt, :<, return_statement
+  end
+
   def test_macos_real_mihomo_runner_rejects_zero_or_skipped_cases
     workflow = File.read(File.join(ROOT, ".github/workflows/test.yml"))
     patcher_tests = File.read(File.join(ROOT, "tests/test_macos_patcher.rb"))

@@ -229,10 +229,31 @@ jobs:
           $core = @(Get-ChildItem -LiteralPath $destination -Filter "mihomo*.exe" -File -Recurse)
           if ($core.Count -ne 1) { throw "Mihomo executable is missing before validation" }
           $targetPowerShell = (Get-Command '${{ matrix.executable }}').Source
+          $receipt = Join-Path $env:RUNNER_TEMP "clash-patch-windows-mihomo.json"
+          Remove-Item -LiteralPath $receipt -Force -ErrorAction SilentlyContinue
+          $nonce = [Guid]::NewGuid().ToString("N")
           & $targetPowerShell -NoLogo -NoProfile -File ./tests/test_windows_installer.ps1 `
             -PowerShellPath $targetPowerShell `
             -ExpectedPSEdition '${{ matrix.edition }}' `
             -ExpectedPSMajor ${{ matrix.major }} `
             -RealMihomoPaths @($core[0].FullName) `
-            -RealMihomoOnly
+            -RealMihomoOnly `
+            -CompletionReceiptPath $receipt `
+            -CompletionReceiptNonce $nonce
           if ($LASTEXITCODE -ne 0) { throw "Windows real Mihomo suite failed" }
+          if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) {
+            throw "Windows real Mihomo suite did not produce its completion receipt"
+          }
+          $completed = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json
+          if ($completed.Mode -ne "RealMihomo" -or
+              $completed.PSEdition -ne '${{ matrix.edition }}' -or
+              [int]$completed.PSMajor -ne ${{ matrix.major }} -or
+              $completed.Nonce -ne $nonce -or
+              [int]$completed.CoreCount -ne $core.Count) {
+            throw "Windows real Mihomo suite produced an invalid completion receipt"
+          }
+          $actualCases = @($completed.Cases | ForEach-Object { "$($_.Core):$($_.Profile)" })
+          $expectedCases = @("1:1", "1:2", "1:3")
+          if (@(Compare-Object $expectedCases $actualCases).Count -ne 0) {
+            throw "Windows real Mihomo suite did not complete every usage profile"
+          }

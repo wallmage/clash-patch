@@ -16,6 +16,7 @@
 - 合同测试：公开文件、Patch/Diagnostics 的“取证 → 修复 → 复测 → 失败恢复并继续迭代”完成闭环、AdGuard 兼容路径及其 Fake-IP 重用时按域名接入 Mihomo 的出站代理修复、配置历史、安全更新、Sub Agent 边界、Windows Computer Use 条件、双平台分流验证、策略生成、平台边界和 CI 配置；全部公开命令的 JSON v1 必须保持单对象输出、退出码一致、稳定 `code`/`operation`、规定字段类型和脱敏边界，默认中文输出不变。
 - 语法与格式：Ruby、JavaScript、Shell、PowerShell、全部 PowerShell 文件的严格 UTF-8 BOM、策略同步和 `git diff --check`。
 - 测试机制：CI 的 macOS 与 Windows job 都有总超时；独立生产故障探针先记录失败并继续执行，最后统一让 job 失败，避免前一个问题遮住后续测试。GitHub Actions 的 `shell` 字段必须使用静态受支持值，契约和 mutation 必须在推送前拦截会让 workflow 零 job 失败的动态 shell。mutation smoke test 覆盖文件写入恢复、安全更新回退、路径身份、整批预检、自动更新补偿、默认 Mihomo 解析、结果档位边界、分流流量绑定、发布包依赖与公开安装实际写入、生产探针 CI 开关、Windows 故障汇总和二次转换保护。mutation 的语法错误、加载失败或超时不能冒充被测试发现。
+- Windows 真实 Mihomo：每个 PowerShell 版本和 Mihomo 版本的矩阵任务必须生成绑定当前随机 nonce、PowerShell 运行时、内核数量及档位 1、2、3 完成记录的凭据；只看到子进程退出码不能算完成。
 
 ## 必须持续防止
 
