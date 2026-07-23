@@ -257,6 +257,23 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_release_archive_dependency_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles.rb",
+        "patch_profiles/profile_writer patch_profiles/subscriptions patch_profiles/runtime",
+        "patch_profiles/profile_writer patch_profiles/missing_subscriptions patch_profiles/runtime"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_release_archive_is_self_contained_and_runs_from_a_unicode_space_path"
+      )
+    end
+  end
+
   def test_normal_batch_preflight_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

@@ -1,5 +1,9 @@
+require "fileutils"
 require "json"
 require "minitest/autorun"
+require "open3"
+require "rbconfig"
+require "tmpdir"
 require "yaml"
 
 ROOT = File.expand_path("..", __dir__)
@@ -69,6 +73,79 @@ class SkillContractTest < Minitest::Test
   def test_all_distribution_files_exist
     missing = REQUIRED_PUBLIC_FILES.reject { |path| File.file?(File.join(ROOT, path)) }
     assert_empty missing, "missing public files: #{missing.join(', ')}"
+  end
+
+  def test_release_archive_is_self_contained_and_runs_from_a_unicode_space_path
+    release_files = REQUIRED_PUBLIC_FILES.select do |path|
+      path == "README.md" || path == "LICENSE" || path.start_with?("clash-patch/")
+    end
+    Dir.mktmpdir("clash-patch-release-") do |directory|
+      package_name = "Clash Patch 发布包"
+      staging = File.join(directory, "staging")
+      package_root = File.join(staging, package_name)
+      release_files.each do |relative|
+        destination = File.join(package_root, relative)
+        FileUtils.mkdir_p(File.dirname(destination))
+        FileUtils.cp(File.join(ROOT, relative), destination, preserve: true)
+      end
+
+      archive = File.join(directory, "clash-patch-release.tar")
+      _output, _error, status = Open3.capture3(
+        "tar", "-cf", archive, "-C", staging, package_name
+      )
+      assert status.success?, "release archive creation failed"
+
+      listing, _error, status = Open3.capture3("tar", "-tf", archive)
+      assert status.success?, "release archive listing failed"
+      entries = listing.lines.map(&:chomp)
+      refute entries.any? { |entry| entry.start_with?("/") || entry.split("/").include?("..") }
+      release_files.each { |relative| assert_includes entries, "#{package_name}/#{relative}" }
+
+      extracted = File.join(directory, "extracted")
+      FileUtils.mkdir_p(extracted)
+      _output, _error, status = Open3.capture3("tar", "-xf", archive, "-C", extracted)
+      assert status.success?, "release archive extraction failed"
+      unpacked = File.join(extracted, package_name)
+      install_macos = File.join(unpacked, "clash-patch/scripts/install_macos.sh")
+      uninstall_macos = File.join(unpacked, "clash-patch/scripts/uninstall_macos.sh")
+      patcher = File.join(unpacked, "clash-patch/scripts/macos/patch_profiles.rb")
+      windows_engine = File.join(unpacked, "clash-patch/scripts/windows/clash_verge_global.js")
+      assert File.executable?(install_macos)
+      assert File.executable?(uninstall_macos)
+
+      [install_macos, uninstall_macos].each do |script|
+        _output, _error, status = Open3.capture3("sh", "-n", script)
+        assert status.success?, "extracted shell entrypoint failed syntax validation"
+        _output, _error, status = Open3.capture3({ "HOME" => directory }, "sh", script, "--help")
+        assert status.success?, "extracted shell help entrypoint failed"
+      end
+      _output, _error, status = Open3.capture3(RbConfig.ruby, patcher, "--help")
+      assert status.success?, "extracted Ruby entrypoint failed"
+      _output, _error, status = Open3.capture3("node", "--check", windows_engine)
+      assert status.success?, "extracted Windows JavaScript entrypoint failed syntax validation"
+
+      profile_directory = File.join(directory, "用户 配置")
+      FileUtils.mkdir_p(profile_directory)
+      File.write(File.join(profile_directory, "friend.yaml"), <<~YAML)
+        mixed-port: 7890
+        proxies:
+          - name: node
+            type: socks5
+            server: 127.0.0.1
+            port: 1080
+        proxy-groups:
+          - name: Main
+            type: select
+            proxies: [node]
+        rules:
+          - MATCH,Main
+      YAML
+      _output, _error, status = Open3.capture3(
+        RbConfig.ruby, patcher, "--profile-dir", profile_directory,
+        "--usage-profile", "1", "--dry-run"
+      )
+      assert status.success?, "extracted release could not patch a profile from a Unicode path"
+    end
   end
 
   def test_tests_and_product_spec_are_distributed_but_generated_material_is_ignored
@@ -1048,6 +1125,11 @@ class SkillContractTest < Minitest::Test
     assert_includes source, "PostfixPlusPlus"
     assert_includes source, "CommandAst"
     assert_includes source, "Set-Variable"
+    assert_includes source, "Invoke-DeferredProbe"
+    assert_includes source, "deferred production probes failed"
+    assert_includes source, "Compress-Archive"
+    assert_includes source, "Expand-Archive"
+    assert_includes source, "incomplete release changed AppHome"
   end
 
   def test_every_test_entrypoint_is_wired_into_ci

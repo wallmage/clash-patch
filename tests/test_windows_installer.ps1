@@ -40,9 +40,12 @@ $sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("clash-patch-windows-tes
 $onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
 $previousUsageProfile = $env:CLASH_PATCH_USAGE_PROFILE
 $env:CLASH_PATCH_USAGE_PROFILE = "3"
+$script:deferredProbeFailures = New-Object System.Collections.ArrayList
 $fakeCore = Join-Path $sandbox $(if ($onWindows) { "mihomo-test.cmd" } else { "mihomo-test.sh" })
 $hangingCore = Join-Path $sandbox $(if ($onWindows) { "mihomo-hang.cmd" } else { "mihomo-hang.sh" })
 $mutatingCore = Join-Path $sandbox "mihomo-mutate.cmd"
+$identityMutatingCore = Join-Path $sandbox "mihomo-identity-mutate.cmd"
+$candidateHangingCore = Join-Path $sandbox "mihomo-candidate-hang.cmd"
 
 function Get-ProtectedAutomaticVariableNames {
     $automaticCandidates = @(
@@ -353,6 +356,14 @@ function Assert-JsonResult([object]$Invocation, [string]$Command, [int]$ExitCode
     return $result
 }
 
+function Invoke-DeferredProbe([string]$Name, [scriptblock]$Probe) {
+    try {
+        & $Probe
+    } catch {
+        [void]$script:deferredProbeFailures.Add(("{0}: {1}" -f $Name, $_.Exception.Message))
+    }
+}
+
 function Invoke-TestPowerShell([string]$ScriptPath, [string[]]$ScriptArguments) {
     $previousPreference = $ErrorActionPreference
     try {
@@ -402,6 +413,18 @@ try {
     if ($onWindows) {
         $mutatingCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nif not `"%CLASH_PATCH_MUTATE_TARGET%`"==`"`" (`r`n  >`"%CLASH_PATCH_MUTATE_TARGET%`" echo friend_concurrent: true`r`n)`r`nexit /b 0`r`n"
         [System.IO.File]::WriteAllText($mutatingCore, $mutatingCoreText, [System.Text.Encoding]::ASCII)
+        $identityMutatingCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nif not `"%CLASH_PATCH_MUTATE_TARGET%`"==`"`" (`r`n  copy /b `"%CLASH_PATCH_MUTATE_TARGET%`" `"%CLASH_PATCH_MUTATE_TARGET%.replacement`" >nul`r`n  move /y `"%CLASH_PATCH_MUTATE_TARGET%.replacement`" `"%CLASH_PATCH_MUTATE_TARGET%`" >nul`r`n)`r`nexit /b 0`r`n"
+        [System.IO.File]::WriteAllText(
+            $identityMutatingCore,
+            $identityMutatingCoreText,
+            [System.Text.Encoding]::ASCII
+        )
+        $candidateHangingCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nping 127.0.0.1 -n 6 >nul`r`nexit /b 0`r`n"
+        [System.IO.File]::WriteAllText(
+            $candidateHangingCore,
+            $candidateHangingCoreText,
+            [System.Text.Encoding]::ASCII
+        )
     }
     if ($onWindows) {
         $hangingCoreText = "@echo off`r`nping 127.0.0.1 -n 6 >nul`r`nexit /b 0`r`n"
@@ -482,15 +505,17 @@ try {
             Assert-True ($mutexInstallJson.code -eq "operation_in_progress") "parallel install did not report the shared AppHome lock"
             Assert-True ((Get-TreeContentSnapshot $mutexCase) -ceq $mutexBefore) "rejected parallel install changed AppHome"
 
-            $extendedMutexCase = "\\?\$mutexCase"
-            $aliasInstall = Invoke-TestPowerShell $installer @(
-                "-AppHome", $extendedMutexCase,
-                "-UsageProfile", "1",
-                "-MihomoPath", $fakeCore,
-                "-Json"
-            )
-            $aliasInstallJson = Assert-JsonResult $aliasInstall "install" 1
-            Assert-True ($aliasInstallJson.code -eq "operation_in_progress") "extended-path alias bypassed the shared AppHome lock"
+            Invoke-DeferredProbe "extended-path AppHome lock alias" {
+                $extendedMutexCase = "\\?\$mutexCase"
+                $aliasInstall = Invoke-TestPowerShell $installer @(
+                    "-AppHome", $extendedMutexCase,
+                    "-UsageProfile", "1",
+                    "-MihomoPath", $fakeCore,
+                    "-Json"
+                )
+                $aliasInstallJson = Assert-JsonResult $aliasInstall "install" 1
+                Assert-True ($aliasInstallJson.code -eq "operation_in_progress") "extended-path alias bypassed the shared AppHome lock"
+            }
 
             $renamedMutexCase = Join-Path $sandbox "app-home-mutex-renamed"
             $renameBlocked = $false
@@ -508,6 +533,49 @@ try {
     }
     [System.IO.File]::WriteAllText($hangingCore, $hangingCoreText, [System.Text.Encoding]::ASCII)
     if (-not $onWindows) { & /bin/chmod 700 $hangingCore }
+
+    if ($onWindows) {
+        $releaseZip = Join-Path $sandbox "clash-patch-release.zip"
+        $releaseExtracted = Join-Path $sandbox "发布 包"
+        Compress-Archive -Path (Join-Path $root "clash-patch") -DestinationPath $releaseZip
+        Expand-Archive -LiteralPath $releaseZip -DestinationPath $releaseExtracted
+        $releasePackage = Join-Path $releaseExtracted "clash-patch"
+        $releaseInstaller = Join-Path (Join-Path $releasePackage "scripts") "install_windows.ps1"
+        Assert-True (Test-Path -LiteralPath $releaseInstaller -PathType Leaf) "release archive omitted the Windows installer"
+
+        $releaseAppHome = Join-Path $sandbox "用户 配置"
+        $releaseProfiles = Join-Path $releaseAppHome "profiles"
+        New-Item -ItemType Directory -Path $releaseProfiles -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $releaseAppHome "config.yaml"), "ipv6: true`ntun: null`n")
+        [System.IO.File]::WriteAllText((Join-Path $releaseAppHome "verge.yaml"), "enable_tun_mode: false`n")
+        [System.IO.File]::WriteAllText(
+            (Join-Path $releaseAppHome "profiles.yaml"),
+            "items:`n- uid: R-release`n  type: remote`n  option:`n    allow_auto_update: true`n"
+        )
+        $releaseInstallResult = Invoke-TestPowerShell $releaseInstaller @(
+            "-AppHome", $releaseAppHome,
+            "-UsageProfile", "1",
+            "-MihomoPath", $fakeCore,
+            "-Json"
+        )
+        $releaseInstallJson = Assert-JsonResult $releaseInstallResult "install" 0
+        Assert-True ($releaseInstallJson.code -eq "installed_common_baseline") "relocated release did not complete a real install"
+        Assert-True (Test-Path -LiteralPath (Join-Path $releaseProfiles "Script.js") -PathType Leaf) "relocated release omitted Script.js"
+
+        $incompleteReleaseHome = Join-Path $sandbox "incomplete-release-home"
+        New-Item -ItemType Directory -Path $incompleteReleaseHome -Force | Out-Null
+        $incompleteBefore = Get-TreeContentSnapshot $incompleteReleaseHome
+        Remove-Item -LiteralPath (Join-Path (Join-Path $releasePackage "scripts/windows/install_windows") "transaction.ps1") -Force
+        $incompleteResult = Invoke-TestPowerShell $releaseInstaller @(
+            "-AppHome", $incompleteReleaseHome,
+            "-UsageProfile", "1",
+            "-MihomoPath", $fakeCore,
+            "-Json"
+        )
+        $incompleteJson = Assert-JsonResult $incompleteResult "install" 6
+        Assert-True ($incompleteJson.code -eq "incomplete_package") "release with a missing module did not report incomplete_package"
+        Assert-True ((Get-TreeContentSnapshot $incompleteReleaseHome) -ceq $incompleteBefore) "incomplete release changed AppHome"
+    }
 
     . $resultContract
     $contractResult = New-ClashPatchResult -Command "install" -Operation "test" -Ok $true -Status "ok" -Code "ok" -ExitCode 0 -SummaryZh "完成"
@@ -1080,6 +1148,76 @@ items:
         Remove-Item -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json") -Force
     }
 
+    Invoke-DeferredProbe "strict safe-update manifest schema" {
+        $schemaSafeUpdateCase = Join-Path $sandbox "safe-update-schema-case"
+        $schemaSafeUpdateProfiles = Join-Path $schemaSafeUpdateCase "profiles"
+        New-Item -ItemType Directory -Path $schemaSafeUpdateProfiles -Force | Out-Null
+        [System.IO.File]::WriteAllText(
+            (Join-Path $schemaSafeUpdateCase "profiles.yaml"),
+            "items:`n- uid: R-schema`n  type: remote`n  option:`n    allow_auto_update: true`n"
+        )
+        $schemaSafeUpdateTarget = Join-Path $schemaSafeUpdateProfiles "R-schema.yaml"
+        [System.IO.File]::WriteAllText($schemaSafeUpdateTarget, "mode: rule`nproxies: []`n")
+        $schemaSnapshot = Invoke-TestPowerShell $installer @("-AppHome", $schemaSafeUpdateCase, "-SnapshotProfiles")
+        Assert-True ($schemaSnapshot.ExitCode -eq 0) "safe-update schema fixture snapshot failed"
+        $schemaUpdatedText = "mode: global`nproxy-groups: []`n"
+        [System.IO.File]::WriteAllText($schemaSafeUpdateTarget, $schemaUpdatedText)
+        $schemaManifestPath = Join-Path $schemaSafeUpdateCase "clash-patch-safe-update.json"
+        $schemaManifest = Get-Content -LiteralPath $schemaManifestPath -Raw | ConvertFrom-Json
+        $schemaManifest.Version = "1"
+        $schemaManifest | Add-Member -NotePropertyName Extra -NotePropertyValue $true
+        $schemaManifest.Profiles[0] | Add-Member -NotePropertyName Extra -NotePropertyValue $true
+        [System.IO.File]::WriteAllText(
+            $schemaManifestPath,
+            (($schemaManifest | ConvertTo-Json -Depth 5) + "`r`n"),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $schemaVerify = Invoke-TestPowerShell $installer @(
+            "-AppHome", $schemaSafeUpdateCase,
+            "-VerifySafeUpdate",
+            "-MihomoPath", $fakeCore,
+            "-Json"
+        )
+        Assert-True (
+            $schemaVerify.ExitCode -eq 1 -and
+            (Test-Path -LiteralPath $schemaManifestPath -PathType Leaf) -and
+            (Get-Content -LiteralPath $schemaSafeUpdateTarget -Raw) -eq $schemaUpdatedText
+        ) "safe update accepted a manifest with non-canonical types or extra fields"
+    }
+
+    Invoke-DeferredProbe "strict UTF-8 safe-update validation" {
+        $utf8SafeUpdateCase = Join-Path $sandbox "safe-update-invalid-utf8-case"
+        $utf8SafeUpdateProfiles = Join-Path $utf8SafeUpdateCase "profiles"
+        New-Item -ItemType Directory -Path $utf8SafeUpdateProfiles -Force | Out-Null
+        [System.IO.File]::WriteAllText(
+            (Join-Path $utf8SafeUpdateCase "profiles.yaml"),
+            "items:`n- uid: R-utf8`n  type: remote`n  option:`n    allow_auto_update: true`n"
+        )
+        $utf8SafeUpdateTarget = Join-Path $utf8SafeUpdateProfiles "R-utf8.yaml"
+        $utf8OriginalText = "mode: rule`nproxies: []`n"
+        [System.IO.File]::WriteAllText($utf8SafeUpdateTarget, $utf8OriginalText)
+        $utf8Snapshot = Invoke-TestPowerShell $installer @("-AppHome", $utf8SafeUpdateCase, "-SnapshotProfiles")
+        Assert-True ($utf8Snapshot.ExitCode -eq 0) "invalid UTF-8 fixture snapshot failed"
+        [byte[]]$utf8InvalidBytes = @(
+            [System.Text.Encoding]::UTF8.GetBytes("mode: rule`n# invalid ")
+        ) + [byte[]]@(0xff) + [byte[]]@(
+            [System.Text.Encoding]::UTF8.GetBytes("`nproxies: []`n")
+        )
+        [System.IO.File]::WriteAllBytes($utf8SafeUpdateTarget, $utf8InvalidBytes)
+        $utf8Verify = Invoke-TestPowerShell $installer @(
+            "-AppHome", $utf8SafeUpdateCase,
+            "-VerifySafeUpdate",
+            "-MihomoPath", $fakeCore,
+            "-Json"
+        )
+        $utf8ManifestPath = Join-Path $utf8SafeUpdateCase "clash-patch-safe-update.json"
+        Assert-True (
+            $utf8Verify.ExitCode -eq 1 -and
+            (Get-Content -LiteralPath $utf8SafeUpdateTarget -Raw) -eq $utf8OriginalText -and
+            -not (Test-Path -LiteralPath $utf8ManifestPath)
+        ) "safe update accepted invalid UTF-8 bytes after replacement-character decoding"
+    }
+
     $concurrentTarget = Join-Path $safeUpdateProfiles "concurrent.yaml"
     $concurrentBackup = Join-Path $safeUpdateProfiles "concurrent.backup"
     [System.IO.File]::WriteAllText($concurrentTarget, "observed: true`n")
@@ -1144,6 +1282,41 @@ items:
     Assert-True ($badBackupRestore.Failures.Count -eq 1) "safe update rollback accepted backup bytes that changed after validation"
     Assert-True ((Get-Content -LiteralPath $badBackupTarget -Raw) -eq "still-valid: true`n") "corrupt backup overwrote a still-valid subscription before rejection"
 
+    if ($onWindows) {
+        Invoke-DeferredProbe "public restore same-byte identity replacement" {
+            $identityRestoreCase = Join-Path $sandbox "public-restore-identity-case"
+            $identityRestoreBackupRoot = Join-Path $identityRestoreCase "clash-patch-backups"
+            $identityRestoreTarget = Join-Path $identityRestoreCase "config.yaml"
+            New-Item -ItemType Directory -Path $identityRestoreCase -Force | Out-Null
+            $identityRestoreBackupText = "mode: rule`nproxies: []`nproxy-groups: []`nrules: []`n"
+            $identityRestoreCurrentText = "mode: global`nproxies: []`nproxy-groups: []`nrules: []`n"
+            [System.IO.File]::WriteAllText($identityRestoreTarget, $identityRestoreBackupText)
+            $identityRestoreBackup = Backup-Versioned $identityRestoreTarget $identityRestoreBackupRoot "prewrite"
+            [System.IO.File]::WriteAllText($identityRestoreTarget, $identityRestoreCurrentText)
+            $identityRestoreExpectedHash = Get-FileSha256 $identityRestoreTarget
+            $identityBeforeValidation = (Get-OptionalFileSnapshot $identityRestoreTarget "public restore before validation").Identity
+            $env:CLASH_PATCH_MUTATE_TARGET = $identityRestoreTarget
+            try {
+                $identityRestoreResult = Invoke-TestPowerShell $installer @(
+                    "-AppHome", $identityRestoreCase,
+                    "-RestoreBackup", (Split-Path -Leaf $identityRestoreBackup),
+                    "-ExpectedCurrentSha256", $identityRestoreExpectedHash,
+                    "-MihomoPath", $identityMutatingCore,
+                    "-Json"
+                )
+            } finally {
+                $env:CLASH_PATCH_MUTATE_TARGET = $null
+            }
+            $identityAfterValidation = (Get-OptionalFileSnapshot $identityRestoreTarget "public restore after validation").Identity
+            $identityRestorePreserved = (Get-Content -LiteralPath $identityRestoreTarget -Raw) -eq $identityRestoreCurrentText
+            Assert-True (
+                $identityRestoreResult.ExitCode -eq 1 -and
+                $identityAfterValidation -cne $identityBeforeValidation -and
+                $identityRestorePreserved
+            ) "public restore overwrote a same-byte file whose identity changed during validation"
+        }
+    }
+
     $internalRestoreCase = Join-Path $sandbox "internal-state-restore-case"
     $internalRestoreBackupRoot = Join-Path $internalRestoreCase "clash-patch-backups"
     $internalUsagePath = Join-Path $internalRestoreCase "clash-patch-usage-profile.json"
@@ -1191,6 +1364,18 @@ items:
     Assert-True (-not (Test-RouteChains $routeChains @("GameNode", "Gaming") "Main" "Taiwan" "AI" $true)) "Windows route verifier accepted an unrelated selector for Google traffic"
     Assert-True (-not (Test-RouteChains $routeChains @("Japan", "AI", "Google") "Main" "Taiwan" "AI" $true)) "Windows route verifier accepted the AI group for ordinary Google traffic"
     Assert-True (Test-RouteChains $routeChains @("Japan", "AI") "AI" "Japan" "AI" $false) "Windows route verifier rejected the required AI group"
+    Invoke-DeferredProbe "non-proxy route termini" {
+        $acceptedNonProxyTermini = @(
+            foreach ($terminus in @("REJECT", "REJECT-DROP", "PASS", "COMPATIBLE")) {
+                if (Test-RouteChains $routeChains @($terminus, "Japan", "AI") "AI" "Japan" "AI" $false) {
+                    $terminus
+                }
+            }
+        )
+        Assert-True ($acceptedNonProxyTermini.Count -eq 0) (
+            "Windows route verifier accepted non-proxy termini: " + ($acceptedNonProxyTermini -join ", ")
+        )
+    }
 
     Assert-True (Test-MihomoVersionText "Mihomo Meta v1.19.27") "minimum Mihomo version was rejected"
     Assert-True (-not (Test-MihomoVersionText "Mihomo Meta v1.19.26")) "old Mihomo version was accepted"
@@ -1210,6 +1395,94 @@ items:
     $timeoutWatch.Stop()
     Assert-True $timeoutRaised "hanging Mihomo process did not fail closed after one second: $timeoutError"
     Assert-True ($timeoutWatch.Elapsed.TotalSeconds -lt 4) "hanging Mihomo process was not terminated promptly"
+
+    if ($onWindows) {
+        Invoke-DeferredProbe "Mihomo timeout terminates descendants" {
+            $treeScriptPath = Join-Path $sandbox "mihomo-process-tree.ps1"
+            $treeChildIdPath = Join-Path $sandbox "mihomo-process-tree-child-id.txt"
+            $treeScriptSource = @'
+param([string]$ChildIdPath)
+$ErrorActionPreference = "Stop"
+$child = Start-Process -FilePath (Join-Path $env:SystemRoot "System32\ping.exe") `
+    -ArgumentList @("-n", "30", "127.0.0.1") -PassThru
+[System.IO.File]::WriteAllText($ChildIdPath, $child.Id.ToString())
+$child.WaitForExit()
+'@
+            [System.IO.File]::WriteAllText($treeScriptPath, $treeScriptSource, [System.Text.Encoding]::ASCII)
+            $treeTimeoutRaised = $false
+            try {
+                Invoke-Mihomo $PowerShellPath @(
+                    "-NoLogo", "-NoProfile", "-File", $treeScriptPath,
+                    "-ChildIdPath", $treeChildIdPath
+                ) 1 | Out-Null
+            } catch {
+                $treeTimeoutRaised = $_.Exception.Message.Contains("超过 1 秒")
+            }
+            $treeChildId = 0
+            if (Test-Path -LiteralPath $treeChildIdPath -PathType Leaf) {
+                $treeChildId = [int](Get-Content -LiteralPath $treeChildIdPath -Raw)
+            }
+            $treeChildAlive = $false
+            if ($treeChildId -gt 0) {
+                $treeChildAlive = $null -ne (Get-Process -Id $treeChildId -ErrorAction SilentlyContinue)
+                if ($treeChildAlive) {
+                    Stop-Process -Id $treeChildId -Force -ErrorAction SilentlyContinue
+                }
+            }
+            Assert-True $treeTimeoutRaised "process-tree fixture did not reach the Mihomo timeout"
+            Assert-True (-not $treeChildAlive) "Mihomo timeout left a descendant process running"
+        }
+
+        Invoke-DeferredProbe "Mihomo candidate cleanup after caller death" {
+            $candidateDirectory = Join-Path $sandbox "candidate-process-death"
+            $candidateChildPath = Join-Path $sandbox "candidate-process-death.ps1"
+            New-Item -ItemType Directory -Path $candidateDirectory -Force | Out-Null
+            $candidateChildSource = @'
+param(
+    [string]$ModulePath,
+    [string]$CorePath,
+    [string]$Directory
+)
+$ErrorActionPreference = "Stop"
+function Test-GeneratedYaml {
+    param([string]$Text)
+    return $true
+}
+. $ModulePath
+Test-MihomoCandidate $CorePath "proxies:`n  - name: fixture-private-marker" $Directory
+'@
+            [System.IO.File]::WriteAllText(
+                $candidateChildPath,
+                $candidateChildSource,
+                [System.Text.Encoding]::ASCII
+            )
+            $candidateChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+                "-NoLogo", "-NoProfile", "-File", $candidateChildPath,
+                "-ModulePath", (Join-Path $installerModuleRoot "mihomo.ps1"),
+                "-CorePath", $candidateHangingCore,
+                "-Directory", $candidateDirectory
+            ) -PassThru
+            $candidateDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            $candidateFiles = @()
+            while ($candidateFiles.Count -eq 0 -and
+                -not $candidateChild.HasExited -and [DateTime]::UtcNow -lt $candidateDeadline) {
+                Start-Sleep -Milliseconds 25
+                $candidateFiles = @(Get-ChildItem -LiteralPath $candidateDirectory -Filter ".clash-patch-validate-*.yaml" -File)
+            }
+            $candidateAppeared = $candidateFiles.Count -eq 1
+            if (-not $candidateChild.HasExited) {
+                Stop-Process -Id $candidateChild.Id -Force
+                $candidateChild.WaitForExit()
+            }
+            $candidateFiles = @(Get-ChildItem -LiteralPath $candidateDirectory -Filter ".clash-patch-validate-*.yaml" -File)
+            $candidateLeftBehind = $candidateFiles.Count -gt 0
+            foreach ($candidateFile in $candidateFiles) {
+                Remove-Item -LiteralPath $candidateFile.FullName -Force
+            }
+            Assert-True $candidateAppeared "candidate cleanup fixture never created its validation file"
+            Assert-True (-not $candidateLeftBehind) "caller death left a Mihomo candidate file behind"
+        }
+    }
 
     $backupSource = Join-Path $sandbox "backup-source.txt"
     $versionedBackupRoot = Join-Path $sandbox "versioned-backups"
@@ -1528,11 +1801,96 @@ try {
         $crashWriteChild.WaitForExit()
         Assert-True ((Get-Content -LiteralPath $crashWriteFirstPath -Raw) -eq "first-new") "crash-write fixture did not leave a partial transaction"
         Assert-True ((Get-Content -LiteralPath $crashWriteSecondPath -Raw) -eq "second-original") "crash-write fixture unexpectedly completed the transaction"
+        $crashWriteJournalPath = Join-Path $crashWriteHome ".clash-patch-transaction.json"
+        $crashWriteJournalAcl = Get-Acl -LiteralPath $crashWriteJournalPath
+        $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $allowedJournalSids = @(
+            $currentUserSid,
+            "S-1-5-18",
+            "S-1-5-32-544"
+        )
+        $unsafeJournalRules = @(
+            foreach ($accessRule in @($crashWriteJournalAcl.Access)) {
+                if ($accessRule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) {
+                    continue
+                }
+                try {
+                    $accessRuleSid = $accessRule.IdentityReference.Translate(
+                        [System.Security.Principal.SecurityIdentifier]
+                    ).Value
+                } catch {
+                    $accessRuleSid = $accessRule.IdentityReference.Value
+                }
+                if ($accessRuleSid -notin $allowedJournalSids) {
+                    $accessRule
+                }
+            }
+        )
+        $crashWriteJournalIsPrivate = $crashWriteJournalAcl.AreAccessRulesProtected -and
+            $unsafeJournalRules.Count -eq 0
+        Invoke-DeferredProbe "private transaction journal ACL" {
+            Assert-True $crashWriteJournalIsPrivate "transaction journal inherited access for unrelated accounts"
+        }
         $crashWriteRecoveryLock = Enter-AppHomeMutationLock $crashWriteHome
         Exit-AppHomeMutationLock $crashWriteRecoveryLock
         Assert-True ((Get-Content -LiteralPath $crashWriteFirstPath -Raw) -eq "first-original") "next operation did not recover a write interrupted by process death"
         Assert-True ((Get-Content -LiteralPath $crashWriteSecondPath -Raw) -eq "second-original") "write recovery changed an untouched transaction target"
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $crashWriteHome ".clash-patch-transaction.json"))) "write recovery left a stale transaction journal"
+
+        Invoke-DeferredProbe "interrupted transaction same-byte identity replacement" {
+            $identityCrashHome = Join-Path $sandbox "identity-crash-write-home"
+            $identityCrashFirstPath = Join-Path $identityCrashHome "first.txt"
+            $identityCrashSecondPath = Join-Path $identityCrashHome "second.txt"
+            $identityCrashReadyPath = Join-Path $sandbox "identity-crash-write.ready"
+            New-Item -ItemType Directory -Path $identityCrashHome -Force | Out-Null
+            [System.IO.File]::WriteAllText($identityCrashFirstPath, "first-original")
+            [System.IO.File]::WriteAllText($identityCrashSecondPath, "second-original")
+            $identityCrashChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+                "-NoLogo", "-NoProfile", "-File", $crashWriteChildPath,
+                "-ModulePath", (Join-Path $installerModuleRoot "transaction.ps1"),
+                "-AppHome", $identityCrashHome,
+                "-FirstPath", $identityCrashFirstPath,
+                "-SecondPath", $identityCrashSecondPath,
+                "-ReadyPath", $identityCrashReadyPath
+            ) -PassThru
+            try {
+                $identityCrashDeadline = [DateTime]::UtcNow.AddSeconds(10)
+                while (-not (Test-Path -LiteralPath $identityCrashReadyPath -PathType Leaf) -and
+                    -not $identityCrashChild.HasExited -and [DateTime]::UtcNow -lt $identityCrashDeadline) {
+                    Start-Sleep -Milliseconds 25
+                }
+                Assert-True (Test-Path -LiteralPath $identityCrashReadyPath -PathType Leaf) "identity crash child did not reach the first durable write"
+                Stop-Process -Id $identityCrashChild.Id -Force
+                $identityCrashChild.WaitForExit()
+            } finally {
+                if (-not $identityCrashChild.HasExited) { Stop-Process -Id $identityCrashChild.Id -Force }
+            }
+            Assert-True ((Get-Content -LiteralPath $identityCrashFirstPath -Raw) -eq "first-new") "identity crash fixture did not leave a partial transaction"
+            $writtenIdentity = (Get-OptionalFileSnapshot $identityCrashFirstPath "identity crash written target").Identity
+            $identityReplacement = Join-Path $identityCrashHome "replacement.tmp"
+            $identityDisplaced = Join-Path $identityCrashHome "displaced.tmp"
+            [System.IO.File]::WriteAllText($identityReplacement, "first-new")
+            [System.IO.File]::Move($identityCrashFirstPath, $identityDisplaced)
+            [System.IO.File]::Move($identityReplacement, $identityCrashFirstPath)
+            [System.IO.File]::Delete($identityDisplaced)
+            $replacementIdentity = (Get-OptionalFileSnapshot $identityCrashFirstPath "identity crash replacement").Identity
+            Assert-True ($replacementIdentity -cne $writtenIdentity) "identity crash fixture did not replace the file identity"
+
+            $identityRecoveryRejected = $false
+            try {
+                $identityRecoveryLock = Enter-AppHomeMutationLock $identityCrashHome
+                Exit-AppHomeMutationLock $identityRecoveryLock
+            } catch {
+                $identityRecoveryRejected = $true
+            }
+            $identityAfterRecovery = (Get-OptionalFileSnapshot $identityCrashFirstPath "identity crash after recovery").Identity
+            $identityContentPreserved = (Get-Content -LiteralPath $identityCrashFirstPath -Raw) -eq "first-new"
+            Assert-True (
+                $identityRecoveryRejected -and
+                $identityAfterRecovery -ceq $replacementIdentity -and
+                $identityContentPreserved
+            ) "interrupted recovery overwrote a same-byte file with a different identity"
+        }
 
         $crashDeleteHome = Join-Path $sandbox "crash-delete-home"
         $crashDeleteFirstPath = Join-Path $crashDeleteHome "first.txt"
@@ -2337,6 +2695,9 @@ friend payload
     Assert-True ($badMarkerResult.ExitCode -eq 1) "uninstaller accepted duplicate end markers"
     Assert-True ((Get-Content -LiteralPath $badMarkerPath -Raw) -eq $badMarkerScript) "uninstaller modified an ambiguously marked script"
 
+    if ($script:deferredProbeFailures.Count -gt 0) {
+        throw ("deferred production probes failed:`n- " + ($script:deferredProbeFailures -join "`n- "))
+    }
     Write-Host "Windows installer behavioral cases passed"
 } finally {
     $env:CLASH_PATCH_USAGE_PROFILE = $previousUsageProfile
