@@ -1,6 +1,7 @@
 require "json"
 require "minitest/autorun"
 require "open3"
+require "rbconfig"
 require "socket"
 require "stringio"
 require "tmpdir"
@@ -21,6 +22,320 @@ class MacosPatcherTest < Minitest::Test
   def setup
     skip "patcher not implemented" unless PATCHER_AVAILABLE || name == "test_patcher_files_exist"
     @policy = JSON.parse(File.read(POLICY_PATH)) if PATCHER_AVAILABLE
+  end
+
+  def require_production_probe!
+    skip "set CLASH_PATCH_RUN_PRODUCTION_PROBES=1 to run known production-failure probes" unless
+      ENV["CLASH_PATCH_RUN_PRODUCTION_PROBES"] == "1"
+  end
+
+  def test_production_probe_normal_batch_restores_a_commit_when_bookkeeping_raises
+    require_production_probe!
+    Dir.mktmpdir do |directory|
+      paths = %w[a-first.yaml z-second.yaml].map do |name|
+        path = File.join(directory, name)
+        File.write(path, YAML.dump(base_config.merge("subscription-marker" => name)))
+        path
+      end
+      originals = paths.to_h { |path| [path, File.binread(path)] }
+      real_replace = ClashPatch.method(:atomic_replace_locked)
+      commits = 0
+      injected = false
+      faulty_replace = lambda do |*arguments|
+        result = real_replace.call(*arguments)
+        commits += 1 if result
+        if result && commits == 2 && !injected
+          injected = true
+          raise IOError, "injected after the second durable commit"
+        end
+        result
+      end
+
+      results = ClashPatch.stub(:atomic_replace_locked, faulty_replace) do
+        ClashPatch.run(
+          directory: directory, policy_path: POLICY_PATH,
+          backup_root: File.join(directory, "backups"), selected_name: "none",
+          validator: ->(_path) { true }, auto_reload: false, usage_profile: 1
+        )
+      end
+
+      assert injected
+      refute results.all? { |result| %i[updated unchanged].include?(result.fetch(:status)) }
+      originals.each do |path, bytes|
+        assert File.binread(path) == bytes, "failed batch left committed bytes in #{File.basename(path)}"
+      end
+    end
+  end
+
+  def test_production_probe_safe_update_restores_a_swap_when_bookkeeping_raises
+    require_production_probe!
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old"))
+      File.write(path, original)
+      canonical = File.realpath(path)
+      real_stat = File.method(:stat)
+      injected = false
+      faulty_stat = lambda do |candidate|
+        if !injected && candidate.to_s == canonical && File.binread(path) != original.b
+          injected = true
+          raise IOError, "injected after the safe-update swap"
+        end
+        real_stat.call(candidate)
+      end
+
+      result = File.stub(:stat, faulty_stat) do
+        ClashPatch.safe_update_all(
+          targets: [{ name: "friend", path: path, url: "https://fixture.invalid/friend" }],
+          policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 1,
+          fetcher: ->(_target) { YAML.dump(base_config.merge("subscription-marker" => "new")) },
+          validator: ->(_path) { true },
+          activation: ->(_items) { flunk "failed transaction must not activate" }
+        )
+      end
+
+      assert injected
+      refute_equal :updated, result.fetch(:status)
+      assert File.binread(path) == original.b, "failed safe update left committed bytes"
+    end
+  end
+
+  def test_production_probe_normal_batch_rejects_duplicate_file_aliases
+    require_production_probe!
+    Dir.mktmpdir do |directory|
+      profiles = File.join(directory, "profiles")
+      FileUtils.mkdir_p(profiles)
+      target = File.join(directory, "real.yaml")
+      original = YAML.dump(base_config)
+      File.write(target, original)
+      aliases = %w[a-alias.yaml z-active.yaml].map do |name|
+        path = File.join(profiles, name)
+        File.symlink(target, path)
+        path
+      end
+      activations = []
+
+      results = ClashPatch.stub(
+        :activate_updated_profile,
+        lambda { |result, **_options|
+          activations << result
+          result.merge(reloaded: true)
+        }
+      ) do
+        ClashPatch.run(
+          directory: profiles, active_directory: profiles, policy_path: POLICY_PATH,
+          backup_root: File.join(directory, "backups"), selected_name: "z-active",
+          validator: ->(_path) { true }, auto_reload: true, usage_profile: 1
+        )
+      end
+
+      safely_rejected = !results.all? do |result|
+        %i[updated unchanged].include?(result.fetch(:status))
+      end
+      violations = []
+      violations << "accepted duplicate aliases" unless safely_rejected
+      violations << "changed the shared target" unless File.binread(target) == original.b
+      violations << "activated a duplicate target" unless activations.empty?
+      assert_empty violations, violations.join("; ")
+      aliases.each { |path| assert File.symlink?(path), path }
+    end
+  end
+
+  def test_production_probe_next_run_recovers_batch_killed_after_first_commit
+    require_production_probe!
+    Dir.mktmpdir do |directory|
+      paths = %w[a-first.yaml z-second.yaml].map do |name|
+        path = File.join(directory, name)
+        File.write(path, YAML.dump(base_config.merge("subscription-marker" => name)))
+        path
+      end
+      originals = paths.to_h { |path| [path, File.binread(path)] }
+      ready_reader, ready_writer = IO.pipe
+      gate_reader, gate_writer = IO.pipe
+      child_id = nil
+      begin
+        child_id = fork do
+          ready_reader.close
+          gate_writer.close
+          real_replace = ClashPatch.method(:atomic_replace_locked)
+          commits = 0
+          gated_replace = lambda do |*arguments|
+            result = real_replace.call(*arguments)
+            commits += 1 if result
+            if result && commits == 1
+              ready_writer.write(".")
+              ready_writer.flush
+              gate_reader.read(1)
+            end
+            result
+          end
+          ClashPatch.stub(:atomic_replace_locked, gated_replace) do
+            ClashPatch.run(
+              directory: directory, policy_path: POLICY_PATH,
+              backup_root: File.join(directory, "backups"), selected_name: "none",
+              validator: ->(_path) { true }, auto_reload: false, usage_profile: 1
+            )
+          end
+          exit! 0
+        end
+        ready_writer.close
+        gate_reader.close
+        assert IO.select([ready_reader], nil, nil, 10), "child never reached the first durable commit"
+        ready_reader.read(1)
+        Process.kill("KILL", child_id)
+        _waited_id, status = Process.wait2(child_id)
+        child_id = nil
+        assert_equal 9, status.termsig
+
+        ClashPatch.run(
+          directory: directory, policy_path: POLICY_PATH, dry_run: true,
+          backup_root: File.join(directory, "backups"), selected_name: "none",
+          validator: ->(_path) { true }, auto_reload: false, usage_profile: 1
+        )
+        originals.each do |path, bytes|
+          assert File.binread(path) == bytes, "next run did not recover #{File.basename(path)}"
+        end
+      ensure
+        gate_writer.write(".") rescue nil
+        Process.kill("KILL", child_id) rescue nil
+        Process.waitpid(child_id) rescue nil
+        [ready_reader, ready_writer, gate_reader, gate_writer].each { |io| io.close rescue nil }
+      end
+    end
+  end
+
+  def test_production_probe_next_safe_update_recovers_batch_killed_after_first_swap
+    require_production_probe!
+    Dir.mktmpdir do |directory|
+      paths = %w[a-first z-second].map do |name|
+        path = File.join(directory, "#{name}.yaml")
+        File.write(path, YAML.dump(base_config.merge("subscription-marker" => "old-#{name}")))
+        path
+      end
+      targets = paths.map do |path|
+        name = File.basename(path, ".yaml")
+        { name: name, path: path, url: "https://fixture.invalid/#{name}" }
+      end
+      originals = paths.to_h { |path| [path, File.binread(path)] }
+      ready_reader, ready_writer = IO.pipe
+      gate_reader, gate_writer = IO.pipe
+      child_id = nil
+      begin
+        child_id = fork do
+          ready_reader.close
+          gate_writer.close
+          real_swap = ClashPatch.method(:atomic_swap_paths)
+          swaps = 0
+          gated_swap = lambda do |*arguments|
+            result = real_swap.call(*arguments)
+            swaps += 1
+            if swaps == 1
+              ready_writer.write(".")
+              ready_writer.flush
+              gate_reader.read(1)
+            end
+            result
+          end
+          ClashPatch.stub(:atomic_swap_paths, gated_swap) do
+            ClashPatch.safe_update_all(
+              targets: targets, policy: @policy,
+              backup_root: File.join(directory, "backups"), usage_profile: 1,
+              fetcher: lambda { |target|
+                YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}"))
+              },
+              validator: ->(_path) { true }, activation: ->(_items) { true }
+            )
+          end
+          exit! 0
+        end
+        ready_writer.close
+        gate_reader.close
+        assert IO.select([ready_reader], nil, nil, 10), "child never reached the first safe-update swap"
+        ready_reader.read(1)
+        Process.kill("KILL", child_id)
+        Process.waitpid(child_id)
+        child_id = nil
+
+        ClashPatch.safe_update_all(
+          targets: targets, policy: @policy,
+          backup_root: File.join(directory, "backups"), usage_profile: 1,
+          fetcher: ->(_target) { raise IOError, "injected preflight failure" },
+          validator: ->(_path) { true }, activation: ->(_items) { true }
+        )
+        originals.each do |path, bytes|
+          assert File.binread(path) == bytes, "next safe-update entry did not recover #{File.basename(path)}"
+        end
+      ensure
+        gate_writer.write(".") rescue nil
+        Process.kill("KILL", child_id) rescue nil
+        Process.waitpid(child_id) rescue nil
+        [ready_reader, ready_writer, gate_reader, gate_writer].each { |io| io.close rescue nil }
+      end
+    end
+  end
+
+  def test_production_probe_mihomo_does_not_survive_a_killed_validator
+    require_production_probe!
+    Dir.mktmpdir do |directory|
+      listener = TCPServer.new("127.0.0.1", 0)
+      port = listener.local_address.ip_port
+      core = File.join(directory, "mihomo")
+      File.write(core, <<~RUBY)
+        #!#{RbConfig.ruby}
+        require "socket"
+        socket = TCPSocket.new("127.0.0.1", ENV.fetch("CLASH_PATCH_READY_PORT").to_i)
+        socket.puts(Process.pid)
+        socket.close
+        sleep 60
+      RUBY
+      File.chmod(0o700, core)
+      worker_id = nil
+      core_id = nil
+      connection = nil
+      core_alive = nil
+      leftovers = nil
+      begin
+        worker_id = fork do
+          ENV["CLASH_PATCH_READY_PORT"] = port.to_s
+          ENV["TMPDIR"] = directory
+          ClashPatch.mihomo_core_status(core, timeout_seconds: 30)
+          exit! 0
+        end
+        assert IO.select([listener], nil, nil, 10), "fake Mihomo never started"
+        connection = listener.accept
+        core_id = Integer(connection.gets)
+        Process.kill("KILL", worker_id)
+        Process.waitpid(worker_id)
+        worker_id = nil
+
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
+        loop do
+          core_alive = begin
+            Process.kill(0, core_id)
+            true
+          rescue Errno::ESRCH
+            false
+          end
+          leftovers = Dir.glob(File.join(directory, "clash-patch-command*"))
+          break if !core_alive && leftovers.empty?
+          break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+          sleep 0.02
+        end
+      ensure
+        Process.kill("KILL", worker_id) rescue nil
+        Process.waitpid(worker_id) rescue nil
+        Process.kill("KILL", -core_id) rescue nil
+        Process.kill("KILL", core_id) rescue nil
+        connection&.close rescue nil
+        listener.close rescue nil
+        Dir.glob(File.join(directory, "clash-patch-command*")).each { |path| FileUtils.rm_f(path) }
+      end
+
+      violations = []
+      violations << "Mihomo child survived" if core_alive
+      violations << "command output tempfile remained" unless leftovers.empty?
+      assert_empty violations, violations.join("; ")
+    end
   end
 
   def test_patcher_files_exist
@@ -108,6 +423,15 @@ class MacosPatcherTest < Minitest::Test
     assert_equal 3, result.fetch("profile")
     assert_equal ["done"], result.fetch("messages")
     assert_equal ["check"], result.fetch("warnings")
+
+    output, error = capture_io do
+      assert_equal 0, ClashPatchResult.cli(%w[
+        --command patch --operation test --ok true --status ok --code completed
+        --exit-code 0 --summary 完成 --profile 4
+      ])
+    end
+    assert_empty error
+    assert_nil JSON.parse(output).fetch("profile")
 
     output, error = capture_io do
       assert_equal 64, ClashPatchResult.cli(%w[--command unknown])
@@ -2995,6 +3319,44 @@ class MacosPatcherTest < Minitest::Test
     refute ClashPatch.mihomo_version_supported?("Mihomo Meta v1.19.26")
     refute ClashPatch.mihomo_version_supported?("unknown")
     refute ClashPatch.validate_with_mihomo("/tmp/missing.yaml", core_path: nil)
+  end
+
+  def test_mihomo_default_core_is_resolved_before_status_and_validation
+    discovered_core = "/tmp/discovered-mihomo"
+    status_calls = []
+    validation_calls = []
+    success = Struct.new(:success?).new(true)
+
+    ClashPatch.stub(:mihomo_core_path, discovered_core) do
+      File.stub(:file?, ->(path) { path == discovered_core }) do
+        File.stub(:executable?, ->(path) { path == discovered_core }) do
+          ClashPatch.stub(:run_process_with_timeout, lambda { |core, *arguments, **_keywords|
+            status_calls << [core, arguments]
+            ["Mihomo Meta v1.19.27", success, false]
+          }) do
+            assert_equal :supported, ClashPatch.mihomo_core_status
+          end
+        end
+      end
+
+      ClashPatch.stub(:mihomo_core_status, lambda { |core, **_keywords|
+        validation_calls << [:status, core]
+        :supported
+      }) do
+        ClashPatch.stub(:run_process_with_timeout, lambda { |core, *arguments, **_keywords|
+          validation_calls << [:validate, core, arguments]
+          ["", success, false]
+        }) do
+          assert ClashPatch.validate_with_mihomo("/tmp/profile/config.yaml")
+        end
+      end
+    end
+
+    assert_equal [[discovered_core, ["-v"]]], status_calls
+    assert_equal [
+      [:status, discovered_core],
+      [:validate, discovered_core, ["-d", "/tmp/profile", "-t", "-f", "/tmp/profile/config.yaml"]]
+    ], validation_calls
   end
 
   def test_mihomo_validation_times_out_and_terminates_the_child

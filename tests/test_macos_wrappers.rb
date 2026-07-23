@@ -27,6 +27,11 @@ class MacosWrapperTest < Minitest::Test
     [stdout, stderr, status, state]
   end
 
+  def require_production_probe!
+    skip "set CLASH_PATCH_RUN_PRODUCTION_PROBES=1 to run known production-failure probes" unless
+      ENV["CLASH_PATCH_RUN_PRODUCTION_PROBES"] == "1"
+  end
+
   def with_supported_app(home)
     FileUtils.mkdir_p(File.join(home, "Applications", "ClashX Meta.app"))
     yield
@@ -104,6 +109,79 @@ class MacosWrapperTest < Minitest::Test
     assert_equal status.exitstatus, result.fetch("exit_code")
     assert_equal stdout.bytes, stdout.encode("UTF-8").bytes
     result
+  end
+
+  def test_production_probe_uninstall_preserves_a_file_replaced_after_staging
+    require_production_probe!
+    with_uninstaller_package(patcher_source: "exit 0\n") do |uninstaller|
+      Dir.mktmpdir do |home|
+        install_dir = File.join(home, "Library", "Application Support", "ClashPatch")
+        FileUtils.mkdir_p(install_dir)
+        installed_patcher = File.join(install_dir, "patch_profiles.rb")
+        state = File.join(home, "usage-profile.plist")
+        File.binwrite(installed_patcher, "owned-patcher")
+        File.binwrite(state, "owned-state")
+        ready = File.join(home, "uninstall-ready")
+        continue_path = File.join(home, "uninstall-continue")
+        anchor = "  /usr/bin/touch \"$UNINSTALL_STAGING/READY\"\n"
+        source = File.binread(uninstaller)
+        assert_equal 1, source.scan(anchor).length
+        instrumented = anchor + <<~'SH'
+          /usr/bin/touch "$CLASH_PATCH_TEST_READY"
+          while [ ! -e "$CLASH_PATCH_TEST_CONTINUE" ]; do
+            /bin/sleep 0.01
+          done
+        SH
+        File.binwrite(uninstaller, source.sub(anchor, instrumented))
+        env = {
+          "HOME" => home,
+          "CLASH_PATCH_USAGE_STATE_PATH" => state,
+          "CLASH_PATCH_USAGE_PROFILE" => nil,
+          "CLASH_PATCH_PROFILE_DIR" => nil,
+          "CLASH_PATCH_TEST_READY" => ready,
+          "CLASH_PATCH_TEST_CONTINUE" => continue_path
+        }
+        stdout = +""
+        stderr = +""
+        process_thread = nil
+        readers = []
+        status = nil
+        begin
+          Open3.popen3(env, "/bin/sh", uninstaller, "--json") do |stdin, out, error, thread|
+            process_thread = thread
+            stdin.close
+            readers << Thread.new { stdout << out.read }
+            readers << Thread.new { stderr << error.read }
+            deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+            until File.exist?(ready)
+              raise "uninstaller never reached the staging gate" if
+                Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+              sleep 0.01
+            end
+            replacement = "#{state}.replacement"
+            File.binwrite(replacement, "concurrent-new")
+            File.rename(replacement, state)
+            File.binwrite(continue_path, "continue")
+            raise "uninstaller did not exit after the staging gate" unless thread.join(10)
+            status = thread.value
+          end
+        ensure
+          File.binwrite(continue_path, "continue") rescue nil
+          if process_thread&.alive?
+            Process.kill("KILL", process_thread.pid) rescue nil
+            process_thread.join
+          end
+          readers.each(&:join)
+        end
+
+        replacement_preserved = File.file?(state) && File.binread(state) == "concurrent-new"
+        violations = []
+        violations << "deleted the replacement" unless replacement_preserved
+        violations << "reported success" if status.success?
+        violations << "omitted a conflict message" unless (stdout + stderr).match?(/conflict|concurrent|并发|替换/)
+        assert_empty violations, violations.join("; ")
+      end
+    end
   end
 
   def test_installer_json_mode_returns_one_contract_object_for_help_and_errors

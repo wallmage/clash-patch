@@ -274,6 +274,27 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_release_public_install_dry_run_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_macos.sh",
+        "      --profile-dir \"$CUSTOM_PROFILE_DIR\" \\\n" \
+          "      --policy \"$POLICY_SOURCE\" \\\n" \
+          "      --backup-dir \"$BACKUP_DIR\" --usage-profile \"$USAGE_PROFILE\" --json 2>/dev/null",
+        "      --profile-dir \"$CUSTOM_PROFILE_DIR\" \\\n" \
+          "      --policy \"$POLICY_SOURCE\" \\\n" \
+          "      --backup-dir \"$BACKUP_DIR\" --usage-profile \"$USAGE_PROFILE\" --dry-run --json 2>/dev/null"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_release_archive_is_self_contained_and_runs_from_a_unicode_space_path"
+      )
+    end
+  end
+
   def test_normal_batch_preflight_mutation_is_killed
     with_repo_copy do |root|
       replace_once(
@@ -323,6 +344,76 @@ class MutationSafetyTest < Minitest::Test
         root,
         RbConfig.ruby, "tests/test_macos_patcher.rb",
         "--name", "test_disables_subscription_auto_update_through_defaults_and_verifies_it"
+      )
+    end
+  end
+
+  def test_result_contract_profile_boundary_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/result_contract.rb",
+        'value.match?(/\A[1-3]\z/) ? value.to_i : nil',
+        'value.match?(/\A[1-4]\z/) ? value.to_i : nil'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_result_contract_cli_emits_valid_json_and_rejects_bad_arguments"
+      )
+    end
+  end
+
+  def test_default_mihomo_resolution_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/mihomo.rb",
+        "  def validate_with_mihomo(path, core_path: AUTO_CORE, timeout_seconds: VALIDATION_TIMEOUT_SECONDS)\n" \
+          "    core = core_path.equal?(AUTO_CORE) ? mihomo_core_path : core_path\n",
+        "  def validate_with_mihomo(path, core_path: AUTO_CORE, timeout_seconds: VALIDATION_TIMEOUT_SECONDS)\n" \
+          "    core = core_path\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_mihomo_default_core_is_resolved_before_status_and_validation"
+      )
+    end
+  end
+
+  def test_windows_deferred_probe_failure_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "tests/test_windows_installer.ps1",
+        '        throw ("deferred production probes failed:',
+        '        Write-Host ("deferred production probes failed:'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_windows_runtime_tests_use_powershell_ast_for_automatic_variable_writes"
+      )
+    end
+  end
+
+  def test_macos_production_probe_ci_gate_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        ".github/workflows/test.yml",
+        '          CLASH_PATCH_RUN_PRODUCTION_PROBES: "1"',
+        '          CLASH_PATCH_RUN_PRODUCTION_PROBES: "0"'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_ci_covers_production_runtimes_and_pins_actions"
       )
     end
   end

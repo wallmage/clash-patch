@@ -6,7 +6,9 @@
     [string]$ExpectedPSEdition,
     [Parameter(Mandatory = $true)]
     [ValidateSet(5, 7)]
-    [int]$ExpectedPSMajor
+    [int]$ExpectedPSMajor,
+    [string[]]$RealMihomoPaths = @(),
+    [switch]$RealMihomoOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -350,8 +352,12 @@ function Assert-JsonResult([object]$Invocation, [string]$Command, [int]$ExitCode
     Assert-True ($result.command -eq $Command) "JSON result command mismatch"
     Assert-True ($result.platform -eq "windows") "JSON result platform mismatch"
     Assert-True ($result.client -eq "clash-verge-rev") "JSON result client mismatch"
-    Assert-True ([int]$result.exit_code -eq $ExitCode) "JSON result exit_code disagrees with process exit"
-    Assert-True ($Invocation.ExitCode -eq $ExitCode) "process exit mismatch"
+    Assert-True ([int]$result.exit_code -eq $ExitCode) (
+        "JSON result exit_code mismatch for ${Command}: expected $ExitCode, JSON reported $($result.exit_code), process exited $($Invocation.ExitCode)"
+    )
+    Assert-True ($Invocation.ExitCode -eq $ExitCode) (
+        "process exit mismatch for ${Command}: expected $ExitCode, process exited $($Invocation.ExitCode), JSON reported $($result.exit_code)"
+    )
     Assert-True ($text -notmatch '(?i)https?://|Bearer\s+|password\s*[:=]|secret\s*[:=]') "JSON result leaked a secret or URL"
     return $result
 }
@@ -419,12 +425,109 @@ try {
             $identityMutatingCoreText,
             [System.Text.Encoding]::ASCII
         )
-        $candidateHangingCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nping 127.0.0.1 -n 6 >nul`r`nexit /b 0`r`n"
+        $candidateHangingCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nping 127.0.0.1 -n 3 >nul`r`nexit /b 0`r`n"
         [System.IO.File]::WriteAllText(
             $candidateHangingCore,
             $candidateHangingCoreText,
             [System.Text.Encoding]::ASCII
         )
+
+        if ($RealMihomoOnly) {
+            Assert-True ($RealMihomoPaths.Count -gt 0) "real Mihomo mode requires at least one core"
+            foreach ($realMihomoPath in $RealMihomoPaths) {
+                Assert-True (Test-Path -LiteralPath $realMihomoPath -PathType Leaf) "real Mihomo path is missing"
+                Assert-True (Test-MihomoVersion $realMihomoPath) "real Mihomo version gate failed"
+                foreach ($realUsageProfile in @(1, 2, 3)) {
+                    $realCase = Join-Path $sandbox (
+                        "real-mihomo-" + $realUsageProfile + "-" + [Guid]::NewGuid().ToString("N")
+                    )
+                    $realProfiles = Join-Path $realCase "profiles"
+                    New-Item -ItemType Directory -Path $realProfiles -Force | Out-Null
+                    [System.IO.File]::WriteAllText(
+                        (Join-Path $realCase "config.yaml"),
+                        "mixed-port: 7890`nmode: rule`nipv6: true`ntun:`n  enable: false`nproxies: []`nproxy-groups:`n  - name: Main`n    type: select`n    proxies:`n      - DIRECT`nrules:`n  - MATCH,Main`n"
+                    )
+                    [System.IO.File]::WriteAllText(
+                        (Join-Path $realCase "verge.yaml"),
+                        "enable_tun_mode: false`n"
+                    )
+                    [System.IO.File]::WriteAllText(
+                        (Join-Path $realCase "profiles.yaml"),
+                        "items:`n- uid: R-real`n  type: remote`n  option:`n    allow_auto_update: true`n"
+                    )
+                    $realInstall = Invoke-TestPowerShell $installer @(
+                        "-AppHome", $realCase,
+                        "-UsageProfile", $realUsageProfile.ToString(),
+                        "-MihomoPath", $realMihomoPath,
+                        "-Json"
+                    )
+                    $realInstallJson = Assert-JsonResult $realInstall "install" 0
+                    Assert-True $realInstallJson.ok "real Mihomo public install did not succeed"
+                    $realValidation = Invoke-Mihomo $realMihomoPath @(
+                        "-d", $realCase,
+                        "-t",
+                        "-f", (Join-Path $realCase "config.yaml")
+                    )
+                    Assert-True ($realValidation.ExitCode -eq 0) "real Mihomo rejected an installed profile"
+                }
+            }
+            Write-Host "Windows real Mihomo public-entry cases passed"
+            return
+        }
+
+        $invalidTransactionJournals = @(
+            '{"Version":"1","Actions":[{"Action":"write","Path":"target.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3"}]}',
+            '{"Version":1,"Actions":[]}',
+            '{"Version":1,"Actions":[{"Action":"rename","Path":"target.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3"}]}',
+            '{"Version":1,"Extra":true,"Actions":[{"Action":"write","Path":"target.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3"}]}',
+            '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3","Extra":true}]}',
+            '{"Version":1,"Actions":[{"Action":"write","Path":"C:\\target.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3"}]}',
+            '{"Version":1,"Actions":[{"Action":"write","Path":"..\\target.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3"}]}',
+            '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt","Existed":true,"OriginalBase64":"not-base64","ReplacementBase64":"bmV3"}]}',
+            '{"Version":1,"Actions":[{"Action":"delete","Path":"target.txt","Existed":false,"OriginalBase64":"","ReplacementBase64":""}]}',
+            '{"Version":1,"Actions":[{"Action":"delete","Path":"target.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3"}]}',
+            '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt","Existed":false,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3"}]}',
+            '{"Version":1,"Actions":[{"Action":"write","Path":"target.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3"},{"Action":"delete","Path":"TARGET.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":""}]}'
+        )
+        foreach ($invalidTransactionJournalText in $invalidTransactionJournals) {
+            $invalidTransactionJournal = $invalidTransactionJournalText | ConvertFrom-Json
+            $invalidTransactionJournalRejected = $false
+            try {
+                Get-ValidatedFileTransactionJournal $invalidTransactionJournal | Out-Null
+            } catch {
+                $invalidTransactionJournalRejected = $true
+            }
+            Assert-True $invalidTransactionJournalRejected "transaction journal validator accepted a malformed state"
+        }
+
+        Invoke-DeferredProbe "duplicate transaction action field" {
+            $duplicateJournalHome = Join-Path $sandbox "duplicate-transaction-field"
+            New-Item -ItemType Directory -Path $duplicateJournalHome -Force | Out-Null
+            $duplicateJournalTarget = Join-Path $duplicateJournalHome "target.txt"
+            [System.IO.File]::WriteAllText($duplicateJournalTarget, "old")
+            $duplicateJournalLock = Enter-AppHomeMutationLock $duplicateJournalHome
+            try {
+                $duplicateJournalPath = Join-Path $duplicateJournalHome ".clash-patch-transaction.json"
+                $duplicateJournalText = '{"Version":1,"Actions":[{"Action":"delete","Action":"write","Path":"target.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3"}]}'
+                [System.IO.File]::WriteAllText(
+                    $duplicateJournalPath,
+                    $duplicateJournalText,
+                    (New-Object System.Text.UTF8Encoding($false))
+                )
+                $duplicateJournalRejected = $false
+                try {
+                    Repair-InterruptedFileTransaction
+                } catch {
+                    $duplicateJournalRejected = $true
+                }
+                $duplicateJournalSafe = $duplicateJournalRejected -and
+                    (Test-Path -LiteralPath $duplicateJournalPath -PathType Leaf) -and
+                    (Get-Content -LiteralPath $duplicateJournalTarget -Raw) -eq "old"
+                Assert-True $duplicateJournalSafe "transaction recovery accepted a duplicate action field"
+            } finally {
+                Exit-AppHomeMutationLock $duplicateJournalLock
+            }
+        }
     }
     if ($onWindows) {
         $hangingCoreText = "@echo off`r`nping 127.0.0.1 -n 6 >nul`r`nexit /b 0`r`n"
@@ -530,10 +633,12 @@ try {
             Assert-True $renameBlocked "AppHome could be renamed while its mutation lock was held"
             Assert-True (-not (Test-Path -LiteralPath $renamedMutexCase)) "AppHome rename created a second mutation-lock identity"
 
-            $mutexUninstall = Invoke-TestPowerShell $uninstaller @("-AppHome", $mutexCase, "-Json")
-            $mutexUninstallJson = Assert-JsonResult $mutexUninstall "uninstall" 1
-            Assert-True ($mutexUninstallJson.code -eq "operation_in_progress") "parallel uninstall did not share the installer AppHome lock"
-            Assert-True ((Get-TreeContentSnapshot $mutexCase) -ceq $mutexBefore) "rejected parallel uninstall changed AppHome"
+            Invoke-DeferredProbe "installer and uninstaller shared AppHome lock" {
+                $mutexUninstall = Invoke-TestPowerShell $uninstaller @("-AppHome", $mutexCase, "-Json")
+                $mutexUninstallJson = Assert-JsonResult $mutexUninstall "uninstall" 1
+                Assert-True ($mutexUninstallJson.code -eq "operation_in_progress") "parallel uninstall did not share the installer AppHome lock"
+                Assert-True ((Get-TreeContentSnapshot $mutexCase) -ceq $mutexBefore) "rejected parallel uninstall changed AppHome"
+            }
         } finally {
             [System.IO.File]::WriteAllText($mutexReleasePath, "release")
             if (-not $mutexHolder.WaitForExit(5000)) {
@@ -1434,9 +1539,14 @@ $child.WaitForExit()
             }
             $treeChildAlive = $false
             if ($treeChildId -gt 0) {
-                $treeChildAlive = $null -ne (Get-Process -Id $treeChildId -ErrorAction SilentlyContinue)
+                $treeChildProcess = Get-Process -Id $treeChildId -ErrorAction SilentlyContinue
+                $treeChildAlive = $null -ne $treeChildProcess
                 if ($treeChildAlive) {
-                    Stop-Process -Id $treeChildId -Force -ErrorAction SilentlyContinue
+                    Stop-Process -Id $treeChildId -Force
+                    [void]$treeChildProcess.WaitForExit(5000)
+                    Assert-True (
+                        $null -eq (Get-Process -Id $treeChildId -ErrorAction SilentlyContinue)
+                    ) "process-tree fixture could not clean up its descendant"
                 }
             }
             Assert-True $treeTimeoutRaised "process-tree fixture did not reach the Mihomo timeout"
@@ -1484,6 +1594,7 @@ Test-MihomoCandidate $CorePath "proxies:`n  - name: fixture-private-marker" $Dir
                 Stop-Process -Id $candidateChild.Id -Force
                 $candidateChild.WaitForExit()
             }
+            Start-Sleep -Seconds 3
             $candidateFiles = @(Get-ChildItem -LiteralPath $candidateDirectory -Filter ".clash-patch-validate-*.yaml" -File)
             $candidateLeftBehind = $candidateFiles.Count -gt 0
             foreach ($candidateFile in $candidateFiles) {

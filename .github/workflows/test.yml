@@ -66,6 +66,27 @@ jobs:
             git show --check --format= HEAD
           fi
 
+  macos-production-probes:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ruby/setup-ruby@003a5c4d8d6321bd302e38f6f0ec593f77f06600 # v1.319.0
+        with:
+          ruby-version: "3.3"
+      - name: Fault-inject production commit, kill, alias, process, and uninstall boundaries
+        env:
+          CLASH_PATCH_RUN_PRODUCTION_PROBES: "1"
+        run: |
+          set +e
+          ruby tests/test_macos_patcher.rb --name /production_probe/
+          patcher_status=$?
+          ruby tests/test_macos_wrappers.rb --name /production_probe/
+          wrapper_status=$?
+          if [ "$patcher_status" -ne 0 ] || [ "$wrapper_status" -ne 0 ]; then
+            exit 1
+          fi
+
   mihomo:
     strategy:
       fail-fast: false
@@ -118,7 +139,7 @@ jobs:
           CLASH_PATCH_REQUIRE_REAL_MIHOMO: "1"
         run: CLASH_PATCH_TEST_MIHOMO="$MIHOMO_CURRENT_PATH" ruby tests/test_macos_patcher.rb --name test_generated_profile_passes_installed_mihomo_validation
 
-  windows-installer:
+  windows-installer-powershell-5:
     runs-on: windows-2022
     timeout-minutes: 20
     steps:
@@ -129,6 +150,56 @@ jobs:
       - name: PowerShell 5.1 installer, uninstaller, and route regressions
         shell: powershell
         run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command powershell.exe).Source -ExpectedPSEdition Desktop -ExpectedPSMajor 5
+
+  windows-installer-powershell-7:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
       - name: PowerShell 7 installer, uninstaller, and route regressions
         shell: pwsh
         run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command pwsh.exe).Source -ExpectedPSEdition Core -ExpectedPSMajor 7
+
+  windows-mihomo:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - version: v1.19.27
+            sha256: "34b4c5bc0c176eebd298f6624aa23ea41985a2c54efb04eb0e9c4542e45190ee"
+          - version: v1.19.29
+            sha256: "1a8520cfe425441eba3eba8623b27b985020031243fe1ecaa1af2b92358a03f9"
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Download and verify official Windows Mihomo
+        shell: pwsh
+        env:
+          MIHOMO_VERSION: ${{ matrix.version }}
+          MIHOMO_SHA256: ${{ matrix.sha256 }}
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "mihomo-windows-amd64.zip"
+          curl.exe --fail --location --retry 3 --connect-timeout 15 --max-time 300 `
+            --output $archive `
+            "https://github.com/MetaCubeX/mihomo/releases/download/$env:MIHOMO_VERSION/mihomo-windows-amd64-$env:MIHOMO_VERSION.zip"
+          if ($LASTEXITCODE -ne 0) { throw "Mihomo download failed" }
+          $actual = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -cne $env:MIHOMO_SHA256) { throw "Mihomo checksum mismatch" }
+          $destination = Join-Path $env:RUNNER_TEMP "mihomo-windows-amd64"
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $core = @(Get-ChildItem -LiteralPath $destination -Filter "mihomo*.exe" -File -Recurse)
+          if ($core.Count -ne 1) { throw "Mihomo archive did not contain exactly one executable" }
+          "MIHOMO_WINDOWS_PATH=$($core[0].FullName)" >> $env:GITHUB_ENV
+      - name: Validate all Windows profiles through the public installer
+        shell: pwsh
+        run: |
+          ./tests/test_windows_installer.ps1 `
+            -PowerShellPath (Get-Command pwsh.exe).Source `
+            -ExpectedPSEdition Core `
+            -ExpectedPSMajor 7 `
+            -RealMihomoPaths @($env:MIHOMO_WINDOWS_PATH) `
+            -RealMihomoOnly

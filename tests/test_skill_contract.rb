@@ -145,6 +145,41 @@ class SkillContractTest < Minitest::Test
         "--usage-profile", "1", "--dry-run"
       )
       assert status.success?, "extracted release could not patch a profile from a Unicode path"
+
+      if RUBY_PLATFORM.include?("darwin")
+        release_home = File.join(directory, "安装 用户")
+        fake_core = File.join(
+          release_home, "Applications", "ClashX Meta.app", "Contents", "Resources",
+          "com.metacubex.ClashX.ProxyConfigHelper.meta"
+        )
+        FileUtils.mkdir_p(File.dirname(fake_core))
+        File.write(fake_core, <<~SH)
+          #!/bin/sh
+          if [ "${1:-}" = "-v" ]; then
+            printf '%s\n' 'Mihomo Meta v1.19.27 release-test'
+          fi
+          exit 0
+        SH
+        FileUtils.chmod(0o700, fake_core)
+        release_env = {
+          "HOME" => release_home,
+          "CLASH_PATCH_PROFILE_DIR" => profile_directory,
+          "CLASH_PATCH_USAGE_STATE_PATH" => File.join(release_home, "usage-profile.plist"),
+          "CLASH_PATCH_USAGE_PROFILE" => nil
+        }
+        output, error, status = Open3.capture3(
+          release_env, "sh", install_macos, "--profile", "1", "--json"
+        )
+        assert status.success?, "extracted public installer failed: #{error}"
+        assert_empty error
+        result = JSON.parse(output)
+        assert_equal status.exitstatus, result.fetch("exit_code")
+        assert_equal "install", result.fetch("command")
+        assert result.fetch("ok")
+        assert File.file?(release_env.fetch("CLASH_PATCH_USAGE_STATE_PATH"))
+        patched_profile = YAML.safe_load(File.read(File.join(profile_directory, "friend.yaml")))
+        assert patched_profile.fetch("rule-providers").key?("clash-patch-cn-domain")
+      end
     end
   end
 
@@ -1085,17 +1120,27 @@ class SkillContractTest < Minitest::Test
     assert_includes workflow, "--test-coverage-lines=100"
     assert_includes workflow, "--test-coverage-functions=100"
     assert_includes workflow, "--test-coverage-branches=80"
+    assert_includes workflow, 'CLASH_PATCH_RUN_PRODUCTION_PROBES: "1"'
+    assert_includes workflow, "ruby tests/test_macos_patcher.rb --name /production_probe/"
+    assert_includes workflow, "ruby tests/test_macos_wrappers.rb --name /production_probe/"
+    assert_includes workflow, "34b4c5bc0c176eebd298f6624aa23ea41985a2c54efb04eb0e9c4542e45190ee"
+    assert_includes workflow, "1a8520cfe425441eba3eba8623b27b985020031243fe1ecaa1af2b92358a03f9"
+    assert_includes workflow, "mihomo-windows-amd64-$env:MIHOMO_VERSION.zip"
+    assert_includes workflow, "-RealMihomoOnly"
+    assert_includes workflow, "--connect-timeout 15 --max-time 300"
     assert_includes workflow, "shell: powershell"
     assert_includes workflow, "Get-Command powershell.exe"
     assert_includes workflow, "-ExpectedPSEdition Desktop -ExpectedPSMajor 5"
+    assert_match(/^  windows-installer-powershell-5:$/, workflow)
     assert_includes workflow, "shell: pwsh"
     assert_includes workflow, "Get-Command pwsh.exe"
     assert_includes workflow, "-ExpectedPSEdition Core -ExpectedPSMajor 7"
+    assert_match(/^  windows-installer-powershell-7:$/, workflow)
     assert_includes workflow, "git diff --check"
     assert_includes workflow, "fetch-depth: 0"
     assert_includes workflow, "github.event.before"
     assert_includes workflow, "github.event.pull_request.base.sha"
-    assert_equal 3, workflow.scan(/timeout-minutes:\s*20/).length
+    assert_equal 6, workflow.scan(/timeout-minutes:\s*20/).length
   end
 
   def test_ruby_coverage_requires_the_entire_transform_module_at_one_hundred_percent
@@ -1126,7 +1171,10 @@ class SkillContractTest < Minitest::Test
     assert_includes source, "CommandAst"
     assert_includes source, "Set-Variable"
     assert_includes source, "Invoke-DeferredProbe"
-    assert_includes source, "deferred production probes failed"
+    assert_match(
+      /if \(\$script:deferredProbeFailures\.Count -gt 0\) \{\s*throw \("deferred production probes failed:/,
+      source
+    )
     assert_includes source, "Compress-Archive"
     assert_includes source, "Expand-Archive"
     assert_includes source, "incomplete release changed AppHome"
