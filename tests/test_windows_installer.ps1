@@ -438,7 +438,7 @@ function Invoke-Installer([string]$AppHome) {
             $failure = $result.Output.Trim() | ConvertFrom-Json
             $detail = "code=$($failure.code) summary=$($failure.summary_zh)"
         } catch {}
-        throw "Windows installer returned $($result.ExitCode); $detail"
+        throw "Windows installer failed for $(Split-Path -Leaf $AppHome): exit=$($result.ExitCode); $detail"
     }
 }
 
