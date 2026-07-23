@@ -1097,7 +1097,11 @@ function Repair-InterruptedFileTransaction {
     Remove-FileTransactionJournal $snapshot.Bytes
 }
 
-function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$DeleteTargets) {
+function Invoke-VerifiedPathTransaction(
+    [object[]]$WriteTargets,
+    [object[]]$DeleteTargets,
+    [scriptblock]$PreCommitCondition = $null
+) {
     $writePathKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
     $actions = @()
     foreach ($writeTarget in @($WriteTargets)) {
@@ -1138,6 +1142,8 @@ function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$Dele
     $journalBytes = $null
     $preparationBytes = $null
     $operationFailure = $null
+    $preCommitRejected = $false
+    $mutationStarted = $false
     $recoveryFailures = @()
     try {
         foreach ($action in @($actions | Sort-Object Path)) {
@@ -1204,27 +1210,38 @@ function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$Dele
             }
         }
 
-        $journalBytes = Write-FileTransactionJournal $opened
-        if ($null -ne $preparationBytes) {
-            Remove-FileTransactionPreparation $preparationBytes
-        }
-        foreach ($entry in @($opened | Where-Object { $_.Action -eq "write" })) {
-            Write-LockedStreamBytes $entry.Stream $entry.Target.Bytes $entry.Original
-        }
-        foreach ($entry in @($opened | Where-Object { $_.Action -eq "write" })) {
-            if ((Get-BytesSha256 (Get-StreamBytes $entry.Stream)) -ne (Get-BytesSha256 $entry.Target.Bytes)) {
-                throw "写入后的文件与已验证候选不一致：$($entry.Target.Path)"
+        if ($null -ne $PreCommitCondition) {
+            $preCommitResults = @(& $PreCommitCondition)
+            if ($preCommitResults.Count -ne 1 -or -not ($preCommitResults[0] -is [bool])) {
+                throw "事务提交条件必须只返回一个布尔值。"
             }
+            $preCommitRejected = -not [bool]$preCommitResults[0]
         }
-        foreach ($entry in @($opened | Where-Object { $_.Action -eq "delete" })) {
-            Set-VerifiedDeleteDisposition $entry.Stream $true
-            $markedDeletes += $entry
+        if (-not $preCommitRejected) {
+            $journalBytes = Write-FileTransactionJournal $opened
+            if ($null -ne $preparationBytes) {
+                Remove-FileTransactionPreparation $preparationBytes
+            }
+            foreach ($entry in @($opened | Where-Object { $_.Action -eq "write" })) {
+                $mutationStarted = $true
+                Write-LockedStreamBytes $entry.Stream $entry.Target.Bytes $entry.Original
+            }
+            foreach ($entry in @($opened | Where-Object { $_.Action -eq "write" })) {
+                if ((Get-BytesSha256 (Get-StreamBytes $entry.Stream)) -ne (Get-BytesSha256 $entry.Target.Bytes)) {
+                    throw "写入后的文件与已验证候选不一致：$($entry.Target.Path)"
+                }
+            }
+            foreach ($entry in @($opened | Where-Object { $_.Action -eq "delete" })) {
+                $mutationStarted = $true
+                Set-VerifiedDeleteDisposition $entry.Stream $true
+                $markedDeletes += $entry
+            }
         }
     } catch {
         $operationFailure = $_
     }
 
-    if ($null -ne $operationFailure) {
+    if ($null -ne $operationFailure -or $preCommitRejected) {
         for ($i = $markedDeletes.Count - 1; $i -ge 0; $i--) {
             try {
                 Set-VerifiedDeleteDisposition $markedDeletes[$i].Stream $false
@@ -1241,7 +1258,7 @@ function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$Dele
                 } catch {
                     $recoveryFailures += "$($entry.Target.Path)：删除事务新建文件失败：$($_.Exception.Message)"
                 }
-            } else {
+            } elseif ($mutationStarted) {
                 try {
                     Write-LockedStreamBytes $entry.Stream $entry.Original (Get-StreamBytes $entry.Stream)
                     if ((Get-BytesSha256 (Get-StreamBytes $entry.Stream)) -ne (Get-BytesSha256 $entry.Original)) {
@@ -1289,18 +1306,30 @@ function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$Dele
         }
     }
     if ($recoveryFailures.Count -gt 0) {
-        $operationMessage = if ($null -eq $operationFailure) { "文件清理失败" } else { $operationFailure.Exception.Message }
+        $operationMessage = if ($null -eq $operationFailure) {
+            "提交条件拒绝后的文件清理失败"
+        } else {
+            $operationFailure.Exception.Message
+        }
         throw ("事务失败：$operationMessage；回滚未能恢复所有文件：" + ($recoveryFailures -join "；"))
     }
     if ($null -ne $operationFailure) { throw $operationFailure }
+    return (-not $preCommitRejected)
 }
 
 function Invoke-VerifiedFileTransaction([object[]]$Targets) {
-    Invoke-VerifiedPathTransaction $Targets @()
+    $null = Invoke-VerifiedPathTransaction $Targets @()
 }
 
-function Invoke-VerifiedWriteDeleteTransaction([object[]]$WriteTargets, [object[]]$DeleteTargets) {
-    Invoke-VerifiedPathTransaction $WriteTargets $DeleteTargets
+function Invoke-VerifiedWriteDeleteTransaction(
+    [object[]]$WriteTargets,
+    [object[]]$DeleteTargets,
+    [scriptblock]$PreCommitCondition = $null
+) {
+    $committed = Invoke-VerifiedPathTransaction $WriteTargets $DeleteTargets $PreCommitCondition
+    if ($null -ne $PreCommitCondition) {
+        return [bool]$committed
+    }
 }
 
 

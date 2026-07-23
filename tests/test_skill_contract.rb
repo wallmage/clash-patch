@@ -1119,6 +1119,66 @@ class SkillContractTest < Minitest::Test
     assert_includes recovery, 'if (-not $target.Exists) { continue }'
   end
 
+  def test_windows_uninstall_rechecks_client_after_transaction_targets_are_locked
+    transaction = File.read(
+      File.join(SKILL, "scripts/windows/install_windows/transaction.ps1")
+    )
+    uninstaller = File.binread(
+      File.join(SKILL, "scripts/uninstall_windows.ps1")
+    ).force_encoding("UTF-8")
+    windows_tests = File.binread(
+      File.join(ROOT, "tests/test_windows_installer.ps1")
+    ).force_encoding("UTF-8")
+
+    transaction_start = transaction.index("function Invoke-VerifiedPathTransaction(")
+    transaction_end = transaction.index(
+      "\nfunction Invoke-VerifiedFileTransaction(",
+      transaction_start
+    )
+    refute_nil transaction_start
+    refute_nil transaction_end
+    transaction_body = transaction[transaction_start...transaction_end]
+    identity_check = transaction_body.index(
+      "[ClashPatch.VerifiedDeleteNative]::GetIdentity($handle)"
+    )
+    precommit_check = transaction_body.index(
+      "$preCommitResults = @(& $PreCommitCondition)"
+    )
+    journal_write = transaction_body.index(
+      "$journalBytes = Write-FileTransactionJournal $opened"
+    )
+    refute_nil identity_check
+    refute_nil precommit_check
+    refute_nil journal_write
+    assert_operator identity_check, :<, precommit_check
+    assert_operator precommit_check, :<, journal_write
+
+    assert_includes transaction, "[scriptblock]$PreCommitCondition = $null"
+    assert_includes transaction,
+                    "Invoke-VerifiedPathTransaction $WriteTargets $DeleteTargets $PreCommitCondition"
+    assert_includes transaction, "elseif ($mutationStarted)"
+    assert_includes uninstaller, "$transactionCommitted = Invoke-VerifiedWriteDeleteTransaction"
+    assert_includes uninstaller,
+                    "$writeTargets $deletePlans $clientStoppedPreCommit"
+    assert_includes uninstaller,
+                    "if ($null -ne $clientStoppedPreCommit -and -not $transactionCommitted)"
+    assert_includes windows_tests,
+                    "client-start race changed a protected uninstall target"
+    assert_includes windows_tests,
+                    "client-start abort rewrote an existing transaction target"
+
+    documents = [
+      File.read(File.join(ROOT, "README.md")),
+      File.read(File.join(SKILL, "SKILL.md")),
+      File.read(File.join(SKILL, "references/patch-policy.md")),
+      File.read(
+        File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md")
+      ),
+      File.read(File.join(ROOT, "tests/baseline.md"))
+    ]
+    documents.each { |document| assert_includes document, "提交条件" }
+  end
+
   def test_installers_preflight_and_uninstallers_restore_owned_settings
     mac_install = File.read(File.join(SKILL, "scripts/install_macos.sh"))
     mac_uninstall = File.read(File.join(SKILL, "scripts/uninstall_macos.sh"))
@@ -1529,7 +1589,8 @@ class SkillContractTest < Minitest::Test
       "short-path backup identity alias",
       "strict transaction journal byte schema",
       "strict UTF-8 safe-update validation",
-      "strict safe-update manifest schema"
+      "strict safe-update manifest schema",
+      "uninstall client start after locked target verification"
     ].sort
     expected_transaction_journal_cases = %w[
       alternate-data-stream

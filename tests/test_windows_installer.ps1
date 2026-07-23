@@ -3956,6 +3956,221 @@ try {
         Assert-True ((Get-Content -LiteralPath (Join-Path $deferredUninstallCase "config.yaml") -Raw) -eq $deferredConfigOriginal) "second safe uninstall did not restore deferred config.yaml"
         Assert-True ((Get-Content -LiteralPath (Join-Path $deferredUninstallCase "verge.yaml") -Raw) -eq $deferredVergeOriginal) "second safe uninstall did not restore deferred verge.yaml"
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $deferredUninstallCase "clash-patch-usage-profile.json"))) "second safe uninstall retained the profile 3 gate"
+
+        Invoke-DeferredProbe "uninstall client start after locked target verification" {
+            $clientStartPackageParent = Join-Path $sandbox "client-start-uninstall-package"
+            New-Item -ItemType Directory -Path $clientStartPackageParent -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $root "clash-patch") -Destination $clientStartPackageParent -Recurse
+            $clientStartPackage = Join-Path $clientStartPackageParent "clash-patch"
+            $clientStartUninstaller = Join-Path (
+                Join-Path $clientStartPackage "scripts"
+            ) "uninstall_windows.ps1"
+            $clientStartTransaction = Join-Path (
+                Join-Path (Join-Path $clientStartPackage "scripts") "windows/install_windows"
+            ) "transaction.ps1"
+            $clientStartTransactionText = [System.IO.File]::ReadAllText($clientStartTransaction)
+            $clientStartWriteFunctionOffset = $clientStartTransactionText.IndexOf(
+                "function Write-LockedStreamBytes("
+            )
+            $clientStartWriteTryOffset = $clientStartTransactionText.IndexOf(
+                "    try {",
+                $clientStartWriteFunctionOffset
+            )
+            Assert-True (
+                $clientStartWriteFunctionOffset -ge 0 -and
+                $clientStartWriteTryOffset -ge 0
+            ) "client-start fixture could not find the locked-stream write boundary"
+            $clientStartWriteSpyHook = @'
+    if (-not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_CLIENT_START_WRITE_SPY)) {
+        [System.IO.File]::WriteAllText($env:CLASH_PATCH_TEST_CLIENT_START_WRITE_SPY, "write")
+    }
+'@
+            $clientStartTransactionText = $clientStartTransactionText.Insert(
+                $clientStartWriteTryOffset,
+                $clientStartWriteSpyHook
+            )
+            $clientStartFunctionOffset = $clientStartTransactionText.IndexOf(
+                "function Invoke-VerifiedPathTransaction("
+            )
+            $clientStartGuardNeedle = '        if ($null -ne $PreCommitCondition) {'
+            $clientStartGuardOffset = $clientStartTransactionText.IndexOf(
+                $clientStartGuardNeedle,
+                $clientStartFunctionOffset
+            )
+            Assert-True (
+                $clientStartFunctionOffset -ge 0 -and
+                $clientStartGuardOffset -ge 0 -and
+                $clientStartTransactionText.LastIndexOf($clientStartGuardNeedle) -eq
+                    $clientStartGuardOffset
+            ) "client-start fixture could not find one locked-target precommit boundary"
+            $clientStartHook = @'
+        if (-not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_CLIENT_START_READY) -and
+            -not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_CLIENT_START_RELEASE)) {
+            [System.IO.File]::WriteAllText($env:CLASH_PATCH_TEST_CLIENT_START_READY, "ready")
+            $clientStartReleaseDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while (-not (Test-Path -LiteralPath $env:CLASH_PATCH_TEST_CLIENT_START_RELEASE -PathType Leaf) -and
+                [DateTime]::UtcNow -lt $clientStartReleaseDeadline) {
+                Start-Sleep -Milliseconds 25
+            }
+            if (-not (Test-Path -LiteralPath $env:CLASH_PATCH_TEST_CLIENT_START_RELEASE -PathType Leaf)) {
+                throw "client-start fixture timed out waiting for release"
+            }
+        }
+'@
+            $clientStartTransactionText = $clientStartTransactionText.Insert(
+                $clientStartGuardOffset,
+                $clientStartHook
+            )
+            [System.IO.File]::WriteAllText(
+                $clientStartTransaction,
+                $clientStartTransactionText,
+                (New-Object System.Text.UTF8Encoding($true))
+            )
+
+            $clientStartHome = Join-Path $sandbox "client-start-uninstall-home"
+            New-Item -ItemType Directory -Path $clientStartHome -Force | Out-Null
+            $clientStartConfigOriginal = "ipv6: true`ntun: null`n"
+            $clientStartVergeOriginal = "enable_tun_mode: false`n"
+            [System.IO.File]::WriteAllText(
+                (Join-Path $clientStartHome "profiles.yaml"),
+                "items:`n- uid: R-client-start`n  type: remote`n  option:`n    allow_auto_update: true`n"
+            )
+            [System.IO.File]::WriteAllText(
+                (Join-Path $clientStartHome "config.yaml"),
+                $clientStartConfigOriginal
+            )
+            [System.IO.File]::WriteAllText(
+                (Join-Path $clientStartHome "verge.yaml"),
+                $clientStartVergeOriginal
+            )
+            Invoke-Installer $clientStartHome
+            $clientStartProtectedPaths = @(
+                (Join-Path (Join-Path $clientStartHome "profiles") "Script.js"),
+                (Join-Path $clientStartHome "profiles.yaml"),
+                (Join-Path $clientStartHome "config.yaml"),
+                (Join-Path $clientStartHome "verge.yaml"),
+                (Join-Path $clientStartHome "clash-patch-install-state.json"),
+                (Join-Path $clientStartHome "clash-patch-auto-update-state.json"),
+                (Join-Path $clientStartHome "clash-patch-usage-profile.json")
+            )
+            $clientStartProtectedBefore = @{}
+            foreach ($protectedPath in $clientStartProtectedPaths) {
+                Assert-True (
+                    Test-Path -LiteralPath $protectedPath -PathType Leaf
+                ) "client-start fixture omitted a protected uninstall target: $protectedPath"
+                $clientStartProtectedBefore[$protectedPath] = [Convert]::ToBase64String(
+                    [System.IO.File]::ReadAllBytes($protectedPath)
+                )
+            }
+
+            $clientStartReady = Join-Path $sandbox "client-start-uninstall.ready"
+            $clientStartRelease = Join-Path $sandbox "client-start-uninstall.release"
+            $clientStartStdout = Join-Path $sandbox "client-start-uninstall.stdout"
+            $clientStartStderr = Join-Path $sandbox "client-start-uninstall.stderr"
+            $clientStartWriteSpy = Join-Path $sandbox "client-start-uninstall.write-spy"
+            $env:CLASH_PATCH_TEST_CLIENT_START_READY = $clientStartReady
+            $env:CLASH_PATCH_TEST_CLIENT_START_RELEASE = $clientStartRelease
+            $env:CLASH_PATCH_TEST_CLIENT_START_WRITE_SPY = $clientStartWriteSpy
+            $clientStartChild = $null
+            $clientStartProcess = $null
+            try {
+                $clientStartChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+                    "-NoLogo", "-NoProfile", "-File", $clientStartUninstaller,
+                    "-AppHome", $clientStartHome,
+                    "-Json"
+                ) -RedirectStandardOutput $clientStartStdout `
+                    -RedirectStandardError $clientStartStderr -PassThru
+                $clientStartReadyDeadline = [DateTime]::UtcNow.AddSeconds(10)
+                while (-not (Test-Path -LiteralPath $clientStartReady -PathType Leaf) -and
+                    -not $clientStartChild.HasExited -and
+                    [DateTime]::UtcNow -lt $clientStartReadyDeadline) {
+                    Start-Sleep -Milliseconds 25
+                }
+                Assert-True (
+                    Test-Path -LiteralPath $clientStartReady -PathType Leaf
+                ) "uninstaller did not reach the locked-target precommit boundary"
+
+                $clientStartProcess = Start-Process -FilePath $runningClientPath `
+                    -ArgumentList @("-n", "20", "127.0.0.1") -PassThru
+                $clientStartSeen = $false
+                $clientStartSeenDeadline = [DateTime]::UtcNow.AddSeconds(5)
+                while (-not $clientStartProcess.HasExited -and
+                    -not $clientStartSeen -and
+                    [DateTime]::UtcNow -lt $clientStartSeenDeadline) {
+                    $clientStartSeen = $null -ne (
+                        Get-Process -Name "clash-verge" -ErrorAction SilentlyContinue |
+                            Select-Object -First 1
+                    )
+                    if (-not $clientStartSeen) { Start-Sleep -Milliseconds 25 }
+                }
+                Assert-True $clientStartSeen "fixture client was not visible to the uninstall process check"
+                [System.IO.File]::WriteAllText($clientStartRelease, "release")
+                Assert-True (
+                    $clientStartChild.WaitForExit(10000)
+                ) "client-start uninstall did not finish after release"
+                $clientStartChild.WaitForExit()
+                $clientStartInvocation = [pscustomobject]@{
+                    Output = [System.IO.File]::ReadAllText($clientStartStdout)
+                    ExitCode = $clientStartChild.ExitCode
+                }
+                $clientStartJson = Assert-JsonResult $clientStartInvocation "uninstall" 1
+                Assert-True (
+                    $clientStartJson.status -eq "partial" -and
+                    $clientStartJson.code -eq "client_running"
+                ) "client-start uninstall did not return the retryable running-client result"
+                Assert-True (
+                    @($clientStartJson.changes).Count -eq 0
+                ) "client-start uninstall reported committed changes"
+                Assert-True (-not (
+                    Test-Path -LiteralPath $clientStartWriteSpy -PathType Leaf
+                )) "client-start abort rewrote an existing transaction target"
+                foreach ($protectedPath in $clientStartProtectedPaths) {
+                    Assert-True (
+                        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($protectedPath)) -ceq
+                            $clientStartProtectedBefore[$protectedPath]
+                    ) "client-start race changed a protected uninstall target: $protectedPath"
+                }
+                Assert-True (-not (
+                    Test-Path -LiteralPath (
+                        Join-Path $clientStartHome ".clash-patch-transaction.json"
+                    )
+                )) "client-start abort retained a transaction journal"
+                Assert-True (-not (
+                    Test-Path -LiteralPath (
+                        Join-Path $clientStartHome ".clash-patch-transaction-preparation.json"
+                    )
+                )) "client-start abort retained a transaction preparation record"
+            } finally {
+                $env:CLASH_PATCH_TEST_CLIENT_START_READY = $null
+                $env:CLASH_PATCH_TEST_CLIENT_START_RELEASE = $null
+                $env:CLASH_PATCH_TEST_CLIENT_START_WRITE_SPY = $null
+                if (-not (Test-Path -LiteralPath $clientStartRelease -PathType Leaf)) {
+                    [System.IO.File]::WriteAllText($clientStartRelease, "release")
+                }
+                if ($null -ne $clientStartChild -and -not $clientStartChild.HasExited) {
+                    Stop-Process -Id $clientStartChild.Id -Force
+                    $clientStartChild.WaitForExit()
+                }
+                if ($null -ne $clientStartProcess -and -not $clientStartProcess.HasExited) {
+                    Stop-Process -Id $clientStartProcess.Id -Force
+                    $clientStartProcess.WaitForExit()
+                }
+            }
+            Invoke-Uninstaller $clientStartHome
+            Assert-True (
+                (Get-Content -LiteralPath (Join-Path $clientStartHome "config.yaml") -Raw) -ceq
+                    $clientStartConfigOriginal
+            ) "retry after client-start abort did not restore config.yaml"
+            Assert-True (
+                (Get-Content -LiteralPath (Join-Path $clientStartHome "verge.yaml") -Raw) -ceq
+                    $clientStartVergeOriginal
+            ) "retry after client-start abort did not restore verge.yaml"
+            Assert-True (-not (
+                Test-Path -LiteralPath (
+                    Join-Path $clientStartHome "clash-patch-install-state.json"
+                )
+            )) "retry after client-start abort retained install recovery state"
+        }
     }
 
     $blockCase = Join-Path $sandbox "block-case"

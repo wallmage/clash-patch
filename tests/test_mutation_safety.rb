@@ -595,6 +595,24 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_uninstall_client_precommit_guard_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/uninstall_windows.ps1",
+        "        $writeTargets $deletePlans $clientStoppedPreCommit\n",
+        "        $writeTargets $deletePlans $null\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name",
+        "test_windows_uninstall_rechecks_client_after_transaction_targets_are_locked"
+      )
+    end
+  end
+
   def test_ruby_automatic_route_group_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

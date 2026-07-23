@@ -50,6 +50,11 @@ function Complete-UninstallResult(
     exit $ExitCode
 }
 
+function Complete-RunningClientUninstall {
+    Write-Info "客户端保持运行；本次没有修改任何受保护文件或状态，已生成的安全备份继续保留。以后检测到客户端未运行时，可再次执行安全卸载。"
+    Complete-UninstallResult 1 "partial" "client_running" "客户端保持运行，本次卸载未修改受保护文件或状态。" @() @("以后检测到客户端未运行时，可再次执行安全卸载。")
+}
+
 function New-UninstallBackup([string]$Path) {
     $backupRoot = $script:ClashPatchUninstallBackupRoot
     if ([string]::IsNullOrWhiteSpace([string]$backupRoot)) {
@@ -189,8 +194,7 @@ try {
         Assert-UsageProfileState $usageState
     }
     if ($clientRunning -and $null -ne $state) {
-        Write-Info "客户端保持运行；本次没有修改任何文件，应用设置、全局脚本、自动更新设置和用途档位均继续保留。以后检测到客户端未运行时，可再次执行安全卸载。"
-        Complete-UninstallResult 1 "partial" "client_running" "客户端保持运行，本次卸载未修改任何文件。" @() @("以后检测到客户端未运行时，可再次执行安全卸载。")
+        Complete-RunningClientUninstall
     }
 
     if ($autoUpdateStateExists) {
@@ -294,6 +298,9 @@ try {
     if ($null -ne $autoUpdatePlan) { $filePlans += $autoUpdatePlan }
     if ($null -ne $scriptPlan) { $filePlans += $scriptPlan }
     $filePlans += @($settingPlans | Where-Object { $_.Changed })
+    if ($null -ne $state -and (Test-ClashVergeRunning)) {
+        Complete-RunningClientUninstall
+    }
     foreach ($filePlan in $filePlans) {
         if ([bool]$filePlan.Existed) { New-UninstallBackup $filePlan.Path | Out-Null }
     }
@@ -340,7 +347,17 @@ try {
             OriginalIdentity = $_.OriginalIdentity
         }
     })
-    Invoke-VerifiedWriteDeleteTransaction $writeTargets $deletePlans
+    $clientStoppedPreCommit = $null
+    if ($null -ne $state) {
+        $clientStoppedPreCommit = {
+            return (-not (Test-ClashVergeRunning))
+        }
+    }
+    $transactionCommitted = Invoke-VerifiedWriteDeleteTransaction `
+        $writeTargets $deletePlans $clientStoppedPreCommit
+    if ($null -ne $clientStoppedPreCommit -and -not $transactionCommitted) {
+        Complete-RunningClientUninstall
+    }
 
     Write-Info "全局自动补丁已移除，config.yaml 与 verge.yaml 已恢复到安装前状态。现有备份没有删除。"
     $changes = @()
