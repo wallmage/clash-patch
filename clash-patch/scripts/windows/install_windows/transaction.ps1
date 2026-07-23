@@ -777,10 +777,21 @@ function Get-InterruptedTransactionRecoveryPlan([object[]]$Actions) {
             throw "中断事务目标已被同内容的其他文件替换：$($action.Path)"
         }
         if ($action.Action -eq "write" -and $action.Existed) {
-            if (-not $snapshot.Exists -or $currentHash -notin @($originalHash, $replacementHash)) {
+            $isInterruptedReplacement = $snapshot.Exists -and
+                $snapshot.Bytes.Length -lt $action.Replacement.Length
+            if ($isInterruptedReplacement) {
+                for ($index = 0; $index -lt $snapshot.Bytes.Length; $index++) {
+                    if ($snapshot.Bytes[$index] -ne $action.Replacement[$index]) {
+                        $isInterruptedReplacement = $false
+                        break
+                    }
+                }
+            }
+            if (-not $snapshot.Exists -or
+                ($currentHash -notin @($originalHash, $replacementHash) -and -not $isInterruptedReplacement)) {
                 throw "中断事务目标有无法自动合并的新改动：$($action.Path)"
             }
-            if ($currentHash -eq $replacementHash -and $currentHash -ne $originalHash) {
+            if ($currentHash -ne $originalHash) {
                 $plan += [pscustomobject]@{ Operation = "write"; Action = $action; Snapshot = $snapshot }
             }
         } elseif ($action.Action -eq "write") {
