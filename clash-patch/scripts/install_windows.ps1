@@ -61,6 +61,9 @@ if ([string]::IsNullOrWhiteSpace($AppHome)) {
     )
     $AppHome = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | Select-Object -First 1
 }
+if (-not [string]::IsNullOrWhiteSpace($AppHome)) {
+    $AppHome = ConvertTo-NormalizedWindowsPath $AppHome
+}
 
 if ([string]::IsNullOrWhiteSpace($AppHome) -or -not (Test-Path -LiteralPath $AppHome -PathType Container)) {
     if (-not $Json) { [Console]::Error.WriteLine("[Clash 补丁] 没有找到受支持的 Clash Verge Rev。请安装最新版 Clash Verge Rev，打开一次后再运行 Clash 补丁。") }

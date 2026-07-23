@@ -121,6 +121,9 @@ if ([string]::IsNullOrWhiteSpace($AppHome)) {
     )
     $AppHome = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | Select-Object -First 1
 }
+if (-not [string]::IsNullOrWhiteSpace($AppHome)) {
+    $AppHome = ConvertTo-NormalizedWindowsPath $AppHome
+}
 
 if ([string]::IsNullOrWhiteSpace($AppHome)) {
     if (-not $Json) { [Console]::Error.WriteLine("[Clash 补丁] 没有找到 Clash Verge Rev 配置目录。") }

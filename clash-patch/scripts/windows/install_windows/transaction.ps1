@@ -3,9 +3,9 @@
 
     $security = Get-Acl -LiteralPath $Path
     $security.SetAccessRuleProtection($true, $false)
-    @($security.Access) | Where-Object { -not $_.IsInherited } | ForEach-Object {
-        $security.RemoveAccessRuleSpecific($_)
-    } | Out-Null
+    @($security.Access.IdentityReference | Select-Object -Unique) | ForEach-Object {
+        $security.PurgeAccessRules($_)
+    }
     $sidValues = @(
         [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
         "S-1-5-18",
@@ -24,12 +24,13 @@
 }
 
 function ConvertTo-NormalizedWindowsPath([string]$Path) {
-    $absolute = [System.IO.Path]::GetFullPath($Path)
-    if ($absolute.StartsWith("\\?\UNC\", [StringComparison]::OrdinalIgnoreCase)) {
-        $absolute = "\\" + $absolute.Substring(8)
-    } elseif ($absolute.StartsWith("\\?\", [StringComparison]::OrdinalIgnoreCase)) {
-        $absolute = $absolute.Substring(4)
+    $candidate = $Path
+    if ($candidate.StartsWith("\\?\UNC\", [StringComparison]::OrdinalIgnoreCase)) {
+        $candidate = "\\" + $candidate.Substring(8)
+    } elseif ($candidate.StartsWith("\\?\", [StringComparison]::OrdinalIgnoreCase)) {
+        $candidate = $candidate.Substring(4)
     }
+    $absolute = [System.IO.Path]::GetFullPath($candidate)
     return $absolute.TrimEnd(
         [System.IO.Path]::DirectorySeparatorChar,
         [System.IO.Path]::AltDirectorySeparatorChar
@@ -56,9 +57,9 @@ function Get-AppHomeRelativePath([string]$Path) {
 }
 
 function Enter-AppHomeMutationLock([string]$AppHome) {
-    Assert-NoReparsePointPath $AppHome "Clash Verge Rev 配置目录"
-    Initialize-VerifiedFileNative
     $canonical = ConvertTo-NormalizedWindowsPath $AppHome
+    Assert-NoReparsePointPath $canonical "Clash Verge Rev 配置目录"
+    Initialize-VerifiedFileNative
     $rootHandle = $null
     $lockStream = $null
     try {

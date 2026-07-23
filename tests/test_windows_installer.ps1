@@ -1727,8 +1727,8 @@ items:
             $identityRestoreBackupRoot = Join-Path $identityRestoreCase "clash-patch-backups"
             $identityRestoreTarget = Join-Path $identityRestoreCase "config.yaml"
             New-Item -ItemType Directory -Path $identityRestoreCase -Force | Out-Null
-            $identityRestoreBackupText = "mode: rule`nproxies: []`nproxy-groups: []`nrules: []`n"
-            $identityRestoreCurrentText = "mode: global`nproxies: []`nproxy-groups: []`nrules: []`n"
+            $identityRestoreBackupText = "mode: rule`nipv6: false`ntun:`n  enable: true`n  stack: system`n  dns-hijack:`n    - any:53`n  auto-route: true`n  auto-detect-interface: true`n  strict-route: true`nproxies: []`nproxy-groups: []`nrules: []`n"
+            $identityRestoreCurrentText = "mode: global`nipv6: false`ntun:`n  enable: true`n  stack: system`n  dns-hijack:`n    - any:53`n  auto-route: true`n  auto-detect-interface: true`n  strict-route: true`nproxies: []`nproxy-groups: []`nrules: []`n"
             [System.IO.File]::WriteAllText($identityRestoreTarget, $identityRestoreBackupText)
             $identityRestoreBackup = Backup-Versioned $identityRestoreTarget $identityRestoreBackupRoot "prewrite"
             [System.IO.File]::WriteAllText($identityRestoreTarget, $identityRestoreCurrentText)
@@ -2616,10 +2616,10 @@ try {
             $publicRestoreBackupRoot = Join-Path $publicRestoreHome "clash-patch-backups"
             $publicRestoreReady = Join-Path $sandbox "public-restore-crash.ready"
             $publicRestoreBackupBytes = [System.Text.Encoding]::UTF8.GetBytes(
-                "mode: rule`nproxies: []`nproxy-groups: []`nrules: []`n"
+                "mode: rule`nipv6: false`ntun:`n  enable: true`n  stack: system`n  dns-hijack:`n    - any:53`n  auto-route: true`n  auto-detect-interface: true`n  strict-route: true`nproxies: []`nproxy-groups: []`nrules: []`n"
             )
             $publicRestoreCurrentBytes = [System.Text.Encoding]::UTF8.GetBytes(
-                "mode: global`nproxies: []`nproxy-groups: []`nrules: []`n"
+                "mode: global`nipv6: false`ntun:`n  enable: true`n  stack: system`n  dns-hijack:`n    - any:53`n  auto-route: true`n  auto-detect-interface: true`n  strict-route: true`nproxies: []`nproxy-groups: []`nrules: []`n"
             )
             New-Item -ItemType Directory -Path $publicRestoreHome -Force | Out-Null
             [System.IO.File]::WriteAllBytes($publicRestoreTarget, $publicRestoreBackupBytes)
@@ -2651,12 +2651,18 @@ try {
                 $env:CLASH_PATCH_TEST_RESTORE_CRASH_READY = $null
                 if (-not $publicRestoreChild.HasExited) { Stop-Process -Id $publicRestoreChild.Id -Force }
             }
-            $publicRestoreAfterKill = [System.IO.File]::ReadAllBytes($publicRestoreTarget)
-            $publicRestoreIsWholeVersion = (Get-BytesSha256 $publicRestoreAfterKill) -in @(
-                (Get-BytesSha256 $publicRestoreCurrentBytes),
-                (Get-BytesSha256 $publicRestoreBackupBytes)
+            Assert-True (Test-Path -LiteralPath (Join-Path $publicRestoreHome ".clash-patch-transaction.json") -PathType Leaf) "interrupted public restore did not leave a recovery journal"
+            $publicRestoreRecovery = Invoke-TestPowerShell $publicRestoreInstaller @(
+                "-AppHome", $publicRestoreHome,
+                "-ShowUsageProfile",
+                "-Json"
             )
-            Assert-True $publicRestoreIsWholeVersion "public restore left a truncated configuration after process death"
+            Assert-JsonResult $publicRestoreRecovery "install" 0 | Out-Null
+            Assert-True (
+                (Get-BytesSha256 ([System.IO.File]::ReadAllBytes($publicRestoreTarget))) -eq
+                (Get-BytesSha256 $publicRestoreCurrentBytes)
+            ) "next public operation did not recover an interrupted restore"
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $publicRestoreHome ".clash-patch-transaction.json"))) "recovered public restore retained its transaction journal"
         }
     }
 
