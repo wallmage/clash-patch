@@ -978,9 +978,23 @@ test('Windows engine contains no unused rule-identity helper', () => {
   assert.doesNotMatch(source, /function clashPatchRuleIdentity/);
 });
 
-test('Windows PowerShell entry scripts have a UTF-8 BOM', () => {
-  for (const entry of [installerPath, uninstallerPath, routeVerifierPath]) {
-    assert.deepEqual([...fs.readFileSync(entry).subarray(0, 3)], [0xef, 0xbb, 0xbf], entry);
+test('all shipped and test PowerShell scripts are strict UTF-8 with a BOM', () => {
+  const pending = [path.join(root, 'clash-patch/scripts')];
+  const powershellFiles = [path.join(root, 'tests/test_windows_installer.ps1')];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(entryPath);
+      if (entry.isFile() && entry.name.endsWith('.ps1')) powershellFiles.push(entryPath);
+    }
+  }
+
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  for (const entry of powershellFiles) {
+    const bytes = fs.readFileSync(entry);
+    assert.deepEqual([...bytes.subarray(0, 3)], [0xef, 0xbb, 0xbf], entry);
+    assert.doesNotThrow(() => decoder.decode(bytes), entry);
   }
 });
 

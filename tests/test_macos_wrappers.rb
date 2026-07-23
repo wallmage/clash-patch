@@ -32,6 +32,24 @@ class MacosWrapperTest < Minitest::Test
     yield
   end
 
+  def install_fake_mihomo(home)
+    core = File.join(
+      home, "Applications", "ClashX Meta.app", "Contents", "Resources",
+      "com.metacubex.ClashX.ProxyConfigHelper.meta"
+    )
+    FileUtils.mkdir_p(File.dirname(core))
+    File.write(core, <<~SH)
+      #!/bin/sh
+      /usr/bin/printf '%s\n' "$*" >> "$HOME/fake-mihomo-arguments.log"
+      if [ "${1:-}" = "-v" ]; then
+        /usr/bin/printf '%s\n' 'Mihomo Meta v1.19.27 test'
+      fi
+      exit 0
+    SH
+    File.chmod(0o700, core)
+    core
+  end
+
   def with_missing_mihomo_installer
     Dir.mktmpdir do |package|
       scripts = File.join(package, "scripts")
@@ -48,7 +66,7 @@ class MacosWrapperTest < Minitest::Test
     end
   end
 
-  def with_supported_mihomo_installer
+  def with_supported_mihomo_installer(patcher_source: nil)
     Dir.mktmpdir do |package|
       scripts = File.join(package, "scripts")
       FileUtils.mkdir_p(File.join(scripts, "macos"))
@@ -57,7 +75,7 @@ class MacosWrapperTest < Minitest::Test
       FileUtils.cp(RESULT_CONTRACT, File.join(scripts, "macos", "result_contract.rb"))
       File.write(
         File.join(scripts, "macos", "patch_profiles.rb"),
-        "if ARGV.include?('--print-core-status'); puts 'supported'; end\nexit 0\n"
+        patcher_source || "if ARGV.include?('--print-core-status'); puts 'supported'; end\nexit 0\n"
       )
       File.write(File.join(package, "references", "policy.json"), "{}\n")
       yield File.join(scripts, "install_macos.sh")
@@ -174,6 +192,55 @@ class MacosWrapperTest < Minitest::Test
     end
   end
 
+  def test_installer_runs_the_real_ruby_patcher_and_mihomo_validation
+    Dir.mktmpdir do |home|
+      with_supported_app(home) do
+        install_fake_mihomo(home)
+        profiles = File.join(home, "profiles")
+        FileUtils.mkdir_p(profiles)
+        profile = File.join(profiles, "friend.yaml")
+        original = <<~YAML
+          mixed-port: 7890
+          proxies:
+            - name: node
+              type: ss
+              server: proxy.invalid
+              cipher: aes-128-gcm
+              password: fixture-secret
+          proxy-groups:
+            - name: Proxy
+              type: select
+              proxies:
+                - node
+          dns:
+            enable: true
+            nameserver:
+              - 223.5.5.5
+          rules:
+            - MATCH,Proxy
+        YAML
+        File.write(profile, original)
+
+        stdout, stderr, status, state = run_script(
+          INSTALLER, "--profile", "1", home: home,
+          extra_env: { "CLASH_PATCH_PROFILE_DIR" => profiles }
+        )
+
+        assert status.success?, "#{stdout}\n#{stderr}"
+        assert_empty stderr
+        assert File.file?(state)
+        output = File.read(profile)
+        refute_equal original, output
+        assert_includes output, "clash-patch-cn-domain"
+        assert_includes output, "RULE-SET,clash-patch-cn-domain,DIRECT"
+        assert Dir.glob(File.join(home, "Library/Application Support/ClashPatch/backups/*.backup")).any?
+        core_arguments = File.read(File.join(home, "fake-mihomo-arguments.log"))
+        assert_match(/^-v$/m, core_arguments)
+        assert_includes core_arguments, " -t -f "
+      end
+    end
+  end
+
   def test_environment_profile_is_supported_but_invalid_environment_is_rejected
     with_supported_mihomo_installer do |installer|
       Dir.mktmpdir do |home|
@@ -204,6 +271,61 @@ class MacosWrapperTest < Minitest::Test
           assert_equal 8, status.exitstatus
           assert_includes stdout, "没有找到可用的 Mihomo"
           refute File.exist?(state)
+        end
+      end
+    end
+  end
+
+  def test_failed_profile_change_preserves_the_previous_saved_profile
+    failing_patcher = <<~RUBY
+      if ARGV.include?("--print-core-status")
+        puts "supported"
+        exit 0
+      end
+      exit 1 if ARGV.include?("--snapshot-initial")
+      exit 0
+    RUBY
+    with_supported_mihomo_installer(patcher_source: failing_patcher) do |installer|
+      Dir.mktmpdir do |home|
+        with_supported_app(home) do
+          state = File.join(home, "usage-profile.plist")
+          system("/usr/bin/plutil", "-create", "xml1", state)
+          system("/usr/bin/plutil", "-insert", "Version", "-integer", "1", state)
+          system("/usr/bin/plutil", "-insert", "Profile", "-integer", "1", state)
+          original = File.binread(state)
+
+          stdout, _stderr, status = run_script(installer, "--profile", "2", home: home)
+
+          assert_equal 1, status.exitstatus
+          assert_includes stdout, "无法创建初始快照"
+          assert_equal original, File.binread(state)
+
+          stdout, stderr, status = run_script(installer, "--profile", "2", "--json", home: home)
+          assert_equal 1, status.exitstatus
+          assert_empty stderr
+          result = assert_json_result(stdout, status, command: "install")
+          assert_equal "snapshot_failed", result.fetch("code")
+          assert_equal original, File.binread(state)
+        end
+      end
+    end
+  end
+
+  def test_profile_three_downgrade_requires_safe_uninstall
+    with_supported_mihomo_installer do |installer|
+      Dir.mktmpdir do |home|
+        with_supported_app(home) do
+          state = File.join(home, "usage-profile.plist")
+          system("/usr/bin/plutil", "-create", "xml1", state)
+          system("/usr/bin/plutil", "-insert", "Version", "-integer", "1", state)
+          system("/usr/bin/plutil", "-insert", "Profile", "-integer", "3", state)
+          original = File.binread(state)
+
+          stdout, _stderr, status = run_script(installer, "--profile", "1", home: home)
+
+          assert_equal 1, status.exitstatus
+          assert_includes stdout, "先运行安全卸载"
+          assert_equal original, File.binread(state)
         end
       end
     end

@@ -925,6 +925,76 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_safe_update_all_preserves_an_atomic_refresh_during_backup
+    Dir.mktmpdir do |directory|
+      backup_root = File.join(directory, "backups")
+      targets = %w[first second].map do |name|
+        path = File.join(directory, "#{name}.yaml")
+        File.write(path, YAML.dump(base_config.merge("subscription-marker" => "old-#{name}")))
+        { name: name, path: path, url: "https://subscriptions.invalid/#{name}" }
+      end
+      originals = targets.to_h { |target| [target.fetch(:path), File.binread(target.fetch(:path))] }
+      refreshed = YAML.dump(base_config.merge("subscription-marker" => "external-refresh"))
+      original_backup = ClashPatch.method(:create_versioned_backup)
+      backup_calls = 0
+      backup_with_refresh = lambda do |path, root, content: nil, reason: "prewrite"|
+        result = original_backup.call(path, root, content: content, reason: reason)
+        backup_calls += 1
+        if backup_calls == 2
+          replacement = File.join(directory, "replacement.yaml")
+          File.binwrite(replacement, refreshed)
+          File.rename(replacement, targets.fetch(1).fetch(:path))
+        end
+        result
+      end
+
+      result = ClashPatch.stub(:create_versioned_backup, backup_with_refresh) do
+        ClashPatch.safe_update_all(
+          targets: targets, policy: @policy, backup_root: backup_root, usage_profile: 3,
+          fetcher: ->(target) { YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}")) },
+          validator: ->(_path) { true }, activation: ->(_items) { flunk "must not activate" }
+        )
+      end
+
+      assert_equal :aborted, result.fetch(:status)
+      assert_equal :concurrent_change, result.fetch(:reason)
+      assert_equal originals.fetch(targets.fetch(0).fetch(:path)), File.binread(targets.fetch(0).fetch(:path))
+      assert_equal refreshed.b, File.binread(targets.fetch(1).fetch(:path))
+    end
+  end
+
+  def test_safe_update_all_restores_every_profile_when_a_later_write_fails
+    Dir.mktmpdir do |directory|
+      targets = %w[first second third].map do |name|
+        path = File.join(directory, "#{name}.yaml")
+        File.write(path, YAML.dump(base_config.merge("subscription-marker" => "old-#{name}")))
+        { name: name, path: path, url: "https://subscriptions.invalid/#{name}" }
+      end
+      originals = targets.to_h { |target| [target.fetch(:path), File.binread(target.fetch(:path))] }
+      original_writer = ClashPatch.method(:write_locked_profile)
+      writes = 0
+      failing_writer = lambda do |handle, bytes|
+        writes += 1
+        raise IOError, "injected second write failure" if writes == 2
+
+        original_writer.call(handle, bytes)
+      end
+
+      result = ClashPatch.stub(:write_locked_profile, failing_writer) do
+        ClashPatch.safe_update_all(
+          targets: targets, policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 3,
+          fetcher: ->(target) { YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}")) },
+          validator: ->(_path) { true }, activation: ->(_items) { flunk "must not activate" }
+        )
+      end
+
+      assert_equal :aborted, result.fetch(:status)
+      assert_equal :write_failed, result.fetch(:reason)
+      assert_operator writes, :>=, 2
+      targets.each { |target| assert_equal originals.fetch(target.fetch(:path)), File.binread(target.fetch(:path)) }
+    end
+  end
+
   def test_safe_update_all_leaves_every_profile_untouched_when_one_download_is_invalid
     Dir.mktmpdir do |directory|
       targets = %w[first second third].map do |name|
@@ -2865,6 +2935,7 @@ class MacosPatcherTest < Minitest::Test
 
     coverage_source = File.read(File.join(ROOT, "tests/coverage_ruby.rb"))
     assert_includes coverage_source, 'Dir.glob(File.join(MACOS_RUBY_ROOT, "**", "*.rb"))'
+    assert_includes coverage_source, "MINIMUM_MODULE_LINE_COVERAGE"
   end
 
   def test_cli_rejects_unknown_options_and_safe_updates_without_a_usage_profile

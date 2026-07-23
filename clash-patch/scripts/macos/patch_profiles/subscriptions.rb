@@ -190,12 +190,24 @@ module ClashPatch
     write_path = File.realpath(path)
     File.open(write_path, "r+b") do |source|
       source.flock(File::LOCK_EX)
-      source.rewind
-      source.write(bytes)
-      source.truncate(bytes.bytesize)
-      source.flush
-      source.fsync
+      write_locked_profile(source, bytes)
     end
+  end
+
+  def write_locked_profile(handle, bytes)
+    handle.rewind
+    handle.write(bytes)
+    handle.truncate(bytes.bytesize)
+    handle.flush
+    handle.fsync
+  end
+
+  def locked_profile_current?(handle, path)
+    opened = handle.stat
+    current = File.stat(File.realpath(path))
+    opened.dev == current.dev && opened.ino == current.ino
+  rescue StandardError
+    false
   end
 
   def default_safe_update_activation(items, usage_profile, selected_name = selected_profile_name)
@@ -225,13 +237,17 @@ module ClashPatch
     end
 
     handles = []
+    concurrent_change = false
     begin
       items.sort_by { |item| File.expand_path(item.fetch(:path)) }.each do |item|
         handle = File.open(File.realpath(item.fetch(:path)), "r+b")
         handle.flock(File::LOCK_EX)
         handles << [item, handle]
       end
-      unless handles.all? { |item, handle| handle.rewind && handle.read == item.fetch(:original) }
+      unless handles.all? do |item, handle|
+               locked_profile_current?(handle, item.fetch(:path)) &&
+                 handle.rewind && handle.read == item.fetch(:original)
+             end
         return { status: :aborted, failed_profile: "", reason: :concurrent_change }
       end
 
@@ -239,11 +255,22 @@ module ClashPatch
         create_versioned_backup(item.fetch(:path), backup_root, content: item.fetch(:original), reason: "pre-update")
       end
       handles.each do |item, handle|
-        handle.rewind
-        handle.write(item.fetch(:candidate))
-        handle.truncate(item.fetch(:candidate).bytesize)
-        handle.flush
-        handle.fsync
+        unless locked_profile_current?(handle, item.fetch(:path))
+          concurrent_change = true
+          raise IOError, "subscription path changed during safe update"
+        end
+        write_locked_profile(handle, item.fetch(:candidate))
+        unless locked_profile_current?(handle, item.fetch(:path))
+          concurrent_change = true
+          raise IOError, "subscription path changed during safe update"
+        end
+      end
+      unless handles.all? do |item, handle|
+               locked_profile_current?(handle, item.fetch(:path)) &&
+                 handle.rewind && handle.read == item.fetch(:candidate)
+             end
+        concurrent_change = true
+        raise IOError, "subscription path changed during safe update"
       end
     rescue StandardError
       rollback_failures = []
@@ -259,9 +286,11 @@ module ClashPatch
         end
       end
       unless rollback_failures.empty?
-        return { status: :rollback_failed, failed_profile: rollback_failures.first, reason: :write_failed }
+        reason = concurrent_change ? :concurrent_change : :write_failed
+        return { status: :rollback_failed, failed_profile: rollback_failures.first, reason: reason }
       end
-      return { status: :aborted, failed_profile: "", reason: :write_failed }
+      reason = concurrent_change ? :concurrent_change : :write_failed
+      return { status: :aborted, failed_profile: "", reason: reason }
     ensure
       handles.each { |_item, handle| handle.close rescue nil }
     end

@@ -10,6 +10,7 @@ PRODUCTION_AGGREGATE_TARGETS = TARGETS.select do |path|
   path != VERIFY_ROUTES_PATH
 end.freeze
 MINIMUM_PATCHER_LINE_COVERAGE = 90.0
+MINIMUM_MODULE_LINE_COVERAGE = 80.0
 MINIMUM_VERIFY_LINE_COVERAGE = 100.0
 TRANSFORM_CORE_METHODS = %i[
   deep_copy base_result usable_config? selectable_groups managed_name? managed_group_name?
@@ -34,10 +35,12 @@ Minitest.after_run do
     relevant = lines.compact
     covered = relevant.count(&:positive?)
     percentage = covered * 100.0 / relevant.length
-    puts format("%s: %.2f%% (%d/%d)", path.sub("#{COVERAGE_ROOT}/", ""), percentage, covered, relevant.length)
-    next unless path == VERIFY_ROUTES_PATH && percentage < MINIMUM_VERIFY_LINE_COVERAGE
-
-    failures << path
+    required = path == VERIFY_ROUTES_PATH ? MINIMUM_VERIFY_LINE_COVERAGE : MINIMUM_MODULE_LINE_COVERAGE
+    puts format(
+      "%s: %.2f%% (%d/%d), required %.2f%%",
+      path.sub("#{COVERAGE_ROOT}/", ""), percentage, covered, relevant.length, required
+    )
+    failures << path if percentage < required
   end
 
   production_relevant = PRODUCTION_AGGREGATE_TARGETS.sum { |path| result.fetch(path).fetch(:lines).compact.length }

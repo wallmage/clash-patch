@@ -269,14 +269,23 @@ try {
     $clientRunning = Test-ClashVergeRunning
     $corePath = Find-MihomoCore $MihomoPath
     Test-MihomoVersion $corePath | Out-Null
+    if ($savedUsageProfile -eq 3 -and $resolvedUsageProfile -ne 3 -and $profileSource -ne "saved") {
+        throw "从档位 3 改为轻量档位前，必须先运行安全卸载。"
+    }
+    $usageProfileTarget = $null
     if ($profileSource -ne "saved") {
-        Save-UsageProfile $usageStatePath $resolvedUsageProfile
-        Write-Info "已保存用途档位 $resolvedUsageProfile。"
+        $usageProfileBytes = ConvertTo-Utf8Bytes ((([ordered]@{
+            Version = 1
+            Profile = $resolvedUsageProfile
+        }) | ConvertTo-Json -Compress) + "`r`n")
+        $usageProfileTarget = [pscustomobject]@{
+            Path = $usageStatePath
+            Bytes = $usageProfileBytes
+            Existed = (Test-Path -LiteralPath $usageStatePath)
+            OriginalBytes = $(if (Test-Path -LiteralPath $usageStatePath) { [System.IO.File]::ReadAllBytes($usageStatePath) } else { $null })
+        }
     }
     if ($resolvedUsageProfile -ne 3) {
-        if ($savedUsageProfile -eq 3 -and $profileSource -ne "saved") {
-            Write-Info "检测到从档位 3 改为轻量档位。安装程序不会覆盖后来产生的用户改动；请由本 skill 先运行安全卸载流程，并说明无法自动恢复的旧增强。"
-        }
         New-Item -ItemType Directory -Path $profilesDirectory -Force | Out-Null
         $scriptOutput = Build-GlobalScript $enginePath $targetScript $resolvedUsageProfile
         $scriptBytes = ConvertTo-Utf8Bytes $scriptOutput
@@ -288,12 +297,15 @@ try {
         }
         Backup-InitialOnce $scriptTarget.Path $backupRoot | Out-Null
         Backup-Versioned $scriptTarget.Path $backupRoot "prewrite" | Out-Null
+        $lightTargets = @($scriptTarget)
+        if ($null -ne $usageProfileTarget) { $lightTargets += $usageProfileTarget }
         try {
-            Write-BytesAtomic $scriptTarget.Path $scriptTarget.Bytes
+            foreach ($target in $lightTargets) { Write-BytesAtomic $target.Path $target.Bytes }
         } catch {
-            Restore-Transaction @($scriptTarget)
+            Restore-Transaction $lightTargets
             throw
         }
+        if ($null -ne $usageProfileTarget) { Write-Info "已保存用途档位 $resolvedUsageProfile。" }
         Write-Info "已为全部订阅安装共享国内域名直连规则；未修改 TUN、IPv6 或订阅自动更新。"
         Complete-InstallResult 0 "ok" "installed_common_baseline" "已安装全部订阅共用的国内域名直连规则。" @("global_script", "cn_domain_baseline")
     }
@@ -313,7 +325,9 @@ try {
             [pscustomobject]@{ Path = $targetScript; Bytes = $scriptBytes; Existed = (Test-Path -LiteralPath $targetScript); OriginalBytes = $(if (Test-Path -LiteralPath $targetScript) { [System.IO.File]::ReadAllBytes($targetScript) } else { $null }) },
             [pscustomobject]@{ Path = $profilesIndexPath; Bytes = $profilesIndexBytes; Existed = $true; OriginalBytes = [System.IO.File]::ReadAllBytes($profilesIndexPath) }
         )
+        if ($null -ne $usageProfileTarget) { $runningTargets += $usageProfileTarget }
         foreach ($target in $runningTargets) {
+            if ($target.Path -eq $usageStatePath) { continue }
             Backup-InitialOnce $target.Path $backupRoot | Out-Null
             Backup-Versioned $target.Path $backupRoot "prewrite" | Out-Null
         }
@@ -324,6 +338,7 @@ try {
             Restore-Transaction $runningTargets
             throw
         }
+        if ($null -ne $usageProfileTarget) { Write-Info "已保存用途档位 $resolvedUsageProfile。" }
         Write-Info "Clash Verge Rev 保持运行；已更新全局扩展脚本，并自动关闭全部远程订阅的自动更新。"
         Write-Info "config.yaml、verge.yaml 和当前运行配置均未修改。下次订阅刷新时应用补丁。"
         Complete-InstallResult 0 "ok" "installed_running_client" "客户端保持运行；全局扩展脚本与自动更新设置已更新。" @("global_script", "auto_update")
@@ -370,7 +385,9 @@ try {
         [pscustomobject]@{ Path = $configPath; Bytes = $configBytes; Existed = (Test-Path -LiteralPath $configPath); OriginalBytes = $(if (Test-Path -LiteralPath $configPath) { [System.IO.File]::ReadAllBytes($configPath) } else { $null }) },
         [pscustomobject]@{ Path = $statePath; Bytes = $stateBytes; Existed = (Test-Path -LiteralPath $statePath); OriginalBytes = $(if (Test-Path -LiteralPath $statePath) { [System.IO.File]::ReadAllBytes($statePath) } else { $null }) }
     )
+    if ($null -ne $usageProfileTarget) { $targets += $usageProfileTarget }
     foreach ($target in $targets) {
+        if ($target.Path -eq $usageStatePath) { continue }
         Backup-InitialOnce $target.Path $backupRoot | Out-Null
         Backup-Versioned $target.Path $backupRoot "prewrite" | Out-Null
     }
@@ -387,6 +404,7 @@ try {
         throw
     }
 
+    if ($null -ne $usageProfileTarget) { Write-Info "已保存用途档位 $resolvedUsageProfile。" }
     Write-Info "已安装全局扩展脚本，之后每次加载或刷新订阅都会自动应用补丁。"
     Write-Info "已自动关闭全部远程订阅的自动更新，并回读确认 profiles.yaml。"
     Write-Info "已开启 TUN，并让全局脚本接管 DNS 配置。下次订阅刷新时应用补丁。"

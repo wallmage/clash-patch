@@ -76,6 +76,8 @@ function Start-TestTraffic([string]$Url) {
     $start.Arguments = '--http1.1 -L --max-time 15 --limit-rate 2k --output NUL --silent "' + $Url.Replace('"', '\"') + '"'
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $start
     if (-not $process.Start()) { throw "无法启动分流测试请求。" }

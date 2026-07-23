@@ -48,11 +48,21 @@ jobs:
           /usr/bin/ruby -c clash-patch/scripts/macos/verify_routes.rb
           sh -n clash-patch/scripts/install_macos.sh
           sh -n clash-patch/scripts/uninstall_macos.sh
+      - name: Source tree whitespace checks
+        run: |
+          git diff --check
+          git show --check --format= HEAD
 
   windows-installer:
     runs-on: windows-2022
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: PowerShell 5.1 installer and uninstaller regressions
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - name: PowerShell 5.1 installer, uninstaller, and route regressions
         shell: powershell
         run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command powershell.exe).Source
+      - name: PowerShell 7 installer, uninstaller, and route regressions
+        shell: pwsh
+        run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command pwsh.exe).Source

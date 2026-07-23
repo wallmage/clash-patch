@@ -23,6 +23,193 @@ $env:CLASH_PATCH_USAGE_PROFILE = "3"
 $fakeCore = Join-Path $sandbox $(if ($onWindows) { "mihomo-test.cmd" } else { "mihomo-test.sh" })
 $hangingCore = Join-Path $sandbox $(if ($onWindows) { "mihomo-hang.cmd" } else { "mihomo-hang.sh" })
 
+function Get-ProtectedAutomaticVariableNames {
+    $automaticCandidates = @(
+        "ConsoleFileName", "EnabledExperimentalFeatures", "ExecutionContext",
+        "HOME", "Host", "IsCoreCLR", "IsLinux", "IsMacOS", "IsWindows",
+        "MyInvocation", "NestedPromptLevel", "PID", "PROFILE",
+        "PSBoundParameters", "PSCmdlet", "PSCommandPath", "PSCulture",
+        "PSDebugContext", "PSEdition", "PSHOME", "PSScriptRoot",
+        "PSSenderInfo", "PSUICulture", "PSVersionTable", "PWD",
+        "ShellId", "StackTrace"
+    )
+    $names = @{}
+    foreach ($variable in @(Get-Variable)) {
+        if ($variable.Name -in @("null", "true", "false")) { continue }
+        if (($variable.Options -band [System.Management.Automation.ScopedItemOptions]::ReadOnly) -or
+            ($variable.Options -band [System.Management.Automation.ScopedItemOptions]::Constant)) {
+            $names[$variable.Name] = $true
+        }
+    }
+    foreach ($name in $automaticCandidates) {
+        $variable = Get-Variable -Name $name -ErrorAction SilentlyContinue
+        if ($null -eq $variable) { continue }
+        if (($variable.Options -band [System.Management.Automation.ScopedItemOptions]::ReadOnly) -or
+            ($variable.Options -band [System.Management.Automation.ScopedItemOptions]::Constant)) {
+            $names[$name] = $true
+        }
+    }
+    return $names
+}
+
+function Get-AutomaticVariableBaseName([System.Management.Automation.Language.VariableExpressionAst]$Variable) {
+    $parts = $Variable.VariablePath.UserPath.Split(":")
+    return $parts[$parts.Count - 1]
+}
+
+function Test-IsDirectVariableTarget(
+    [System.Management.Automation.Language.VariableExpressionAst]$Variable,
+    [System.Management.Automation.Language.Ast]$Target
+) {
+    if ($Variable -eq $Target) { return $true }
+    $current = $Variable.Parent
+    while ($null -ne $current -and $current -ne $Target) {
+        if ($current -is [System.Management.Automation.Language.MemberExpressionAst] -or
+            $current -is [System.Management.Automation.Language.IndexExpressionAst]) {
+            return $false
+        }
+        $current = $current.Parent
+    }
+    return $current -eq $Target
+}
+
+function Assert-NoReadOnlyAutomaticVariableWrites(
+    [System.Management.Automation.Language.ScriptBlockAst]$Ast,
+    [string]$DisplayName
+) {
+    $protectedNames = Get-ProtectedAutomaticVariableNames
+    $violations = New-Object System.Collections.ArrayList
+    $recordName = {
+        param([string]$Name, [System.Management.Automation.Language.Ast]$Write)
+        $parts = $Name.Split(":")
+        $baseName = $parts[$parts.Count - 1]
+        if ($protectedNames.ContainsKey($baseName)) {
+            [void]$violations.Add(("{0}:{1}: ${2} is read-only or constant" -f $DisplayName, $Write.Extent.StartLineNumber, $baseName))
+        }
+    }
+    $record = {
+        param(
+            [System.Management.Automation.Language.VariableExpressionAst]$Variable,
+            [System.Management.Automation.Language.Ast]$Write
+        )
+        & $recordName (Get-AutomaticVariableBaseName $Variable) $Write
+    }
+
+    foreach ($assignment in @($Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst]
+    }, $true))) {
+        foreach ($variable in @($assignment.Left.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.VariableExpressionAst]
+        }, $true))) {
+            if (Test-IsDirectVariableTarget $variable $assignment.Left) {
+                & $record $variable $assignment
+            }
+        }
+    }
+
+    foreach ($parameter in @($Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.ParameterAst]
+    }, $true))) {
+        & $record $parameter.Name $parameter
+    }
+
+    foreach ($loop in @($Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.ForEachStatementAst]
+    }, $true))) {
+        & $record $loop.Variable $loop
+    }
+
+    $mutationTokens = @("PlusPlus", "MinusMinus", "PostfixPlusPlus", "PostfixMinusMinus")
+    foreach ($unary in @($Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.UnaryExpressionAst]
+    }, $true))) {
+        if ($unary.TokenKind.ToString() -notin $mutationTokens) { continue }
+        if ($unary.Child -is [System.Management.Automation.Language.VariableExpressionAst]) {
+            & $record $unary.Child $unary
+        }
+    }
+
+    $variableMutationCommands = @("Set-Variable", "New-Variable", "Clear-Variable", "Remove-Variable")
+    foreach ($command in @($Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst]
+    }, $true))) {
+        $commandName = $command.GetCommandName()
+        if ($commandName -notin $variableMutationCommands) { continue }
+        $expectName = $false
+        $sawPositionalName = $false
+        for ($index = 1; $index -lt $command.CommandElements.Count; $index++) {
+            $element = $command.CommandElements[$index]
+            if ($element -is [System.Management.Automation.Language.CommandParameterAst]) {
+                $expectName = $element.ParameterName -eq "Name"
+                if ($expectName -and $null -ne $element.Argument -and
+                    $element.Argument -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                    & $recordName $element.Argument.Value $command
+                    $expectName = $false
+                }
+                continue
+            }
+            if ($element -isnot [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                if ($expectName) { $expectName = $false }
+                continue
+            }
+            if ($expectName -or -not $sawPositionalName) {
+                & $recordName $element.Value $command
+                $sawPositionalName = $true
+                $expectName = $false
+            }
+        }
+    }
+
+    if ($violations.Count -gt 0) { throw ($violations -join "`n") }
+}
+
+$automaticVariableGuardCases = @(
+    '$host = "blocked"',
+    'param([string]$HOST)',
+    'foreach ($Host in @("blocked")) { }',
+    '++$global:Host',
+    '${script:HOST}--',
+    '$safe, $Host = @("safe", "blocked")',
+    'Set-Variable -Name Host -Value "blocked"'
+)
+foreach ($guardCase in $automaticVariableGuardCases) {
+    $guardTokens = $null
+    $guardErrors = $null
+    $guardAst = [System.Management.Automation.Language.Parser]::ParseInput($guardCase, [ref]$guardTokens, [ref]$guardErrors)
+    if ($guardErrors.Count -gt 0) { throw ($guardErrors | Out-String) }
+    $guardRejected = $false
+    try { Assert-NoReadOnlyAutomaticVariableWrites $guardAst "automatic-variable-guard-fixture" } catch { $guardRejected = $true }
+    if (-not $guardRejected) { throw "automatic-variable guard accepted: $guardCase" }
+}
+$safeGuardTokens = $null
+$safeGuardErrors = $null
+$safeGuardAst = [System.Management.Automation.Language.Parser]::ParseInput(
+    '$connectionHost = "safe"; $Host.UI.RawUI.BackgroundColor = "Red"',
+    [ref]$safeGuardTokens,
+    [ref]$safeGuardErrors
+)
+if ($safeGuardErrors.Count -gt 0) { throw ($safeGuardErrors | Out-String) }
+Assert-NoReadOnlyAutomaticVariableWrites $safeGuardAst "automatic-variable-safe-fixture"
+
+$productionPowerShellFiles = @(Get-ChildItem -LiteralPath (Join-Path $root "clash-patch/scripts") -Filter "*.ps1" -File -Recurse)
+foreach ($productionPowerShellFile in $productionPowerShellFiles) {
+    $productionTokens = $null
+    $productionParseErrors = $null
+    $productionAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $productionPowerShellFile.FullName,
+        [ref]$productionTokens,
+        [ref]$productionParseErrors
+    )
+    if ($productionParseErrors.Count -gt 0) { throw ($productionParseErrors | Out-String) }
+    Assert-NoReadOnlyAutomaticVariableWrites $productionAst $productionPowerShellFile.FullName
+}
+
 $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($installer, [ref]$tokens, [ref]$parseErrors)
@@ -129,7 +316,7 @@ function Assert-InstallerRejectsScript([string]$Name, [string]$Script, [string]$
 try {
     New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
     if ($onWindows) {
-        $fakeCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nexit /b 0`r`n"
+        $fakeCoreText = "@echo off`r`necho %*>>`"%~dp0mihomo-arguments.log`"`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nexit /b 0`r`n"
     } else {
         $fakeCoreText = "#!/bin/sh`nif [ `"`${1:-}`" = `"-v`" ]; then`n  echo 'Mihomo Meta v1.19.27 test arm64'`nfi`nexit 0`n"
     }
@@ -241,6 +428,111 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
     $routeObservation = Invoke-TestPowerShell $routeHarnessPath @()
     Assert-True ($routeObservation.ExitCode -eq 0) "Observe-Route crashed on a matching connection: $($routeObservation.Output)"
 
+    if ($onWindows) {
+        $controllerReadyPath = Join-Path $sandbox "route-controller-ready"
+        $portProbe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $portProbe.Start()
+        $routeControllerPort = ([System.Net.IPEndPoint]$portProbe.LocalEndpoint).Port
+        $portProbe.Stop()
+        $routeControllerJob = Start-Job -ArgumentList @($routeControllerPort, $controllerReadyPath) -ScriptBlock {
+            param([int]$Port, [string]$ReadyPath)
+            $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+            $listener.Start()
+            [System.IO.File]::WriteAllText($ReadyPath, "ready")
+            $connectionRequest = 0
+            try {
+                for ($requestNumber = 0; $requestNumber -lt 9; $requestNumber++) {
+                    $client = $listener.AcceptTcpClient()
+                    try {
+                        $stream = $client.GetStream()
+                        $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::ASCII, $false, 1024, $true)
+                        $requestLine = $reader.ReadLine()
+                        $headers = @{}
+                        while ($true) {
+                            $line = $reader.ReadLine()
+                            if ([string]::IsNullOrEmpty($line)) { break }
+                            $separator = $line.IndexOf(":")
+                            if ($separator -gt 0) {
+                                $headers[$line.Substring(0, $separator).Trim()] = $line.Substring($separator + 1).Trim()
+                            }
+                        }
+                        $path = $requestLine.Split(" ")[1]
+                        $status = "200 OK"
+                        if ($headers["Authorization"] -ne "Bearer fixture-secret") {
+                            $status = "401 Unauthorized"
+                            $body = '{"error":"unauthorized"}'
+                        } elseif ($path -eq "/proxies") {
+                            $body = @{
+                                proxies = @{
+                                    Proxy = @{ type = "Selector"; now = "Main Node" }
+                                    AI = @{ type = "Selector"; now = "AI Node" }
+                                }
+                            } | ConvertTo-Json -Depth 6 -Compress
+                        } elseif ($path -eq "/connections") {
+                            $connectionRequest += 1
+                            if (($connectionRequest % 2) -eq 1) {
+                                $connections = @()
+                            } else {
+                                $routeIndex = [int]($connectionRequest / 2) - 1
+                                $hosts = @("www.google.com", "openai.com", "www.anthropic.com", "claude.ai")
+                                $groups = @("Proxy", "AI", "AI", "AI")
+                                $nodes = @("Main Node", "AI Node", "AI Node", "AI Node")
+                                $connections = @(@{
+                                    id = "route-$routeIndex"
+                                    metadata = @{ host = $hosts[$routeIndex] }
+                                    chains = @($nodes[$routeIndex], $groups[$routeIndex])
+                                })
+                            }
+                            $body = @{ connections = $connections } | ConvertTo-Json -Depth 6 -Compress
+                        } else {
+                            $status = "404 Not Found"
+                            $body = '{"error":"not_found"}'
+                        }
+                        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+                        $responseHead = "HTTP/1.1 $status`r`nContent-Type: application/json`r`nContent-Length: $($bodyBytes.Length)`r`nConnection: close`r`n`r`n"
+                        $headBytes = [System.Text.Encoding]::ASCII.GetBytes($responseHead)
+                        $stream.Write($headBytes, 0, $headBytes.Length)
+                        $stream.Write($bodyBytes, 0, $bodyBytes.Length)
+                        $stream.Flush()
+                        $reader.Dispose()
+                    } finally {
+                        $client.Dispose()
+                    }
+                }
+            } finally {
+                $listener.Stop()
+            }
+        }
+        $fakeCurlDirectory = Join-Path $sandbox "fake-curl"
+        New-Item -ItemType Directory -Path $fakeCurlDirectory -Force | Out-Null
+        Copy-Item -LiteralPath (Join-Path (Join-Path $env:SystemRoot "System32") "where.exe") -Destination (Join-Path $fakeCurlDirectory "curl.exe")
+        $previousPath = $env:PATH
+        try {
+            $readyDeadline = [DateTime]::UtcNow.AddSeconds(10)
+            while (-not (Test-Path -LiteralPath $controllerReadyPath) -and [DateTime]::UtcNow -lt $readyDeadline) {
+                Start-Sleep -Milliseconds 100
+            }
+            Assert-True (Test-Path -LiteralPath $controllerReadyPath) "route success controller did not start: $(Receive-Job $routeControllerJob -Keep | Out-String)"
+            $env:PATH = $fakeCurlDirectory + [System.IO.Path]::PathSeparator + $previousPath
+            $routeSuccess = Invoke-TestPowerShell $routeVerifier @(
+                "-ControllerUrl", "http://127.0.0.1:$routeControllerPort",
+                "-Secret", "fixture-secret",
+                "-ObservationSeconds", "2",
+                "-Json"
+            )
+            $routeSuccessResult = Assert-JsonResult $routeSuccess "verify_routes" 0
+            Assert-True ($routeSuccessResult.code -eq "routes_verified") "route verifier success code mismatch"
+            Assert-True (@($routeSuccessResult.checks).Count -eq 4) "route verifier did not report all four route checks"
+            Assert-True (@($routeSuccessResult.checks | Where-Object { -not [bool]$_.ok }).Count -eq 0) "route verifier reported a failed check on its success path"
+        } finally {
+            $env:PATH = $previousPath
+            if ($null -ne $routeControllerJob) {
+                Stop-Job $routeControllerJob -ErrorAction SilentlyContinue
+                Remove-Job $routeControllerJob -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
     $brokenPackageRoot = Join-Path $sandbox "broken-package"
     New-Item -ItemType Directory -Path $brokenPackageRoot -Force | Out-Null
     $brokenInstaller = Join-Path $brokenPackageRoot "install_windows.ps1"
@@ -290,6 +582,17 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
     Assert-True ($profileTwoScript.Contains("cnDomainProvider")) "profile 2 script omitted the China-domain provider"
     $savedProfileTwo = Get-Content -LiteralPath (Join-Path $lightCase "clash-patch-usage-profile.json") -Raw | ConvertFrom-Json
     Assert-True ([int]$savedProfileTwo.Profile -eq 2) "profile 2 was not saved"
+
+    $downgradeCase = Join-Path $sandbox "downgrade-without-uninstall-case"
+    New-Item -ItemType Directory -Path $downgradeCase -Force | Out-Null
+    $downgradeStatePath = Join-Path $downgradeCase "clash-patch-usage-profile.json"
+    $downgradeState = '{"Version":1,"Profile":3}' + "`r`n"
+    [System.IO.File]::WriteAllText($downgradeStatePath, $downgradeState)
+    $downgradeResult = Invoke-TestPowerShell $installer @("-AppHome", $downgradeCase, "-UsageProfile", "1", "-MihomoPath", $fakeCore)
+    Assert-True ($downgradeResult.ExitCode -eq 1) "profile 3 downgrade proceeded without the required safe uninstall"
+    Assert-True ($downgradeResult.Output.Contains("先运行安全卸载")) "profile 3 downgrade rejection did not explain the required safe uninstall"
+    Assert-True ((Get-Content -LiteralPath $downgradeStatePath -Raw) -eq $downgradeState) "rejected downgrade changed the saved usage profile"
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path (Join-Path $downgradeCase "profiles") "Script.js"))) "rejected downgrade changed the global script"
 
     $unitStage = Set-YamlTopLevelScalar "ipv6 : true`ntun: null`n" "ipv6" "false"
     Assert-True ($unitStage -match '(?m)^tun:') "scalar transform lost tun node: $($unitStage | ConvertTo-Json -Compress)"
@@ -521,6 +824,33 @@ items:
     Assert-True $restoreFailed "rollback did not report a restore failure"
     Assert-True ((Get-Content -LiteralPath $continuePath -Raw) -eq "restored") "rollback stopped before restoring earlier targets"
 
+    if ($onWindows) {
+        $rejectingCore = Join-Path $sandbox "mihomo-reject.cmd"
+        $rejectingCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nexit /b 17`r`n"
+        [System.IO.File]::WriteAllText($rejectingCore, $rejectingCoreText, [System.Text.Encoding]::ASCII)
+        $validationFailureCase = Join-Path $sandbox "mihomo-validation-failure-case"
+        New-Item -ItemType Directory -Path $validationFailureCase -Force | Out-Null
+        $validationConfig = "ipv6: true`ntun: null`n"
+        $validationVerge = "enable_tun_mode: false`n"
+        $validationProfiles = "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n"
+        $validationUsage = '{"Version":1,"Profile":1}' + "`r`n"
+        [System.IO.File]::WriteAllText((Join-Path $validationFailureCase "config.yaml"), $validationConfig)
+        [System.IO.File]::WriteAllText((Join-Path $validationFailureCase "verge.yaml"), $validationVerge)
+        [System.IO.File]::WriteAllText((Join-Path $validationFailureCase "profiles.yaml"), $validationProfiles)
+        [System.IO.File]::WriteAllText((Join-Path $validationFailureCase "clash-patch-usage-profile.json"), $validationUsage)
+
+        $validationFailure = Invoke-TestPowerShell $installer @(
+            "-AppHome", $validationFailureCase, "-UsageProfile", "3", "-MihomoPath", $rejectingCore
+        )
+
+        Assert-True ($validationFailure.ExitCode -eq 1) "installer ignored a failed Mihomo candidate validation"
+        Assert-True ((Get-Content -LiteralPath (Join-Path $validationFailureCase "config.yaml") -Raw) -eq $validationConfig) "failed Mihomo validation changed config.yaml"
+        Assert-True ((Get-Content -LiteralPath (Join-Path $validationFailureCase "verge.yaml") -Raw) -eq $validationVerge) "failed Mihomo validation changed verge.yaml"
+        Assert-True ((Get-Content -LiteralPath (Join-Path $validationFailureCase "profiles.yaml") -Raw) -eq $validationProfiles) "failed Mihomo validation changed profiles.yaml"
+        Assert-True ((Get-Content -LiteralPath (Join-Path $validationFailureCase "clash-patch-usage-profile.json") -Raw) -eq $validationUsage) "failed Mihomo validation changed the usage profile"
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path (Join-Path $validationFailureCase "profiles") "Script.js"))) "failed Mihomo validation created Script.js"
+    }
+
     $nullCase = Join-Path $sandbox "null-case"
     New-Item -ItemType Directory -Path $nullCase -Force | Out-Null
     [System.IO.File]::WriteAllText((Join-Path $nullCase "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
@@ -537,6 +867,11 @@ items:
     Assert-True ($profilesBackups.Count -ge 1) "profiles.yaml was changed without a dated backup"
     $nullCaseJson = Invoke-TestPowerShell $installer @("-AppHome", $nullCase, "-MihomoPath", $fakeCore, "-Json")
     Assert-JsonResult $nullCaseJson "install" 0 | Out-Null
+    if ($onWindows) {
+        $mihomoArguments = Get-Content -LiteralPath (Join-Path $sandbox "mihomo-arguments.log") -Raw
+        Assert-True ($mihomoArguments -match '(?m)(^| )-t( |$)') "installer never asked Mihomo to test a generated candidate"
+        Assert-True ($mihomoArguments -match '(?m)(^| )-f( |$)') "installer never passed the generated candidate to Mihomo"
+    }
 
     if ($onWindows) {
         $runningCase = Join-Path $sandbox "running-client-case"
@@ -594,6 +929,31 @@ items:
     [System.IO.File]::WriteAllText($composedPath, $composedWithSuffix)
     Invoke-Installer $composeCase
     Assert-True ((Get-Content -LiteralPath $composedPath -Raw).Contains("const friendAfterPatch = true;")) "reinstall discarded code after the managed block"
+    if ($onWindows) {
+        $generatedScriptHarness = Join-Path $sandbox "run-generated-script.js"
+        $generatedScriptHarnessSource = @'
+const fs = require("node:fs");
+const vm = require("node:vm");
+const generatedPath = process.argv[2];
+const context = {};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(generatedPath, "utf8"), context, { filename: generatedPath });
+const result = context.main({
+  proxies: [{ name: "Node", type: "ss", server: "proxy.invalid", password: "fixture-secret" }],
+  "proxy-groups": [{ name: "Main", type: "select", proxies: ["Node"] }],
+  dns: { enable: true, nameserver: ["223.5.5.5"], "nameserver-policy": {} },
+  rules: ["MATCH,Main"]
+});
+if (!result || result.friend !== true) throw new Error("previous main did not run");
+if (!result["rule-providers"] || !Object.keys(result["rule-providers"]).some((name) => name.indexOf("clash-patch-cn-domain") === 0)) {
+  throw new Error("Clash Patch transform did not run");
+}
+'@
+        [System.IO.File]::WriteAllText($generatedScriptHarness, $generatedScriptHarnessSource, (New-Object System.Text.UTF8Encoding($false)))
+        $node = Get-Command node.exe -ErrorAction Stop
+        $generatedScriptOutput = & $node.Source $generatedScriptHarness $composedPath 2>&1 | Out-String
+        Assert-True ($LASTEXITCODE -eq 0) "generated Script.js failed syntax or execution: $generatedScriptOutput"
+    }
     Invoke-Uninstaller $composeCase
     $restoredScript = Get-Content -LiteralPath (Join-Path $composeProfiles "Script.js") -Raw
     Assert-True ($restoredScript.Contains($originalScript.Trim())) "uninstaller did not restore the composed script"
@@ -612,12 +972,16 @@ items:
     [System.IO.File]::WriteAllText((Join-Path $asyncCase "verge.yaml"), $asyncVerge)
     $asyncScriptPath = Join-Path $asyncProfiles "Script.js"
     [System.IO.File]::WriteAllText($asyncScriptPath, $asyncScript)
-    $asyncResult = Invoke-TestPowerShell $installer @("-AppHome", $asyncCase, "-MihomoPath", $fakeCore)
+    $asyncUsageStatePath = Join-Path $asyncCase "clash-patch-usage-profile.json"
+    $asyncUsageState = '{"Version":1,"Profile":1}' + "`r`n"
+    [System.IO.File]::WriteAllText($asyncUsageStatePath, $asyncUsageState)
+    $asyncResult = Invoke-TestPowerShell $installer @("-AppHome", $asyncCase, "-UsageProfile", "3", "-MihomoPath", $fakeCore)
     Assert-True ($asyncResult.ExitCode -eq 1) "installer accepted an async main that Clash Verge Rev cannot await"
     Assert-True ($asyncResult.Output.Contains("异步 main")) "async main rejection did not explain the incompatibility"
     Assert-True ((Get-Content -LiteralPath $asyncScriptPath -Raw) -eq $asyncScript) "async main rejection changed Script.js"
     Assert-True ((Get-Content -LiteralPath (Join-Path $asyncCase "config.yaml") -Raw) -eq $asyncConfig) "async main rejection changed config.yaml"
     Assert-True ((Get-Content -LiteralPath (Join-Path $asyncCase "verge.yaml") -Raw) -eq $asyncVerge) "async main rejection changed verge.yaml"
+    Assert-True ((Get-Content -LiteralPath $asyncUsageStatePath -Raw) -eq $asyncUsageState) "failed install changed the saved usage profile"
 
     $templateMarkerCase = Join-Path $sandbox "template-marker-case"
     $templateMarkerProfiles = Join-Path $templateMarkerCase "profiles"

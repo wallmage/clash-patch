@@ -190,7 +190,8 @@ class SkillContractTest < Minitest::Test
     assert_includes policy, "只有档位 3"
     assert_includes mac_installer, '--usage-profile "$USAGE_PROFILE"'
     assert_includes windows_installer, 'if ($resolvedUsageProfile -ne 3)'
-    assert_includes windows_installer, "检测到从档位 3 改为轻量档位"
+    assert_includes windows_installer, '$savedUsageProfile -eq 3'
+    assert_includes windows_installer, "必须先运行安全卸载"
   end
 
   def test_all_profiles_share_one_managed_china_domain_baseline
@@ -956,6 +957,22 @@ class SkillContractTest < Minitest::Test
     assert_includes workflow, "--test-coverage-branches=80"
     assert_includes workflow, "shell: powershell"
     assert_includes workflow, "Get-Command powershell.exe"
+    assert_includes workflow, "shell: pwsh"
+    assert_includes workflow, "Get-Command pwsh.exe"
+    assert_includes workflow, "git diff --check"
+  end
+
+  def test_windows_runtime_tests_use_powershell_ast_for_automatic_variable_writes
+    source = File.read(File.join(ROOT, "tests/test_windows_installer.ps1"))
+
+    assert_includes source, "Assert-NoReadOnlyAutomaticVariableWrites"
+    assert_includes source, "AssignmentStatementAst"
+    assert_includes source, "ParameterAst"
+    assert_includes source, "ForEachStatementAst"
+    assert_includes source, "UnaryExpressionAst"
+    assert_includes source, "PostfixPlusPlus"
+    assert_includes source, "CommandAst"
+    assert_includes source, "Set-Variable"
   end
 
   def test_all_public_commands_expose_the_versioned_result_contract
