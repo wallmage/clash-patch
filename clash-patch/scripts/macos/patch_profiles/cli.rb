@@ -103,6 +103,7 @@ module ClashPatch
       print_core_status: false,
       print_subscription_auto_update_state: false,
       disable_subscription_auto_update: false,
+      enable_subscription_auto_update: false,
       snapshot_initial: false,
       list_backups: false,
       compare_backup: nil,
@@ -124,6 +125,7 @@ module ClashPatch
       opts.on("--print-core-status", "检查 Mihomo 内核是否满足最低版本") { options[:print_core_status] = true }
       opts.on("--print-subscription-auto-update-state", "输出订阅自动更新状态") { options[:print_subscription_auto_update_state] = true }
       opts.on("--disable-subscription-auto-update", "关闭订阅自动更新并回读确认") { options[:disable_subscription_auto_update] = true }
+      opts.on("--enable-subscription-auto-update", "恢复订阅自动更新并回读确认") { options[:enable_subscription_auto_update] = true }
       opts.on("--snapshot-initial", "为当前存储位置创建一次初始快照") { options[:snapshot_initial] = true }
       opts.on("--list-backups", "按时间倒序列出可用备份") { options[:list_backups] = true }
       opts.on("--compare-backup ID", "比较指定备份与当前配置") { |value| options[:compare_backup] = value }
@@ -195,6 +197,28 @@ module ClashPatch
         return emit_cli_result(
           operation: "disable_subscription_auto_update", exit_code: 1, status: "failed",
           code: "auto_update_failed", summary_zh: "无法关闭订阅自动更新。"
+        ) if options[:json]
+        warn error.message
+        return 1
+      end
+    end
+
+    if options[:enable_subscription_auto_update]
+      begin
+        result = enable_subscription_auto_update
+        return emit_cli_result(
+          operation: "enable_subscription_auto_update", exit_code: 0,
+          status: result.fetch(:status) == :already_enabled ? "no_change" : "ok",
+          code: result.fetch(:status).to_s,
+          summary_zh: result.fetch(:status) == :already_enabled ? "订阅自动更新已经开启。" : "已恢复订阅自动更新。",
+          changes: result.fetch(:status) == :already_enabled ? [] : ["subscription_auto_update"]
+        ) if options[:json]
+        puts result.fetch(:status)
+        return 0
+      rescue InvalidConfigError, SystemCallError, IOError => error
+        return emit_cli_result(
+          operation: "enable_subscription_auto_update", exit_code: 1, status: "failed",
+          code: "auto_update_restore_failed", summary_zh: "无法恢复订阅自动更新。"
         ) if options[:json]
         warn error.message
         return 1

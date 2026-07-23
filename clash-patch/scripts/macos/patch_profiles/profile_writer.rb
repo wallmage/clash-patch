@@ -54,8 +54,6 @@ module ClashPatch
       if second_pass[:changed] || second_pass[:config] != candidate_config
         return base_result(config, :non_idempotent).merge(path: path)
       end
-      return result.merge(path: path, dry_run: true) if dry_run
-
       Tempfile.create([File.basename(write_path), ".tmp"], File.dirname(write_path), encoding: "UTF-8") do |temporary|
         temporary.write(patched_text)
         temporary.flush
@@ -70,6 +68,7 @@ module ClashPatch
             return base_result(config, :validation_failed).merge(path: path)
           end
         end
+        return result.merge(path: path, dry_run: true) if dry_run
 
         source.rewind
         if !locked_source_current?(source, path, write_path) || source.read != original_bytes
@@ -130,17 +129,45 @@ module ClashPatch
     roots = directories || (directory ? [directory] : default_profile_directories)
     active_root = active_directory || active_profile_root(roots, selected, directory)
 
-    results = roots.flat_map do |root|
+    work_items = roots.flat_map do |root|
       paths = profile_paths(root)
       unless active_profile?(File.join(root, "config.yaml"), selected)
         paths = paths.reject { |path| File.basename(path).casecmp("config.yaml").zero? }
       end
       paths.map do |path|
+        {
+          path: path,
+          active: active_root &&
+            File.expand_path(File.dirname(path)) == File.expand_path(active_root) &&
+            active_profile?(path, selected)
+        }
+      end
+    end
+
+    preflight = work_items.map do |item|
+      result = patch_path(
+        item.fetch(:path), policy, dry_run: true, backup_root: nil,
+        validator: validator, usage_profile: usage_profile
+      )
+      result[:active] = item.fetch(:active)
+      result
+    end
+    return preflight if dry_run
+
+    unless preflight.all? { |result| %i[updated unchanged].include?(result[:status]) }
+      return preflight.map do |result|
+        result[:status] == :updated ? result.merge(status: :batch_aborted, dry_run: false) : result
+      end
+    end
+
+    results = []
+    work_items.sort_by { |item| item.fetch(:active) ? 1 : 0 }.each do |item|
+      path = item.fetch(:path)
         result = patch_path(
           path, policy, dry_run: dry_run, backup_root: backup_root,
           validator: validator, usage_profile: usage_profile
         )
-        result[:active] = active_root && File.expand_path(File.dirname(path)) == File.expand_path(active_root) && active_profile?(path, selected)
+        result[:active] = item.fetch(:active)
         if auto_reload && !dry_run && result[:active] && result[:status] == :updated
           result = activate_updated_profile(
             result,
@@ -150,8 +177,15 @@ module ClashPatch
             require_tun: usage_profile >= 2
           )
         end
-        result
-      end
+        results << result
+        next if %i[updated unchanged].include?(result[:status])
+
+        results.reverse_each do |prior|
+          next unless prior[:status] == :updated
+
+          prior[:status] = restore_profile_bytes(prior) ? :batch_rolled_back : :batch_rollback_failed
+        end
+        break
     end
 
     results

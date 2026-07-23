@@ -919,6 +919,31 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_enables_subscription_auto_update_and_verifies_the_result
+    calls = []
+    values = ["0", "1"]
+    runner = lambda do |*arguments, **_options|
+      calls << arguments
+      if arguments[1] == "export"
+        ["plist", "", Struct.new(:success?).new(true)]
+      elsif arguments[1] == "write"
+        ["", "", Struct.new(:success?).new(true)]
+      elsif arguments[0] == "/usr/bin/plutil"
+        [values.shift, "", Struct.new(:success?).new(true)]
+      else
+        flunk("unexpected command: #{arguments.inspect}")
+      end
+    end
+
+    result = ClashPatch.enable_subscription_auto_update(runner: runner)
+
+    assert_equal :enabled, result.fetch(:status)
+    assert_includes calls, [
+      "/usr/bin/defaults", "write", "com.metacubex.ClashX.meta",
+      "kAutoUpdateEnable", "-bool", "true"
+    ]
+  end
+
   def test_remote_subscription_records_map_every_client_entry_without_exposing_urls
     Dir.mktmpdir do |directory|
       %w[MESL Yue Express].each { |name| File.write(File.join(directory, "#{name}.yaml"), YAML.dump(base_config)) }
@@ -1357,7 +1382,7 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
-  def test_deep_yaml_isolated_to_one_profile_in_batch
+  def test_deep_yaml_aborts_the_batch_before_other_profiles_are_written
     Dir.mktmpdir do |directory|
       deep_path = File.join(directory, "deep.yaml")
       good_path = File.join(directory, "good.yaml")
@@ -1365,15 +1390,16 @@ class MacosPatcherTest < Minitest::Test
       lines = (0...depth).map { |index| "#{'  ' * index}level#{index}:" }
       lines << "#{'  ' * depth}leaf: value"
       File.write(deep_path, lines.join("\n") + "\n")
-      File.write(good_path, YAML.dump(base_config))
+      good_original = YAML.dump(base_config)
+      File.write(good_path, good_original)
 
       results = ClashPatch.run(directories: [directory], policy_path: POLICY_PATH,
                                selected_name: "good")
       by_name = results.each_with_object({}) { |result, memo| memo[File.basename(result.fetch(:path))] = result }
 
       assert_includes %i[invalid error], by_name.fetch("deep.yaml").fetch(:status)
-      assert_equal :updated, by_name.fetch("good.yaml").fetch(:status)
-      assert_equal false, ClashPatch.load_yaml(File.read(good_path)).fetch("ipv6")
+      assert_equal :batch_aborted, by_name.fetch("good.yaml").fetch(:status)
+      assert_equal good_original, File.read(good_path)
     end
   end
 
@@ -2811,6 +2837,19 @@ class MacosPatcherTest < Minitest::Test
         assert_empty error
         assert_equal "auto_update_failed", JSON.parse(output).fetch("code")
       end
+      ClashPatch.stub(:enable_subscription_auto_update, { status: :enabled }) do
+        output, = capture_io do
+          assert_equal 0, ClashPatch.cli(["--json", "--enable-subscription-auto-update"])
+        end
+        assert_equal "enabled", JSON.parse(output).fetch("code")
+      end
+      ClashPatch.stub(:enable_subscription_auto_update, -> { raise ClashPatch::InvalidConfigError }) do
+        output, error = capture_io do
+          assert_equal 1, ClashPatch.cli(["--json", "--enable-subscription-auto-update"])
+        end
+        assert_empty error
+        assert_equal "auto_update_restore_failed", JSON.parse(output).fetch("code")
+      end
     end
   end
 
@@ -2973,6 +3012,26 @@ class MacosPatcherTest < Minitest::Test
       _output, _error = capture_io do
         assert_equal 1, ClashPatch.cli(["--profile-dir", "/private", "--usage-profile", "3"])
       end
+    end
+  end
+
+  def test_normal_batch_aborts_before_writing_when_a_later_profile_fails
+    Dir.mktmpdir do |directory|
+      first = File.join(directory, "a-valid.yaml")
+      second = File.join(directory, "z-invalid.yaml")
+      original = YAML.dump(base_config)
+      File.write(first, original)
+      File.write(second, "not: [valid")
+
+      results = ClashPatch.run(
+        directory: directory, policy_path: POLICY_PATH,
+        backup_root: File.join(directory, "backups"),
+        validator: ->(_path) { true }, auto_reload: false, usage_profile: 3
+      )
+
+      assert results.any? { |result| result[:status] == :invalid }
+      assert_equal original, File.read(first)
+      assert results.any? { |result| result[:status] == :batch_aborted }
     end
   end
 

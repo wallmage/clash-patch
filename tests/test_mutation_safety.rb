@@ -20,8 +20,10 @@ class MutationSafetyTest < Minitest::Test
   def replace_once(root, relative_path, before, after)
     path = File.join(root, relative_path)
     source = File.binread(path)
-    assert_equal 1, source.scan(before).length, "mutation anchor changed: #{relative_path}"
-    File.binwrite(path, source.sub(before, after))
+    binary_before = before.b
+    binary_after = after.b
+    assert_equal 1, source.scan(binary_before).length, "mutation anchor changed: #{relative_path}"
+    File.binwrite(path, source.sub(binary_before, binary_after))
   end
 
   def assert_mutation_is_killed(root, *command)
@@ -165,6 +167,40 @@ class MutationSafetyTest < Minitest::Test
         root,
         RbConfig.ruby, "tests/test_macos_patcher.rb",
         "--name", "test_route_target_patterns_require_real_domain_boundaries"
+      )
+    end
+  end
+
+  def test_normal_batch_preflight_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/profile_writer.rb",
+        "    unless preflight.all? { |result| %i[updated unchanged].include?(result[:status]) }\n",
+        "    if false && !preflight.all? { |result| %i[updated unchanged].include?(result[:status]) }\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_normal_batch_aborts_before_writing_when_a_later_profile_fails"
+      )
+    end
+  end
+
+  def test_auto_update_compensation_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_macos.sh",
+        'disabled) AUTO_UPDATE_CHANGED=1; say "已自动关闭订阅更新，并保存修改前状态。" ;;',
+        'disabled) say "已自动关闭订阅更新，并保存修改前状态。" ;;'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_wrappers.rb",
+        "--name", "test_profile_three_restores_auto_update_when_a_later_step_fails"
       )
     end
   end

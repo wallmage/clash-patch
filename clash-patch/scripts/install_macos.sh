@@ -22,6 +22,7 @@ SHOW_PROFILE=0
 SAFE_UPDATE=0
 JSON_OUTPUT=0
 OPERATION="install"
+AUTO_UPDATE_CHANGED=0
 
 for argument do
   [ "$argument" = "--json" ] && JSON_OUTPUT=1
@@ -34,6 +35,18 @@ finish() {
   finish_summary=$4
   finish_operation=${5:-$OPERATION}
   finish_profile=${6:-$USAGE_PROFILE}
+  if [ "$finish_exit" -ne 0 ] && [ "$AUTO_UPDATE_CHANGED" -eq 1 ]; then
+    AUTO_UPDATE_CHANGED=0
+    restore_result=$(/usr/bin/ruby "$PATCHER_SOURCE" --enable-subscription-auto-update 2>&1 || true)
+    case "$restore_result" in
+      enabled|already_enabled) ;;
+      *)
+        finish_status=partial
+        finish_code=auto_update_restore_failed
+        finish_summary="操作失败，且订阅自动更新未能恢复。"
+        ;;
+    esac
+  fi
   if [ "$JSON_OUTPUT" -eq 1 ]; then
     if [ -x /usr/bin/ruby ] && [ -f "$RESULT_CONTRACT_SOURCE" ]; then
       if [ -n "$finish_profile" ]; then
@@ -58,6 +71,28 @@ say() {
   /usr/bin/printf '%s\n' "[Clash 补丁] $1"
 }
 
+finish_json_child_failure() {
+  child_json=$1
+  fallback_status=$2
+  fallback_code=$3
+  fallback_summary=$4
+  child_operation=$5
+  child_status=$(/usr/bin/printf '%s' "$child_json" | /usr/bin/ruby -rjson -e 'v=JSON.parse(STDIN.read)[ARGV[0]]; abort unless v.is_a?(String); print v' status 2>/dev/null || true)
+  child_code=$(/usr/bin/printf '%s' "$child_json" | /usr/bin/ruby -rjson -e 'v=JSON.parse(STDIN.read)[ARGV[0]]; abort unless v.is_a?(String); print v' code 2>/dev/null || true)
+  child_summary=$(/usr/bin/printf '%s' "$child_json" | /usr/bin/ruby -rjson -e 'v=JSON.parse(STDIN.read)[ARGV[0]]; abort unless v.is_a?(String); print v' summary_zh 2>/dev/null || true)
+  case "$child_status" in
+    failed|partial|rolled_back|invalid_request|unsupported) ;;
+    *) child_status="" ;;
+  esac
+  case "$child_code" in
+    *[!a-z0-9_]*) child_code="" ;;
+  esac
+  if [ -n "$child_status" ] && [ -n "$child_code" ] && [ -n "$child_summary" ]; then
+    finish 1 "$child_status" "$child_code" "$child_summary" "$child_operation"
+  fi
+  finish 1 "$fallback_status" "$fallback_code" "$fallback_summary" "$child_operation"
+}
+
 usage() {
   [ "$JSON_OUTPUT" -eq 0 ] || return 0
   /usr/bin/printf '%s\n' "用法：install_macos.sh [--profile 1|2|3] [--show-profile] [--safe-update]"
@@ -74,12 +109,18 @@ read_saved_profile() {
   esac
 }
 
-save_profile() {
+assert_profile_state_safe() {
   state_dir=$(/usr/bin/dirname "$USAGE_STATE_PATH")
-  if [ -L "$state_dir" ] || { [ -e "$USAGE_STATE_PATH" ] && { [ ! -f "$USAGE_STATE_PATH" ] || [ -L "$USAGE_STATE_PATH" ]; }; }; then
+  if [ -L "$state_dir" ] || [ -L "$USAGE_STATE_PATH" ] ||
+     { [ -e "$USAGE_STATE_PATH" ] && [ ! -f "$USAGE_STATE_PATH" ]; }; then
     say "档位保存位置不安全，未写入任何设置。"
     finish 7 failed unsafe_profile_state "档位保存位置不安全，未写入任何设置。" save_profile
   fi
+}
+
+save_profile() {
+  assert_profile_state_safe
+  state_dir=$(/usr/bin/dirname "$USAGE_STATE_PATH")
   /bin/mkdir -p "$state_dir"
   /bin/chmod 700 "$state_dir"
   temporary=$(/usr/bin/mktemp "$state_dir/.usage-profile.XXXXXX")
@@ -234,6 +275,10 @@ if [ ! -f "$PATCHER_SOURCE" ] || [ ! -f "$POLICY_SOURCE" ] || [ ! -f "$RESULT_CO
   finish 6 failed incomplete_package "安装包不完整。" install
 fi
 
+if [ "$PROFILE_SOURCE" != "saved" ]; then
+  assert_profile_state_safe
+fi
+
 # 旧版目录监听会被补丁自己的写入再次触发。只移除能核对所有权的旧服务。
 remove_legacy_agent "$CURRENT_PLIST" "$CURRENT_LABEL" "$CURRENT_PATCHER"
 remove_legacy_agent "$LEGACY_PLIST" "$LEGACY_LABEL" "$LEGACY_PATCHER"
@@ -254,7 +299,7 @@ if [ "$USAGE_PROFILE" -eq 3 ]; then
     finish 9 failed auto_update_failed "无法自动关闭订阅自动更新；未修改任何订阅。" install
   fi
   case "$auto_update_result" in
-    disabled) say "已自动关闭订阅更新，并保存修改前状态。" ;;
+    disabled) AUTO_UPDATE_CHANGED=1; say "已自动关闭订阅更新，并保存修改前状态。" ;;
     already_disabled) say "订阅自动更新已经关闭。" ;;
     *) say "订阅自动更新回读结果异常；本次未修改任何订阅。"; finish 9 failed auto_update_verify_failed "订阅自动更新回读结果异常；未修改任何订阅。" install ;;
   esac
@@ -265,16 +310,18 @@ fi
 
 if [ -n "$CUSTOM_PROFILE_DIR" ]; then
   if [ "$JSON_OUTPUT" -eq 1 ]; then
-    /usr/bin/ruby "$PATCHER_SOURCE" --profile-dir "$CUSTOM_PROFILE_DIR" --backup-dir "$BACKUP_DIR" --snapshot-initial --json >/dev/null ||
-      finish 1 failed snapshot_failed "无法创建初始快照。" snapshot_initial
+    if ! child_json=$(/usr/bin/ruby "$PATCHER_SOURCE" --profile-dir "$CUSTOM_PROFILE_DIR" --backup-dir "$BACKUP_DIR" --snapshot-initial --json 2>/dev/null); then
+      finish_json_child_failure "$child_json" failed snapshot_failed "无法创建初始快照。" snapshot_initial
+    fi
   else
     /usr/bin/ruby "$PATCHER_SOURCE" --profile-dir "$CUSTOM_PROFILE_DIR" --backup-dir "$BACKUP_DIR" --snapshot-initial ||
       { say "无法创建初始快照。"; finish 1 failed snapshot_failed "无法创建初始快照。" snapshot_initial; }
   fi
 else
   if [ "$JSON_OUTPUT" -eq 1 ]; then
-    /usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --snapshot-initial --json >/dev/null ||
-      finish 1 failed snapshot_failed "无法创建初始快照。" snapshot_initial
+    if ! child_json=$(/usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --snapshot-initial --json 2>/dev/null); then
+      finish_json_child_failure "$child_json" failed snapshot_failed "无法创建初始快照。" snapshot_initial
+    fi
   else
     /usr/bin/ruby "$PATCHER_SOURCE" --backup-dir "$BACKUP_DIR" --snapshot-initial ||
       { say "无法创建初始快照。"; finish 1 failed snapshot_failed "无法创建初始快照。" snapshot_initial; }
@@ -284,13 +331,14 @@ fi
 if [ "$SAFE_UPDATE" -eq 1 ]; then
   if [ -n "$CUSTOM_PROFILE_DIR" ]; then
     if [ "$JSON_OUTPUT" -eq 1 ]; then
-      /usr/bin/ruby "$PATCHER_SOURCE" \
+      if ! child_json=$(/usr/bin/ruby "$PATCHER_SOURCE" \
         --profile-dir "$CUSTOM_PROFILE_DIR" \
         --policy "$POLICY_SOURCE" \
         --backup-dir "$BACKUP_DIR" \
         --safe-update-all \
-        --usage-profile "$USAGE_PROFILE" --json >/dev/null ||
-        finish 1 failed safe_update_failed "安全更新失败。" safe_update
+        --usage-profile "$USAGE_PROFILE" --json 2>/dev/null); then
+        finish_json_child_failure "$child_json" failed safe_update_failed "安全更新失败。" safe_update
+      fi
     else
       /usr/bin/ruby "$PATCHER_SOURCE" \
         --profile-dir "$CUSTOM_PROFILE_DIR" \
@@ -302,12 +350,13 @@ if [ "$SAFE_UPDATE" -eq 1 ]; then
     fi
   else
     if [ "$JSON_OUTPUT" -eq 1 ]; then
-      /usr/bin/ruby "$PATCHER_SOURCE" \
+      if ! child_json=$(/usr/bin/ruby "$PATCHER_SOURCE" \
         --policy "$POLICY_SOURCE" \
         --backup-dir "$BACKUP_DIR" \
         --safe-update-all \
-        --usage-profile "$USAGE_PROFILE" --json >/dev/null ||
-        finish 1 failed safe_update_failed "安全更新失败。" safe_update
+        --usage-profile "$USAGE_PROFILE" --json 2>/dev/null); then
+        finish_json_child_failure "$child_json" failed safe_update_failed "安全更新失败。" safe_update
+      fi
     else
       /usr/bin/ruby "$PATCHER_SOURCE" \
         --policy "$POLICY_SOURCE" \
@@ -327,11 +376,12 @@ fi
 
 if [ -n "$CUSTOM_PROFILE_DIR" ]; then
   if [ "$JSON_OUTPUT" -eq 1 ]; then
-    /usr/bin/ruby "$PATCHER_SOURCE" \
+    if ! child_json=$(/usr/bin/ruby "$PATCHER_SOURCE" \
       --profile-dir "$CUSTOM_PROFILE_DIR" \
       --policy "$POLICY_SOURCE" \
-      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE" --json >/dev/null ||
-      finish 1 failed patch_failed "配置处理失败。" patch_profiles
+      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE" --json 2>/dev/null); then
+      finish_json_child_failure "$child_json" failed patch_failed "配置处理失败。" patch_profiles
+    fi
   else
     /usr/bin/ruby "$PATCHER_SOURCE" \
       --profile-dir "$CUSTOM_PROFILE_DIR" \
@@ -341,10 +391,11 @@ if [ -n "$CUSTOM_PROFILE_DIR" ]; then
   fi
 else
   if [ "$JSON_OUTPUT" -eq 1 ]; then
-    /usr/bin/ruby "$PATCHER_SOURCE" \
+    if ! child_json=$(/usr/bin/ruby "$PATCHER_SOURCE" \
       --policy "$POLICY_SOURCE" \
-      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE" --json >/dev/null ||
-      finish 1 failed patch_failed "配置处理失败。" patch_profiles
+      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE" --json 2>/dev/null); then
+      finish_json_child_failure "$child_json" failed patch_failed "配置处理失败。" patch_profiles
+    fi
   else
     /usr/bin/ruby "$PATCHER_SOURCE" \
       --policy "$POLICY_SOURCE" \

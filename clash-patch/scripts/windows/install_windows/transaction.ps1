@@ -126,6 +126,127 @@ function Get-FileSha256([string]$Path) {
     return (Get-BytesSha256 ([System.IO.File]::ReadAllBytes($Path)))
 }
 
+function Get-StreamBytes([System.IO.FileStream]$Stream) {
+    $Stream.Position = 0
+    $memory = New-Object System.IO.MemoryStream
+    try {
+        $Stream.CopyTo($memory)
+        return $memory.ToArray()
+    } finally {
+        $memory.Dispose()
+    }
+}
+
+function Write-LockedStreamBytes(
+    [System.IO.FileStream]$Stream,
+    [byte[]]$Replacement,
+    [byte[]]$Original
+) {
+    try {
+        $Stream.Position = 0
+        $Stream.Write($Replacement, 0, $Replacement.Length)
+        $Stream.SetLength($Replacement.Length)
+        $Stream.Flush($true)
+    } catch {
+        $writeError = $_
+        try {
+            $Stream.Position = 0
+            $Stream.Write($Original, 0, $Original.Length)
+            $Stream.SetLength($Original.Length)
+            $Stream.Flush($true)
+        } catch {
+            throw "写入失败，且原内容恢复失败：$($_.Exception.Message)"
+        }
+        throw $writeError
+    }
+}
+
+function Invoke-VerifiedFileTransaction([object[]]$Targets) {
+    $opened = @()
+    $operationFailure = $null
+    $recoveryFailures = @()
+    try {
+        foreach ($target in @($Targets | Sort-Object Path)) {
+            $directory = Split-Path -Parent $target.Path
+            if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+                New-Item -ItemType Directory -Path $directory -Force | Out-Null
+            }
+            if ([bool]$target.Existed) {
+                $stream = [System.IO.File]::Open(
+                    $target.Path,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::ReadWrite,
+                    [System.IO.FileShare]::Read
+                )
+                $current = Get-StreamBytes $stream
+                if ((Get-BytesSha256 $current) -ne (Get-BytesSha256 $target.OriginalBytes)) {
+                    $stream.Dispose()
+                    throw "目标文件在候选生成后发生变化，拒绝覆盖：$($target.Path)"
+                }
+            } else {
+                if (Test-Path -LiteralPath $target.Path) {
+                    throw "目标路径在候选生成后出现，拒绝覆盖：$($target.Path)"
+                }
+                $stream = [System.IO.File]::Open(
+                    $target.Path,
+                    [System.IO.FileMode]::CreateNew,
+                    [System.IO.FileAccess]::ReadWrite,
+                    [System.IO.FileShare]::Read
+                )
+                $current = [byte[]]@()
+            }
+            $opened += [pscustomobject]@{ Target = $target; Stream = $stream; Original = $current }
+        }
+
+        foreach ($entry in $opened) {
+            Write-LockedStreamBytes $entry.Stream $entry.Target.Bytes $entry.Original
+        }
+        foreach ($entry in $opened) {
+            if ((Get-BytesSha256 (Get-StreamBytes $entry.Stream)) -ne (Get-BytesSha256 $entry.Target.Bytes)) {
+                throw "写入后的文件与已验证候选不一致：$($entry.Target.Path)"
+            }
+        }
+    } catch {
+        $operationFailure = $_
+    } finally {
+        if ($null -ne $operationFailure) {
+            for ($i = $opened.Count - 1; $i -ge 0; $i--) {
+                $entry = $opened[$i]
+                if ([bool]$entry.Target.Existed) {
+                    try {
+                        Write-LockedStreamBytes $entry.Stream $entry.Original (Get-StreamBytes $entry.Stream)
+                    } catch {
+                        $recoveryFailures += "$($entry.Target.Path)：$($_.Exception.Message)"
+                    }
+                }
+            }
+        }
+        foreach ($entry in $opened) {
+            try {
+                $entry.Stream.Dispose()
+            } catch {
+                $recoveryFailures += "$($entry.Target.Path)：关闭文件失败：$($_.Exception.Message)"
+            }
+        }
+        if ($null -ne $operationFailure) {
+            foreach ($entry in $opened) {
+                if (-not [bool]$entry.Target.Existed -and (Test-Path -LiteralPath $entry.Target.Path)) {
+                    try {
+                        Remove-Item -LiteralPath $entry.Target.Path -Force
+                    } catch {
+                        $recoveryFailures += "$($entry.Target.Path)：删除新文件失败：$($_.Exception.Message)"
+                    }
+                }
+            }
+        }
+    }
+    if ($recoveryFailures.Count -gt 0) {
+        $operationMessage = if ($null -eq $operationFailure) { "文件清理失败" } else { $operationFailure.Exception.Message }
+        throw ("事务失败：$operationMessage；回滚未能恢复所有文件：" + ($recoveryFailures -join "；"))
+    }
+    if ($null -ne $operationFailure) { throw $operationFailure }
+}
+
 
 function Restore-Transaction([object[]]$Targets) {
     $failures = @()

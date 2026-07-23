@@ -900,7 +900,7 @@ test('Windows installation fails closed and preserves exact restore state', () =
   assert.match(installer, /Mihomo 1\.19\.27/);
   assert.match(installer, /Join-Path \(Join-Path \$env:LOCALAPPDATA "Clash Verge"\) "verge-mihomo\.exe"/);
   assert.match(installer, /function Test-ClashVergeRunning/);
-  assert.match(installer, /if \(\$clientRunning\)[\s\S]*\$runningTargets[\s\S]*Write-BytesAtomic \$target\.Path \$target\.Bytes[\s\S]*exit 0/);
+  assert.match(installer, /if \(\$clientRunning\)[\s\S]*\$runningTargets[\s\S]*Invoke-VerifiedFileTransaction \$runningTargets[\s\S]*exit 0/);
   assert.match(installer, /WaitForExit\(\$TimeoutSeconds \* 1000\)/);
   assert.match(installer, /\$process\.Kill\(\)/);
   assert.doesNotMatch(installer, /Get-Process -Name "verge-mihomo"/);
@@ -929,7 +929,8 @@ test('Windows installer is split into side-effect-free modules with stable funct
     'common.ps1': ['Write-Info', 'Complete-InstallResult', 'Get-SavedUsageProfile', 'Save-UsageProfile'],
     'transaction.ps1': [
       'Protect-BackupAcl', 'Get-PathKey', 'Backup-Versioned', 'Backup-InitialOnce', 'Write-BytesAtomic',
-      'ConvertTo-Utf8Bytes', 'Write-Utf8Atomic', 'Get-BytesSha256', 'Get-FileSha256', 'Restore-Transaction',
+      'ConvertTo-Utf8Bytes', 'Write-Utf8Atomic', 'Get-BytesSha256', 'Get-FileSha256',
+      'Get-StreamBytes', 'Write-LockedStreamBytes', 'Invoke-VerifiedFileTransaction', 'Restore-Transaction',
       'Get-InstallStateEntry', 'Assert-InstallStateEntry', 'Assert-InstallState', 'Assert-StateTargetUnchanged',
       'New-InstallStateEntry'
     ],

@@ -22,6 +22,7 @@ $previousUsageProfile = $env:CLASH_PATCH_USAGE_PROFILE
 $env:CLASH_PATCH_USAGE_PROFILE = "3"
 $fakeCore = Join-Path $sandbox $(if ($onWindows) { "mihomo-test.cmd" } else { "mihomo-test.sh" })
 $hangingCore = Join-Path $sandbox $(if ($onWindows) { "mihomo-hang.cmd" } else { "mihomo-hang.sh" })
+$mutatingCore = Join-Path $sandbox "mihomo-mutate.cmd"
 
 function Get-ProtectedAutomaticVariableNames {
     $automaticCandidates = @(
@@ -322,6 +323,10 @@ try {
     }
     [System.IO.File]::WriteAllText($fakeCore, $fakeCoreText, [System.Text.Encoding]::ASCII)
     if (-not $onWindows) { & /bin/chmod 700 $fakeCore }
+    if ($onWindows) {
+        $mutatingCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nif not `"%CLASH_PATCH_MUTATE_TARGET%`"==`"`" (`r`n  >`"%CLASH_PATCH_MUTATE_TARGET%`" echo friend_concurrent: true`r`n)`r`nexit /b 0`r`n"
+        [System.IO.File]::WriteAllText($mutatingCore, $mutatingCoreText, [System.Text.Encoding]::ASCII)
+    }
     if ($onWindows) {
         $hangingCoreText = "@echo off`r`nping 127.0.0.1 -n 6 >nul`r`nexit /b 0`r`n"
     } else {
@@ -672,8 +677,8 @@ items:
     update_interval: 1440
 '@
     $nestedProfilesOutput = Set-RemoteSubscriptionAutoUpdateDisabled $nestedProfilesInput
-    Assert-True ($nestedProfilesOutput -match '(?m)^    allow_auto_update: false$') "nested option did not receive a direct allow_auto_update field"
-    Assert-True ($nestedProfilesOutput -notmatch '(?m)^      allow_auto_update: false$') "allow_auto_update was inserted into a nested option mapping"
+    Assert-True ($nestedProfilesOutput -match '(?m)^ {4}allow_auto_update: false\r?$') "nested option did not receive a direct allow_auto_update field"
+    Assert-True ($nestedProfilesOutput -notmatch '(?m)^ {6}allow_auto_update: false\r?$') "allow_auto_update was inserted into a nested option mapping"
     Assert-True ($nestedProfilesOutput.Contains("      User-Agent: Clash")) "nested option content was changed"
     Assert-RemoteSubscriptionAutoUpdateDisabled $nestedProfilesOutput
 
@@ -736,6 +741,25 @@ items:
     Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-first.yaml") -Raw) -eq $firstSafeUpdated) "valid safe update incorrectly restored first remote subscription"
     Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-second.yml") -Raw) -eq $secondSafeUpdated) "valid safe update incorrectly restored second remote subscription"
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json"))) "accepted safe update left a stale manifest"
+
+    if ($onWindows) {
+        $concurrentVerifySnapshot = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
+        Assert-True ($concurrentVerifySnapshot.ExitCode -eq 0) "concurrent verification snapshot failed: $($concurrentVerifySnapshot.Output)"
+        [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), "mode: rule`nproxies: []`n")
+        [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), "mode: rule`nproxy-groups: []`n")
+        $env:CLASH_PATCH_MUTATE_TARGET = Join-Path $safeUpdateProfiles "R-first.yaml"
+        try {
+            $concurrentVerify = Invoke-TestPowerShell $installer @(
+                "-AppHome", $safeUpdateCase, "-VerifySafeUpdate", "-MihomoPath", $mutatingCore
+            )
+        } finally {
+            $env:CLASH_PATCH_MUTATE_TARGET = $null
+        }
+        Assert-True ($concurrentVerify.ExitCode -eq 1) "safe update accepted bytes that replaced the file during Mihomo validation"
+        Assert-True ((Get-Content -LiteralPath (Join-Path $safeUpdateProfiles "R-first.yaml") -Raw).Contains("friend_concurrent: true")) "safe update overwrote a concurrent refresh"
+        Assert-True (Test-Path -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json") -PathType Leaf) "concurrent validation failure discarded its recovery manifest"
+        Remove-Item -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json") -Force
+    }
 
     $concurrentTarget = Join-Path $safeUpdateProfiles "concurrent.yaml"
     $concurrentBackup = Join-Path $safeUpdateProfiles "concurrent.backup"
@@ -864,6 +888,60 @@ items:
     Assert-True $restoreFailed "rollback did not report a restore failure"
     Assert-True ((Get-Content -LiteralPath $continuePath -Raw) -eq "restored") "rollback stopped before restoring earlier targets"
 
+    $verifiedTargetPath = Join-Path $transactionDir "verified-target.txt"
+    $verifiedOriginal = [System.Text.Encoding]::UTF8.GetBytes("original")
+    [System.IO.File]::WriteAllBytes($verifiedTargetPath, $verifiedOriginal)
+    $verifiedTarget = [pscustomobject]@{
+        Path = $verifiedTargetPath
+        Bytes = [System.Text.Encoding]::UTF8.GetBytes("replacement")
+        Existed = $true
+        OriginalBytes = $verifiedOriginal
+    }
+    [System.IO.File]::WriteAllText($verifiedTargetPath, "concurrent")
+    $verifiedTransactionRejected = $false
+    try { Invoke-VerifiedFileTransaction @($verifiedTarget) } catch { $verifiedTransactionRejected = $true }
+    Assert-True $verifiedTransactionRejected "verified transaction overwrote a target that changed after candidate generation"
+    Assert-True ((Get-Content -LiteralPath $verifiedTargetPath -Raw) -eq "concurrent") "verified transaction did not preserve concurrent content"
+
+    $rollbackOnePath = Join-Path $transactionDir "rollback-one.txt"
+    $rollbackTwoPath = Join-Path $transactionDir "rollback-two.txt"
+    $rollbackOneOriginal = [System.Text.Encoding]::UTF8.GetBytes("one-original")
+    $rollbackTwoOriginal = [System.Text.Encoding]::UTF8.GetBytes("two-original")
+    [System.IO.File]::WriteAllBytes($rollbackOnePath, $rollbackOneOriginal)
+    [System.IO.File]::WriteAllBytes($rollbackTwoPath, $rollbackTwoOriginal)
+    $savedWriteLockedStreamBytes = ${function:Write-LockedStreamBytes}
+    $script:transactionWriteCallCount = 0
+    try {
+        function Write-LockedStreamBytes(
+            [System.IO.FileStream]$Stream,
+            [byte[]]$Replacement,
+            [byte[]]$Original
+        ) {
+            $script:transactionWriteCallCount++
+            if ($script:transactionWriteCallCount -eq 2) { throw "primary write failure" }
+            if ($script:transactionWriteCallCount -eq 3) { throw "rollback failure" }
+            $Stream.Position = 0
+            $Stream.Write($Replacement, 0, $Replacement.Length)
+            $Stream.SetLength($Replacement.Length)
+            $Stream.Flush()
+        }
+        $rollbackFailureMessage = ""
+        try {
+            Invoke-VerifiedFileTransaction @(
+                [pscustomobject]@{ Path = $rollbackOnePath; Bytes = [System.Text.Encoding]::UTF8.GetBytes("one-new"); Existed = $true; OriginalBytes = $rollbackOneOriginal },
+                [pscustomobject]@{ Path = $rollbackTwoPath; Bytes = [System.Text.Encoding]::UTF8.GetBytes("two-new"); Existed = $true; OriginalBytes = $rollbackTwoOriginal }
+            )
+        } catch {
+            $rollbackFailureMessage = $_.Exception.Message
+        }
+        Assert-True $rollbackFailureMessage.Contains("primary write failure") "verified transaction hid its original failure"
+        Assert-True $rollbackFailureMessage.Contains("rollback failure") "verified transaction hid a rollback failure"
+        Assert-True ((Get-Content -LiteralPath $rollbackOnePath -Raw) -eq "one-original") "verified transaction stopped rollback after one restore failed"
+    } finally {
+        Set-Item -Path Function:\Write-LockedStreamBytes -Value $savedWriteLockedStreamBytes
+        Remove-Variable -Name transactionWriteCallCount -Scope Script -ErrorAction SilentlyContinue
+    }
+
     if ($onWindows) {
         $rejectingCore = Join-Path $sandbox "mihomo-reject.cmd"
         $rejectingCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nexit /b 17`r`n"
@@ -889,6 +967,22 @@ items:
         Assert-True ((Get-Content -LiteralPath (Join-Path $validationFailureCase "profiles.yaml") -Raw) -eq $validationProfiles) "failed Mihomo validation changed profiles.yaml"
         Assert-True ((Get-Content -LiteralPath (Join-Path $validationFailureCase "clash-patch-usage-profile.json") -Raw) -eq $validationUsage) "failed Mihomo validation changed the usage profile"
         Assert-True (-not (Test-Path -LiteralPath (Join-Path (Join-Path $validationFailureCase "profiles") "Script.js"))) "failed Mihomo validation created Script.js"
+
+        $concurrentInstallCase = Join-Path $sandbox "concurrent-install-case"
+        New-Item -ItemType Directory -Path $concurrentInstallCase -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $concurrentInstallCase "profiles.yaml"), "items:`n- uid: R-test`n  type: remote`n  option:`n    allow_auto_update: true`n")
+        [System.IO.File]::WriteAllText((Join-Path $concurrentInstallCase "config.yaml"), "ipv6: true`ntun: null`n")
+        [System.IO.File]::WriteAllText((Join-Path $concurrentInstallCase "verge.yaml"), "enable_tun_mode: false`n")
+        $env:CLASH_PATCH_MUTATE_TARGET = Join-Path $concurrentInstallCase "config.yaml"
+        try {
+            $concurrentInstall = Invoke-TestPowerShell $installer @(
+                "-AppHome", $concurrentInstallCase, "-UsageProfile", "3", "-MihomoPath", $mutatingCore
+            )
+        } finally {
+            $env:CLASH_PATCH_MUTATE_TARGET = $null
+        }
+        Assert-True ($concurrentInstall.ExitCode -eq 1) "installer overwrote a config change made while the candidate was being validated"
+        Assert-True ((Get-Content -LiteralPath (Join-Path $concurrentInstallCase "config.yaml") -Raw).Contains("friend_concurrent: true")) "installer did not preserve concurrent config content"
     }
 
     $nullCase = Join-Path $sandbox "null-case"

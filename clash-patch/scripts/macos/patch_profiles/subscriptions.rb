@@ -56,7 +56,11 @@ module ClashPatch
       "/usr/bin/defaults", "write", domain, "kAutoUpdateEnable", "-bool", "false"
     )
     unless write_status.success?
-      runner.call("/usr/bin/defaults", "write", domain, "kAutoUpdateEnable", "-bool", "true")
+      begin
+        enable_subscription_auto_update(runner: runner)
+      rescue InvalidConfigError, SystemCallError, IOError => restore_error
+        raise IOError, "无法关闭订阅自动更新，且恢复原值失败：#{restore_error.message}"
+      end
       raise IOError, "无法关闭 ClashX Meta 订阅自动更新：#{error.to_s.strip}"
     end
 
@@ -67,11 +71,41 @@ module ClashPatch
                        ""
                      end
     unless subscription_auto_update_state(verified_value) == :disabled
-      runner.call("/usr/bin/defaults", "write", domain, "kAutoUpdateEnable", "-bool", "true")
+      begin
+        enable_subscription_auto_update(runner: runner)
+      rescue InvalidConfigError, SystemCallError, IOError => restore_error
+        raise IOError, "订阅自动更新设置回读失败，且恢复原值失败：#{restore_error.message}"
+      end
       raise IOError, "ClashX Meta 订阅自动更新设置回读失败，已经恢复原值"
     end
 
     { status: :disabled, domain: domain, backup: created_backup }
+  end
+
+  def enable_subscription_auto_update(runner: Open3.method(:capture3))
+    exported = defaults_export_domain(runner: runner)
+    raise InvalidConfigError, "无法读取 ClashX Meta 偏好设置" unless exported
+
+    domain = exported.fetch(:domain)
+    current = plist_raw_value(exported.fetch(:plist), "kAutoUpdateEnable", runner: runner)
+    state = subscription_auto_update_state(current)
+    return { status: :already_enabled, domain: domain } if state == :enabled
+    raise InvalidConfigError, "无法确认 ClashX Meta 订阅自动更新状态" unless state == :disabled
+
+    _output, error, write_status = runner.call(
+      "/usr/bin/defaults", "write", domain, "kAutoUpdateEnable", "-bool", "true"
+    )
+    raise IOError, "无法恢复 ClashX Meta 订阅自动更新：#{error.to_s.strip}" unless write_status.success?
+
+    verified_export = defaults_export_domain(runner: runner)
+    verified_value = if verified_export && verified_export.fetch(:domain) == domain
+                       plist_raw_value(verified_export.fetch(:plist), "kAutoUpdateEnable", runner: runner)
+                     else
+                       ""
+                     end
+    raise IOError, "ClashX Meta 订阅自动更新恢复后回读失败" unless subscription_auto_update_state(verified_value) == :enabled
+
+    { status: :enabled, domain: domain }
   end
 
   def selected_profile_name

@@ -334,6 +334,132 @@ class MacosWrapperTest < Minitest::Test
     end
   end
 
+  def test_profile_three_restores_auto_update_when_a_later_step_fails
+    patcher = <<~RUBY
+      File.open(File.join(ENV.fetch("HOME"), "patcher-calls.log"), "a") { |file| file.puts(ARGV.join(" ")) }
+      if ARGV.include?("--print-core-status")
+        puts "supported"
+        exit 0
+      end
+      if ARGV.include?("--disable-subscription-auto-update")
+        puts "disabled"
+        exit 0
+      end
+      if ARGV.include?("--enable-subscription-auto-update")
+        puts "enabled"
+        exit 0
+      end
+      exit 1 if ARGV.include?("--snapshot-initial")
+      exit 0
+    RUBY
+    with_supported_mihomo_installer(patcher_source: patcher) do |installer|
+      Dir.mktmpdir do |home|
+        with_supported_app(home) do
+          stdout, _stderr, status = run_script(installer, "--profile", "3", home: home)
+
+          assert_equal 1, status.exitstatus
+          assert_includes stdout, "无法创建初始快照"
+          calls = File.read(File.join(home, "patcher-calls.log")).lines.map(&:strip)
+          disable_index = calls.index { |call| call.include?("--disable-subscription-auto-update") }
+          enable_index = calls.index { |call| call.include?("--enable-subscription-auto-update") }
+          refute_nil disable_index
+          refute_nil enable_index
+          assert_operator enable_index, :>, disable_index
+        end
+      end
+    end
+  end
+
+  def test_unsafe_profile_state_is_rejected_before_profile_three_changes_settings
+    patcher = <<~RUBY
+      File.open(File.join(ENV.fetch("HOME"), "patcher-calls.log"), "a") { |file| file.puts(ARGV.join(" ")) }
+      puts "supported" if ARGV.include?("--print-core-status")
+      puts "disabled" if ARGV.include?("--disable-subscription-auto-update")
+      exit 0
+    RUBY
+    with_supported_mihomo_installer(patcher_source: patcher) do |installer|
+      Dir.mktmpdir do |home|
+        with_supported_app(home) do
+          state = File.join(home, "usage-profile.plist")
+          File.symlink(File.join(home, "outside-state"), state)
+          File.write(File.join(home, "patcher-calls.log"), "")
+
+          stdout, _stderr, status = run_script(installer, "--profile", "3", home: home)
+
+          assert_equal 7, status.exitstatus
+          assert_includes stdout, "档位保存位置不安全"
+          calls = File.read(File.join(home, "patcher-calls.log"))
+          refute_includes calls, "--disable-subscription-auto-update"
+          refute_includes calls, "--snapshot-initial"
+        end
+      end
+    end
+  end
+
+  def test_auto_update_restore_failure_is_reported_as_partial
+    patcher = <<~RUBY
+      if ARGV.include?("--print-core-status")
+        puts "supported"
+        exit 0
+      end
+      if ARGV.include?("--disable-subscription-auto-update")
+        puts "disabled"
+        exit 0
+      end
+      exit 1 if ARGV.include?("--enable-subscription-auto-update")
+      exit 1 if ARGV.include?("--snapshot-initial")
+      exit 0
+    RUBY
+    with_supported_mihomo_installer(patcher_source: patcher) do |installer|
+      Dir.mktmpdir do |home|
+        with_supported_app(home) do
+          stdout, stderr, status = run_script(installer, "--profile", "3", "--json", home: home)
+
+          assert_equal 1, status.exitstatus
+          assert_empty stderr
+          result = assert_json_result(stdout, status, command: "install")
+          assert_equal "partial", result.fetch("status")
+          assert_equal "auto_update_restore_failed", result.fetch("code")
+        end
+      end
+    end
+  end
+
+  def test_json_wrapper_preserves_a_partial_safe_update_result
+    patcher = <<~RUBY
+      require "json"
+      if ARGV.include?("--print-core-status")
+        puts "supported"
+        exit 0
+      end
+      exit 0 if ARGV.include?("--snapshot-initial")
+      if ARGV.include?("--safe-update-all")
+        puts JSON.generate(
+          "status" => "partial",
+          "code" => "safe_update_runtime_pending",
+          "summary_zh" => "订阅文件已恢复，但运行内核恢复失败。"
+        )
+        exit 1
+      end
+      exit 0
+    RUBY
+    with_supported_mihomo_installer(patcher_source: patcher) do |installer|
+      Dir.mktmpdir do |home|
+        with_supported_app(home) do
+          stdout, stderr, status = run_script(
+            installer, "--safe-update", "--profile", "1", "--json", home: home
+          )
+
+          assert_equal 1, status.exitstatus
+          assert_empty stderr
+          result = assert_json_result(stdout, status, command: "install")
+          assert_equal "partial", result.fetch("status")
+          assert_equal "safe_update_runtime_pending", result.fetch("code")
+        end
+      end
+    end
+  end
+
   def test_profile_three_downgrade_requires_safe_uninstall
     with_supported_mihomo_installer do |installer|
       Dir.mktmpdir do |home|

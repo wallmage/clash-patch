@@ -102,7 +102,12 @@ function Assert-JavaScriptCanCompose([string]$Text) {
     }
 }
 
-function Build-GlobalScript([string]$EnginePath, [string]$TargetPath, [int]$UsageProfile) {
+function Build-GlobalScript(
+    [string]$EnginePath,
+    [string]$TargetPath,
+    [int]$UsageProfile,
+    [AllowNull()][string]$CurrentText = $null
+) {
     if ($UsageProfile -notin @(1, 2, 3)) { throw "用途档位无效。" }
     $engine = Get-Content -LiteralPath $EnginePath -Raw -Encoding UTF8
     $profileMarker = "const CLASH_PATCH_USAGE_PROFILE = 3;"
@@ -113,8 +118,8 @@ function Build-GlobalScript([string]$EnginePath, [string]$TargetPath, [int]$Usag
     $prefix = ""
     $suffix = ""
 
-    if (Test-Path -LiteralPath $TargetPath -PathType Leaf) {
-        $current = Get-Content -LiteralPath $TargetPath -Raw -Encoding UTF8
+    if ($null -ne $CurrentText) {
+        $current = $CurrentText
         $analysis = Get-JavaScriptAnalysis $current
         $beginMarkers = @($analysis.Markers | Where-Object { $_.Kind -eq "begin" })
         $endMarkers = @($analysis.Markers | Where-Object { $_.Kind -eq "end" })
