@@ -376,12 +376,15 @@ class MacosWrapperTest < Minitest::Test
             "CLASH_PATCH_TEST_CONTINUE" => continue_path
           }
           uninstall_thread = nil
+          readers = []
           begin
             Open3.popen3(
               env, "/bin/sh", uninstaller, "--json", pgroup: true
             ) do |stdin, stdout, stderr, thread|
               uninstall_thread = thread
               stdin.close
+              readers << Thread.new { stdout.read rescue nil }
+              readers << Thread.new { stderr.read rescue nil }
               deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
               until File.exist?(ready)
                 raise "uninstaller never reached the post-delete gate" if
@@ -389,17 +392,14 @@ class MacosWrapperTest < Minitest::Test
                 sleep 0.01
               end
               Process.kill("KILL", -thread.pid)
-              stdout.read
-              stderr.read
               raise "uninstaller did not stop after the post-delete kill" unless thread.join(10)
               refute thread.value.success?
             end
             File.binwrite(continue_path, "continue")
           ensure
-            if uninstall_thread&.alive?
-              Process.kill("KILL", -uninstall_thread.pid) rescue nil
-              uninstall_thread.join
-            end
+            Process.kill("KILL", -uninstall_thread.pid) rescue nil
+            uninstall_thread&.join
+            readers.each(&:join)
           end
 
           staging = File.join(install_dir, ".clash-patch-uninstall-staging")
@@ -888,12 +888,15 @@ class MacosWrapperTest < Minitest::Test
           ready = File.join(home, "patcher-ready")
           process_thread = nil
           child_pid = nil
+          readers = []
           begin
             Open3.popen3(
               env, "/bin/sh", installer, "--profile", "3", pgroup: true
             ) do |stdin, stdout, stderr, thread|
               process_thread = thread
               stdin.close
+              readers << Thread.new { stdout.read rescue nil }
+              readers << Thread.new { stderr.read rescue nil }
               deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
               until File.exist?(ready)
                 raise "installer never reached the profile application gate" if
@@ -902,8 +905,6 @@ class MacosWrapperTest < Minitest::Test
               end
               child_pid = Integer(File.read(File.join(home, "patcher-pid")))
               Process.kill("KILL", -thread.pid)
-              stdout.read
-              stderr.read
               raise "installer did not stop after SIGKILL" unless thread.join(10)
               refute thread.value.success?
             end
@@ -914,10 +915,12 @@ class MacosWrapperTest < Minitest::Test
               nil
             end
             begin
-              Process.kill("KILL", -process_thread.pid) if process_thread&.alive?
+              Process.kill("KILL", -process_thread.pid) if process_thread
             rescue Errno::ESRCH, Errno::EPERM
               nil
             end
+            process_thread&.join
+            readers.each(&:join)
           end
 
           assert_equal "3", File.read(File.join(home, "applied-profile"))

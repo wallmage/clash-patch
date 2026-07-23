@@ -2150,6 +2150,12 @@ $child.WaitForExit()
             }
             $treeChildAlive = $false
             if ($treeChildId -gt 0) {
+                $treeChildExitDeadline = [DateTime]::UtcNow.AddSeconds(5)
+                do {
+                    $treeChildProcess = Get-Process -Id $treeChildId -ErrorAction SilentlyContinue
+                    if ($null -eq $treeChildProcess) { break }
+                    Start-Sleep -Milliseconds 25
+                } while ([DateTime]::UtcNow -lt $treeChildExitDeadline)
                 $treeChildProcess = Get-Process -Id $treeChildId -ErrorAction SilentlyContinue
                 $treeChildAlive = $null -ne $treeChildProcess
                 if ($treeChildAlive) {
