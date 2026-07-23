@@ -785,17 +785,18 @@ function Get-InterruptedTransactionRecoveryPlan([object[]]$Actions) {
         if ($snapshot.Exists -and $snapshot.Identity -cne $action.Identity) {
             throw "中断事务目标已被同内容的其他文件替换：$($action.Path)"
         }
-        if ($action.Action -eq "write" -and $action.Existed) {
-            $isInterruptedReplacement = $snapshot.Exists -and
-                $snapshot.Bytes.Length -lt $action.Replacement.Length
-            if ($isInterruptedReplacement) {
-                for ($index = 0; $index -lt $snapshot.Bytes.Length; $index++) {
-                    if ($snapshot.Bytes[$index] -ne $action.Replacement[$index]) {
-                        $isInterruptedReplacement = $false
-                        break
-                    }
+        $isInterruptedReplacement = $action.Action -eq "write" -and
+            $snapshot.Exists -and
+            $snapshot.Bytes.Length -lt $action.Replacement.Length
+        if ($isInterruptedReplacement) {
+            for ($index = 0; $index -lt $snapshot.Bytes.Length; $index++) {
+                if ($snapshot.Bytes[$index] -ne $action.Replacement[$index]) {
+                    $isInterruptedReplacement = $false
+                    break
                 }
             }
+        }
+        if ($action.Action -eq "write" -and $action.Existed) {
             if (-not $snapshot.Exists -or
                 ($currentHash -notin @($originalHash, $replacementHash) -and -not $isInterruptedReplacement)) {
                 throw "中断事务目标有无法自动合并的新改动：$($action.Path)"
@@ -804,6 +805,10 @@ function Get-InterruptedTransactionRecoveryPlan([object[]]$Actions) {
                 $plan += [pscustomobject]@{ Operation = "write"; Action = $action; Snapshot = $snapshot }
             }
         } elseif ($action.Action -eq "write") {
+            if ($snapshot.Exists -and
+                $currentHash -ne $replacementHash -and -not $isInterruptedReplacement) {
+                throw "中断事务新建目标有无法自动合并的新改动：$($action.Path)"
+            }
             if ($snapshot.Exists) {
                 $plan += [pscustomobject]@{ Operation = "delete"; Action = $action; Snapshot = $snapshot }
             }

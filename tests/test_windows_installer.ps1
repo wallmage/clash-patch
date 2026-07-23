@@ -792,6 +792,49 @@ fs.writeFileSync(process.argv[4], JSON.stringify(output));
                 -not (Test-Path -LiteralPath (Join-Path $newFileTransactionHome ".clash-patch-transaction.json"))
             ) "new-file transaction left a stale journal"
         }
+
+        Invoke-DeferredProbe "interrupted new-file transaction preserves later content" {
+            $newFileRecoveryHome = Join-Path $sandbox "new-file-recovery-home"
+            $newFileRecoveryTarget = Join-Path $newFileRecoveryHome "Script.js"
+            New-Item -ItemType Directory -Path $newFileRecoveryHome -Force | Out-Null
+            $newFileRecoveryLock = Enter-AppHomeMutationLock $newFileRecoveryHome
+            try {
+                $replacementBytes = [System.Text.Encoding]::UTF8.GetBytes("managed replacement")
+                [System.IO.File]::WriteAllBytes($newFileRecoveryTarget, $replacementBytes)
+                $createdSnapshot = Get-OptionalFileSnapshot $newFileRecoveryTarget "new-file recovery created target"
+                $action = [pscustomobject]@{
+                    Action = "write"
+                    Path = $newFileRecoveryTarget
+                    Existed = $false
+                    Identity = $createdSnapshot.Identity
+                    Original = [byte[]]@()
+                    Replacement = $replacementBytes
+                }
+                $laterBytes = [System.Text.Encoding]::UTF8.GetBytes("user content written after interruption")
+                [System.IO.File]::WriteAllBytes($newFileRecoveryTarget, $laterBytes)
+                $laterSnapshot = Get-OptionalFileSnapshot $newFileRecoveryTarget "new-file recovery later target"
+                Assert-True (
+                    $laterSnapshot.Identity -ceq $createdSnapshot.Identity
+                ) "new-file recovery fixture replaced the target identity"
+
+                $recoveryRejected = $false
+                try {
+                    $plan = @(Get-InterruptedTransactionRecoveryPlan @($action))
+                    Invoke-InterruptedTransactionRecovery $plan
+                } catch {
+                    $recoveryRejected = $true
+                }
+                $preservedSnapshot = Get-OptionalFileSnapshot $newFileRecoveryTarget "new-file recovery preserved target"
+                Assert-True (
+                    $recoveryRejected -and
+                    $preservedSnapshot.Exists -and
+                    $preservedSnapshot.Identity -ceq $createdSnapshot.Identity -and
+                    (Get-BytesSha256 $preservedSnapshot.Bytes) -eq (Get-BytesSha256 $laterBytes)
+                ) "interrupted recovery deleted later content written into a new transaction target"
+            } finally {
+                Exit-AppHomeMutationLock $newFileRecoveryLock
+            }
+        }
     }
     if ($onWindows) {
         $hangingCoreText = "@echo off`r`nping 127.0.0.1 -n 6 >nul`r`nexit /b 0`r`n"

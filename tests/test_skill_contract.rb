@@ -1230,6 +1230,7 @@ class SkillContractTest < Minitest::Test
       "duplicate transaction action field",
       "extended-path AppHome lock alias",
       "installer and uninstaller shared AppHome lock",
+      "interrupted new-file transaction preserves later content",
       "interrupted transaction same-byte identity replacement",
       "new-file transaction journal empty original bytes",
       "non-proxy route termini",
@@ -1284,6 +1285,21 @@ class SkillContractTest < Minitest::Test
     assert_equal 1, workflow.scan("ruby tests/run_macos_production_probes.rb").length
     assert_includes runner_source, 'ENV.fetch("CLASH_PATCH_CURRENT_RUBY", RbConfig.ruby)'
     assert_includes runner_source, 'ENV.fetch("CLASH_PATCH_SYSTEM_RUBY", "/usr/bin/ruby")'
+  end
+
+  def test_windows_interrupted_new_file_recovery_requires_managed_bytes
+    source = File.binread(
+      File.join(SKILL, "scripts/windows/install_windows/transaction.ps1")
+    ).force_encoding("UTF-8")
+    recovery_plan = source[
+      /function Get-InterruptedTransactionRecoveryPlan\b.*?(?=^function Invoke-InterruptedTransactionRecovery)/m
+    ]
+
+    refute_nil recovery_plan
+    assert_match(
+      /\} elseif \(\$action\.Action -eq "write"\) \{\n\s+if \(\$snapshot\.Exists -and\n\s+\$currentHash -ne \$replacementHash -and -not \$isInterruptedReplacement\) \{\n\s+throw "中断事务新建目标有无法自动合并的新改动/,
+      recovery_plan
+    )
   end
 
   def test_macos_production_probe_runner_executes_all_cases_and_propagates_any_failure
