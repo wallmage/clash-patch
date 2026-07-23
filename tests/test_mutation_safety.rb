@@ -613,6 +613,62 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_single_write_precommit_forwarding_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/install_windows/transaction.ps1",
+        "    $committed = Invoke-VerifiedPathTransaction $Targets @() $PreCommitCondition\n",
+        "    $committed = Invoke-VerifiedPathTransaction $Targets @() $null\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name",
+        "test_windows_install_and_restore_recheck_client_at_locked_precommit"
+      )
+    end
+  end
+
+  def test_windows_install_client_precommit_guard_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_windows.ps1",
+        "$installCommitted = Invoke-VerifiedFileTransaction $targets $clientStoppedPreCommit\n",
+        "$installCommitted = Invoke-VerifiedFileTransaction $targets $null\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name",
+        "test_windows_install_and_restore_recheck_client_at_locked_precommit"
+      )
+    end
+  end
+
+  def test_windows_restore_client_precommit_guard_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_windows.ps1",
+        ") $clientStoppedPreCommit\n" \
+          "    if (-not $restoreCommitted)",
+        ") $null\n" \
+          "    if (-not $restoreCommitted)"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name",
+        "test_windows_install_and_restore_recheck_client_at_locked_precommit"
+      )
+    end
+  end
+
   def test_windows_uninstall_pending_safe_update_guard_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

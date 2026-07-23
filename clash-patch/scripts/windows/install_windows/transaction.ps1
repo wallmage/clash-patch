@@ -1317,8 +1317,14 @@ function Invoke-VerifiedPathTransaction(
     return (-not $preCommitRejected)
 }
 
-function Invoke-VerifiedFileTransaction([object[]]$Targets) {
-    $null = Invoke-VerifiedPathTransaction $Targets @()
+function Invoke-VerifiedFileTransaction(
+    [object[]]$Targets,
+    [scriptblock]$PreCommitCondition = $null
+) {
+    $committed = Invoke-VerifiedPathTransaction $Targets @() $PreCommitCondition
+    if ($null -ne $PreCommitCondition) {
+        return [bool]$committed
+    }
 }
 
 function Invoke-VerifiedWriteDeleteTransaction(

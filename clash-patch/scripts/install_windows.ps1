@@ -106,6 +106,9 @@ try {
 } catch {
     Complete-InstallResult 1 "failed" "operation_in_progress" $_.Exception.Message
 }
+$clientStoppedPreCommit = {
+    return (-not (Test-ClashVergeRunning))
+}
 
 try {
 try {
@@ -311,7 +314,7 @@ if (-not [string]::IsNullOrWhiteSpace($RestoreBackup)) {
         throw "当前配置在检查期间发生变化，拒绝覆盖。"
     }
     Backup-Versioned $resolved.TargetPath $backupRoot "pre-restore" | Out-Null
-    Invoke-VerifiedFileTransaction @(
+    $restoreCommitted = Invoke-VerifiedFileTransaction @(
         [pscustomobject]@{
             Path = $resolved.TargetPath
             Bytes = $restoreBytes
@@ -319,7 +322,10 @@ if (-not [string]::IsNullOrWhiteSpace($RestoreBackup)) {
             OriginalBytes = $currentSnapshot.Bytes
             OriginalIdentity = $currentSnapshot.Identity
         }
-    )
+    ) $clientStoppedPreCommit
+    if (-not $restoreCommitted) {
+        throw "检测到 Clash Verge Rev 在备份恢复期间启动；本次没有修改当前配置。"
+    }
     Write-Info "备份已恢复；恢复前版本已经另行备份。"
     Complete-InstallResult 0 "ok" "backup_restored" "备份已恢复；恢复前版本已经另行备份。" @("configuration")
 }
@@ -552,7 +558,10 @@ try {
     }
 
     if (Test-ClashVergeRunning) { throw "检测到 Clash Verge Rev 在安装期间启动；已撤销本次文件修改。" }
-    Invoke-VerifiedFileTransaction $targets
+    $installCommitted = Invoke-VerifiedFileTransaction $targets $clientStoppedPreCommit
+    if (-not $installCommitted) {
+        throw "检测到 Clash Verge Rev 在安装期间启动；已撤销本次文件修改。"
+    }
 
     if ($null -ne $usageProfileTarget) { Write-Info "已保存用途档位 $resolvedUsageProfile。" }
     Write-Info "已安装全局扩展脚本，之后每次加载或刷新订阅都会自动应用补丁。"

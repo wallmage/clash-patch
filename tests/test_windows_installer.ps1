@@ -3974,7 +3974,7 @@ try {
         Assert-True ((Get-Content -LiteralPath (Join-Path $deferredUninstallCase "verge.yaml") -Raw) -eq $deferredVergeOriginal) "second safe uninstall did not restore deferred verge.yaml"
         Assert-True (-not (Test-Path -LiteralPath (Join-Path $deferredUninstallCase "clash-patch-usage-profile.json"))) "second safe uninstall retained the profile 3 gate"
 
-        Invoke-DeferredProbe "uninstall client start after locked target verification" {
+        Invoke-DeferredProbe "stopped-client transactions recheck after locked target verification" {
             $clientStartPackageParent = Join-Path $sandbox "client-start-uninstall-package"
             New-Item -ItemType Directory -Path $clientStartPackageParent -Force | Out-Null
             Copy-Item -LiteralPath (Join-Path $root "clash-patch") -Destination $clientStartPackageParent -Recurse
@@ -4031,6 +4031,31 @@ try {
             }
             if (-not (Test-Path -LiteralPath $env:CLASH_PATCH_TEST_CLIENT_START_RELEASE -PathType Leaf)) {
                 throw "client-start fixture timed out waiting for release"
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_CLIENT_START_EXECUTABLE) -and
+            -not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_CLIENT_START_PID)) {
+            $clientStartInjected = Start-Process `
+                -FilePath $env:CLASH_PATCH_TEST_CLIENT_START_EXECUTABLE `
+                -ArgumentList @("-n", "20", "127.0.0.1") -PassThru
+            [void]$clientStartInjected.Handle
+            [System.IO.File]::WriteAllText(
+                $env:CLASH_PATCH_TEST_CLIENT_START_PID,
+                [string]$clientStartInjected.Id
+            )
+            $clientStartInjectedSeen = $false
+            $clientStartInjectedDeadline = [DateTime]::UtcNow.AddSeconds(5)
+            while (-not $clientStartInjected.HasExited -and
+                -not $clientStartInjectedSeen -and
+                [DateTime]::UtcNow -lt $clientStartInjectedDeadline) {
+                $clientStartInjectedSeen = $null -ne (
+                    Get-Process -Name "clash-verge" -ErrorAction SilentlyContinue |
+                        Select-Object -First 1
+                )
+                if (-not $clientStartInjectedSeen) { Start-Sleep -Milliseconds 25 }
+            }
+            if (-not $clientStartInjectedSeen) {
+                throw "injected client was not visible to the transaction precommit check"
             }
         }
 '@
@@ -4188,6 +4213,171 @@ try {
                     Join-Path $clientStartHome "clash-patch-install-state.json"
                 )
             )) "retry after client-start abort retained install recovery state"
+
+            $invokeClientStartTransaction = {
+                param(
+                    [string]$Name,
+                    [string]$ScriptPath,
+                    [string[]]$Arguments,
+                    [string]$WriteSpyPath
+                )
+                $pidPath = Join-Path $sandbox ("client-start-" + $Name + ".pid")
+                $env:CLASH_PATCH_TEST_CLIENT_START_EXECUTABLE = $runningClientPath
+                $env:CLASH_PATCH_TEST_CLIENT_START_PID = $pidPath
+                $env:CLASH_PATCH_TEST_CLIENT_START_WRITE_SPY = $WriteSpyPath
+                try {
+                    return (Invoke-TestPowerShell $ScriptPath $Arguments)
+                } finally {
+                    $env:CLASH_PATCH_TEST_CLIENT_START_EXECUTABLE = $null
+                    $env:CLASH_PATCH_TEST_CLIENT_START_PID = $null
+                    $env:CLASH_PATCH_TEST_CLIENT_START_WRITE_SPY = $null
+                    if (Test-Path -LiteralPath $pidPath -PathType Leaf) {
+                        $startedPid = [int]([System.IO.File]::ReadAllText($pidPath))
+                        $startedProcess = Get-Process -Id $startedPid -ErrorAction SilentlyContinue
+                        if ($null -ne $startedProcess -and -not $startedProcess.HasExited) {
+                            Stop-Process -Id $startedPid -Force
+                            $startedProcess.WaitForExit()
+                        }
+                    }
+                }
+            }
+
+            $clientStartInstaller = Join-Path (
+                Join-Path $clientStartPackage "scripts"
+            ) "install_windows.ps1"
+            $clientStartInstallHome = Join-Path $sandbox "client-start-install-home"
+            $clientStartInstallProfiles = Join-Path $clientStartInstallHome "profiles"
+            New-Item -ItemType Directory -Path $clientStartInstallProfiles -Force | Out-Null
+            $clientStartInstallConfig = "ipv6: true`ntun: null`n"
+            $clientStartInstallVerge = "enable_tun_mode: false`n"
+            $clientStartInstallIndex = "items:`n- uid: R-install-client-start`n  type: remote`n  option:`n    allow_auto_update: true`n"
+            [System.IO.File]::WriteAllText(
+                (Join-Path $clientStartInstallHome "config.yaml"),
+                $clientStartInstallConfig
+            )
+            [System.IO.File]::WriteAllText(
+                (Join-Path $clientStartInstallHome "verge.yaml"),
+                $clientStartInstallVerge
+            )
+            [System.IO.File]::WriteAllText(
+                (Join-Path $clientStartInstallHome "profiles.yaml"),
+                $clientStartInstallIndex
+            )
+            $clientStartInstallWriteSpy = Join-Path $sandbox "client-start-install.write-spy"
+            $clientStartInstallInvocation = & $invokeClientStartTransaction `
+                -Name "install" `
+                -ScriptPath $clientStartInstaller `
+                -Arguments @(
+                    "-AppHome", $clientStartInstallHome,
+                    "-UsageProfile", "3",
+                    "-MihomoPath", $fakeCore,
+                    "-Json"
+                ) `
+                -WriteSpyPath $clientStartInstallWriteSpy
+            $clientStartInstallJson = Assert-JsonResult $clientStartInstallInvocation "install" 1
+            Assert-True (
+                $clientStartInstallJson.status -eq "rolled_back" -and
+                $clientStartInstallJson.code -eq "install_failed"
+            ) "client-start install did not return the stopped-client failure"
+            Assert-True (
+                (Get-Content -LiteralPath (Join-Path $clientStartInstallHome "config.yaml") -Raw) -ceq
+                    $clientStartInstallConfig -and
+                (Get-Content -LiteralPath (Join-Path $clientStartInstallHome "verge.yaml") -Raw) -ceq
+                    $clientStartInstallVerge -and
+                (Get-Content -LiteralPath (Join-Path $clientStartInstallHome "profiles.yaml") -Raw) -ceq
+                    $clientStartInstallIndex
+            ) "client-start install changed a protected target"
+            foreach ($unexpectedInstallPath in @(
+                (Join-Path $clientStartInstallProfiles "Script.js"),
+                (Join-Path $clientStartInstallHome "clash-patch-install-state.json"),
+                (Join-Path $clientStartInstallHome "clash-patch-auto-update-state.json"),
+                (Join-Path $clientStartInstallHome "clash-patch-usage-profile.json"),
+                (Join-Path $clientStartInstallHome ".clash-patch-transaction.json"),
+                (Join-Path $clientStartInstallHome ".clash-patch-transaction-preparation.json")
+            )) {
+                Assert-True (-not (
+                    Test-Path -LiteralPath $unexpectedInstallPath
+                )) "client-start install retained a protected target: $unexpectedInstallPath"
+            }
+            Assert-True (-not (
+                Test-Path -LiteralPath $clientStartInstallWriteSpy -PathType Leaf
+            )) "client-start install wrote after the locked precommit check"
+            $clientStartInstallRetry = Invoke-TestPowerShell $clientStartInstaller @(
+                "-AppHome", $clientStartInstallHome,
+                "-UsageProfile", "3",
+                "-MihomoPath", $fakeCore,
+                "-Json"
+            )
+            Assert-JsonResult $clientStartInstallRetry "install" 0 | Out-Null
+
+            $clientStartRestoreHome = Join-Path $sandbox "client-start-restore-home"
+            $clientStartRestoreTarget = Join-Path $clientStartRestoreHome "config.yaml"
+            $clientStartRestoreBackupRoot = Join-Path (
+                $clientStartRestoreHome
+            ) "clash-patch-backups"
+            New-Item -ItemType Directory -Path $clientStartRestoreHome -Force | Out-Null
+            $clientStartRestoreBackupText = "mode: rule`nipv6: false`ntun:`n  enable: true`n  stack: system`n  dns-hijack:`n    - any:53`n  auto-route: true`n  auto-detect-interface: true`n  strict-route: true`nproxies: []`nproxy-groups: []`nrules: []`n"
+            $clientStartRestoreCurrentText = "mode: global`nipv6: false`ntun:`n  enable: true`n  stack: system`n  dns-hijack:`n    - any:53`n  auto-route: true`n  auto-detect-interface: true`n  strict-route: true`nproxies: []`nproxy-groups: []`nrules: []`n"
+            [System.IO.File]::WriteAllText(
+                $clientStartRestoreTarget,
+                $clientStartRestoreBackupText
+            )
+            $clientStartRestoreLock = Enter-AppHomeMutationLock $clientStartRestoreHome
+            try {
+                $clientStartRestoreBackup = Backup-Versioned `
+                    $clientStartRestoreTarget $clientStartRestoreBackupRoot "prewrite"
+            } finally {
+                Exit-AppHomeMutationLock $clientStartRestoreLock
+            }
+            [System.IO.File]::WriteAllText(
+                $clientStartRestoreTarget,
+                $clientStartRestoreCurrentText
+            )
+            $clientStartRestoreHash = Get-FileSha256 $clientStartRestoreTarget
+            $clientStartRestoreWriteSpy = Join-Path $sandbox "client-start-restore.write-spy"
+            $clientStartRestoreInvocation = & $invokeClientStartTransaction `
+                -Name "restore" `
+                -ScriptPath $clientStartInstaller `
+                -Arguments @(
+                    "-AppHome", $clientStartRestoreHome,
+                    "-RestoreBackup", (Split-Path -Leaf $clientStartRestoreBackup),
+                    "-ExpectedCurrentSha256", $clientStartRestoreHash,
+                    "-MihomoPath", $fakeCore,
+                    "-Json"
+                ) `
+                -WriteSpyPath $clientStartRestoreWriteSpy
+            $clientStartRestoreJson = Assert-JsonResult $clientStartRestoreInvocation "install" 1
+            Assert-True (
+                $clientStartRestoreJson.operation -eq "restore_backup" -and
+                $clientStartRestoreJson.code -eq "operation_failed"
+            ) "client-start restore did not return the stopped-client failure"
+            Assert-True (
+                (Get-Content -LiteralPath $clientStartRestoreTarget -Raw) -ceq
+                    $clientStartRestoreCurrentText
+            ) "client-start restore changed current configuration"
+            Assert-True (-not (
+                Test-Path -LiteralPath $clientStartRestoreWriteSpy -PathType Leaf
+            )) "client-start restore wrote after the locked precommit check"
+            foreach ($unexpectedRestorePath in @(
+                (Join-Path $clientStartRestoreHome ".clash-patch-transaction.json"),
+                (Join-Path $clientStartRestoreHome ".clash-patch-transaction-preparation.json")
+            )) {
+                Assert-True (-not (
+                    Test-Path -LiteralPath $unexpectedRestorePath
+                )) "client-start restore retained transaction state: $unexpectedRestorePath"
+            }
+            $clientStartRestoreRetry = Invoke-TestPowerShell $clientStartInstaller @(
+                "-AppHome", $clientStartRestoreHome,
+                "-RestoreBackup", (Split-Path -Leaf $clientStartRestoreBackup),
+                "-ExpectedCurrentSha256", $clientStartRestoreHash,
+                "-MihomoPath", $fakeCore,
+                "-Json"
+            )
+            Assert-JsonResult $clientStartRestoreRetry "install" 0 | Out-Null
+            Assert-True (
+                (Get-Content -LiteralPath $clientStartRestoreTarget -Raw) -ceq
+                    $clientStartRestoreBackupText
+            ) "retry after client-start restore abort did not restore the requested backup"
         }
     }
 
