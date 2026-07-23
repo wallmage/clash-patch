@@ -2294,6 +2294,44 @@ Test-MihomoCandidate $CorePath "proxies:`n  - name: fixture-private-marker" $Dir
     Assert-True ((Get-Content -LiteralPath $stateSnapshotWritePath -Raw) -eq "state-write-original") "stale state rejection changed an unrelated write target"
 
     if ($onWindows) {
+        $preparationRecoveryDir = Join-Path $sandbox "preparation-recovery"
+        $preparationRecoveryTarget = Join-Path $preparationRecoveryDir "new-state.json"
+        New-Item -ItemType Directory -Path $preparationRecoveryDir -Force | Out-Null
+        $preparationRecoveryLock = Enter-AppHomeMutationLock $preparationRecoveryDir
+        try {
+            Write-FileTransactionPreparation @(
+                [pscustomobject]@{
+                    Path = $preparationRecoveryTarget
+                    CreateNew = $true
+                }
+            ) | Out-Null
+            [System.IO.File]::WriteAllText($preparationRecoveryTarget, "external-content")
+            $preparationExternalRejected = $false
+            try { Repair-InterruptedFilePreparation } catch { $preparationExternalRejected = $true }
+            Assert-True $preparationExternalRejected "preparation recovery deleted a nonempty external target"
+            Assert-True (
+                (Get-Content -LiteralPath $preparationRecoveryTarget -Raw) -eq "external-content"
+            ) "preparation recovery changed a nonempty external target"
+            Assert-True (
+                Test-Path -LiteralPath (
+                    Join-Path $preparationRecoveryDir ".clash-patch-transaction-preparation.json"
+                ) -PathType Leaf
+            ) "failed preparation recovery discarded its retry record"
+
+            [System.IO.File]::WriteAllBytes($preparationRecoveryTarget, [byte[]]@())
+            Repair-InterruptedFilePreparation
+            Assert-True (-not (
+                Test-Path -LiteralPath $preparationRecoveryTarget
+            )) "preparation recovery retained an empty transaction target"
+            Assert-True (-not (
+                Test-Path -LiteralPath (
+                    Join-Path $preparationRecoveryDir ".clash-patch-transaction-preparation.json"
+                )
+            )) "successful preparation recovery retained its record"
+        } finally {
+            Exit-AppHomeMutationLock $preparationRecoveryLock
+        }
+
         $outsideTransactionDir = Join-Path $sandbox "outside-transaction"
         $junctionPath = Join-Path $transactionDir "junction"
         $outsideSentinelPath = Join-Path $outsideTransactionDir "sentinel.txt"
@@ -2938,6 +2976,117 @@ try {
                 (Get-BytesSha256 $publicRestoreCurrentBytes)
             ) "next public operation did not recover an interrupted restore"
             Assert-True (-not (Test-Path -LiteralPath (Join-Path $publicRestoreHome ".clash-patch-transaction.json"))) "recovered public restore retained its transaction journal"
+        }
+
+        Invoke-DeferredProbe "public new-target pre-journal strong-kill recovery" {
+            $publicPreJournalPackageParent = Join-Path $sandbox "public-pre-journal-crash-package"
+            New-Item -ItemType Directory -Path $publicPreJournalPackageParent -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $root "clash-patch") -Destination $publicPreJournalPackageParent -Recurse
+            $publicPreJournalPackage = Join-Path $publicPreJournalPackageParent "clash-patch"
+            $publicPreJournalInstaller = Join-Path (Join-Path $publicPreJournalPackage "scripts") "install_windows.ps1"
+            $publicPreJournalTransaction = Join-Path (
+                Join-Path (Join-Path $publicPreJournalPackage "scripts") "windows/install_windows"
+            ) "transaction.ps1"
+            $publicPreJournalTransactionText = [System.IO.File]::ReadAllText($publicPreJournalTransaction)
+            $publicPreJournalFunctionOffset = $publicPreJournalTransactionText.IndexOf(
+                "function Invoke-VerifiedPathTransaction("
+            )
+            $publicPreJournalNeedle = '        $journalBytes = Write-FileTransactionJournal $opened'
+            $publicPreJournalOffset = $publicPreJournalTransactionText.IndexOf(
+                $publicPreJournalNeedle,
+                $publicPreJournalFunctionOffset
+            )
+            Assert-True (
+                $publicPreJournalFunctionOffset -ge 0 -and $publicPreJournalOffset -ge 0
+            ) "public pre-journal crash fixture could not find the transaction journal boundary"
+            $publicPreJournalHook = @'
+        if (-not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_PREJOURNAL_CRASH_READY)) {
+            [System.IO.File]::WriteAllText($env:CLASH_PATCH_TEST_PREJOURNAL_CRASH_READY, "ready")
+            Start-Sleep -Seconds 30
+        }
+'@
+            $publicPreJournalTransactionText = $publicPreJournalTransactionText.Insert(
+                $publicPreJournalOffset,
+                $publicPreJournalHook
+            )
+            [System.IO.File]::WriteAllText(
+                $publicPreJournalTransaction,
+                $publicPreJournalTransactionText,
+                (New-Object System.Text.UTF8Encoding($true))
+            )
+
+            $publicPreJournalHome = Join-Path $sandbox "public-pre-journal-crash-home"
+            $publicPreJournalProfiles = Join-Path $publicPreJournalHome "profiles"
+            $publicPreJournalReady = Join-Path $sandbox "public-pre-journal-crash.ready"
+            New-Item -ItemType Directory -Path $publicPreJournalProfiles -Force | Out-Null
+            [System.IO.File]::WriteAllText(
+                (Join-Path $publicPreJournalHome "config.yaml"),
+                "ipv6: true`ntun: null`n"
+            )
+            [System.IO.File]::WriteAllText(
+                (Join-Path $publicPreJournalHome "verge.yaml"),
+                "enable_tun_mode: false`n"
+            )
+            [System.IO.File]::WriteAllText(
+                (Join-Path $publicPreJournalHome "profiles.yaml"),
+                "items:`n- uid: R-pre-journal`n  type: remote`n  option:`n    allow_auto_update: true`n"
+            )
+            $env:CLASH_PATCH_TEST_PREJOURNAL_CRASH_READY = $publicPreJournalReady
+            $publicPreJournalChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+                "-NoLogo", "-NoProfile", "-File", $publicPreJournalInstaller,
+                "-AppHome", $publicPreJournalHome,
+                "-UsageProfile", "1",
+                "-MihomoPath", $fakeCore
+            ) -PassThru
+            try {
+                $publicPreJournalDeadline = [DateTime]::UtcNow.AddSeconds(10)
+                while (-not (Test-Path -LiteralPath $publicPreJournalReady -PathType Leaf) -and
+                    -not $publicPreJournalChild.HasExited -and
+                    [DateTime]::UtcNow -lt $publicPreJournalDeadline) {
+                    Start-Sleep -Milliseconds 25
+                }
+                Assert-True (
+                    Test-Path -LiteralPath $publicPreJournalReady -PathType Leaf
+                ) "public install did not reach the pre-journal new-target boundary"
+                Stop-Process -Id $publicPreJournalChild.Id -Force
+                $publicPreJournalChild.WaitForExit()
+            } finally {
+                $env:CLASH_PATCH_TEST_PREJOURNAL_CRASH_READY = $null
+                if (-not $publicPreJournalChild.HasExited) {
+                    Stop-Process -Id $publicPreJournalChild.Id -Force
+                }
+            }
+            $publicPreJournalUsage = Join-Path $publicPreJournalHome "clash-patch-usage-profile.json"
+            Assert-True (
+                (Test-Path -LiteralPath $publicPreJournalUsage -PathType Leaf) -and
+                (Get-Item -LiteralPath $publicPreJournalUsage).Length -eq 0
+            ) "public pre-journal crash fixture did not leave the newly created empty state"
+            Assert-True (-not (
+                Test-Path -LiteralPath (Join-Path $publicPreJournalHome ".clash-patch-transaction.json")
+            )) "public pre-journal crash unexpectedly published the main transaction journal"
+            Assert-True (
+                Test-Path -LiteralPath (
+                    Join-Path $publicPreJournalHome ".clash-patch-transaction-preparation.json"
+                ) -PathType Leaf
+            ) "public pre-journal crash did not leave a preparation record"
+
+            $publicPreJournalRecovery = Invoke-TestPowerShell $publicPreJournalInstaller @(
+                "-AppHome", $publicPreJournalHome,
+                "-UsageProfile", "1",
+                "-MihomoPath", $fakeCore,
+                "-Json"
+            )
+            $publicPreJournalRecoveryJson = Assert-JsonResult $publicPreJournalRecovery "install" 0
+            Assert-True (
+                $publicPreJournalRecoveryJson.code -eq "installed_common_baseline"
+            ) "next public install did not recover the pre-journal new target"
+            $publicPreJournalUsageJson = Get-Content -LiteralPath $publicPreJournalUsage -Raw | ConvertFrom-Json
+            Assert-True ([int]$publicPreJournalUsageJson.Profile -eq 1) "recovered install did not replace the empty usage state"
+            Assert-True (-not (
+                Test-Path -LiteralPath (
+                    Join-Path $publicPreJournalHome ".clash-patch-transaction-preparation.json"
+                )
+            )) "recovered install retained the preparation record"
         }
     }
 

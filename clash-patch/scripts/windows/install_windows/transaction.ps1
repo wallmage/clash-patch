@@ -100,19 +100,23 @@ function Enter-AppHomeMutationLock([string]$AppHome) {
 
         $script:ClashPatchMutationRoot = $canonical
         $script:ClashPatchTransactionJournalPath = Join-Path $canonical ".clash-patch-transaction.json"
+        $script:ClashPatchTransactionPreparationPath = Join-Path $canonical ".clash-patch-transaction-preparation.json"
         $recoveredTransaction = Test-Path -LiteralPath $script:ClashPatchTransactionJournalPath -PathType Leaf
+        $recoveredPreparation = Test-Path -LiteralPath $script:ClashPatchTransactionPreparationPath -PathType Leaf
         Repair-InterruptedFileTransaction
+        Repair-InterruptedFilePreparation
         return [pscustomobject]@{
             Root = $canonical
             RootHandle = $rootHandle
             LockStream = $lockStream
-            RecoveredTransaction = $recoveredTransaction
+            RecoveredTransaction = ($recoveredTransaction -or $recoveredPreparation)
         }
     } catch {
         if ($null -ne $lockStream) { $lockStream.Dispose() }
         if ($null -ne $rootHandle) { $rootHandle.Dispose() }
         $script:ClashPatchMutationRoot = $null
         $script:ClashPatchTransactionJournalPath = $null
+        $script:ClashPatchTransactionPreparationPath = $null
         throw
     }
 }
@@ -130,6 +134,7 @@ function Exit-AppHomeMutationLock([object]$Lock) {
         )) {
             $script:ClashPatchMutationRoot = $null
             $script:ClashPatchTransactionJournalPath = $null
+            $script:ClashPatchTransactionPreparationPath = $null
         }
     }
 }
@@ -647,6 +652,162 @@ function Set-VerifiedDeleteDisposition([System.IO.FileStream]$Stream, [bool]$Del
     [ClashPatch.VerifiedDeleteNative]::SetDeleteDisposition($Stream.SafeFileHandle, $DeleteFile)
 }
 
+function Write-FileTransactionPreparation([object[]]$Actions) {
+    $path = [string]$script:ClashPatchTransactionPreparationPath
+    $createdActions = @($Actions | Where-Object { $_.CreateNew })
+    if ([string]::IsNullOrWhiteSpace($path) -or $createdActions.Count -eq 0) {
+        return $null
+    }
+    if (Test-Path -LiteralPath $path) {
+        throw "发现尚未恢复的新建文件准备记录。"
+    }
+    $relativePaths = @($createdActions | Sort-Object Path | ForEach-Object {
+        Get-AppHomeRelativePath ([string]$_.Path)
+    })
+    $record = [ordered]@{
+        Version = 1
+        Paths = $relativePaths
+    }
+    $bytes = ConvertTo-Utf8Bytes (($record | ConvertTo-Json -Depth 3) + "`r`n")
+    $temporary = Join-Path $script:ClashPatchMutationRoot (
+        ".clash-patch-transaction-preparation." + [Guid]::NewGuid().ToString("N") + ".tmp"
+    )
+    $stream = $null
+    $moved = $false
+    try {
+        $stream = [System.IO.File]::Open(
+            $temporary,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        $stream.Dispose()
+        $stream = $null
+        [System.IO.File]::Move($temporary, $path)
+        Protect-BackupAcl $path
+        $moved = $true
+        return $bytes
+    } finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        if (-not $moved -and (Test-Path -LiteralPath $temporary -PathType Leaf)) {
+            [System.IO.File]::Delete($temporary)
+        }
+    }
+}
+
+function Get-ValidatedFileTransactionPreparation([object]$Record) {
+    if ($null -eq $Record) { throw "新建文件准备记录无效。" }
+    $properties = @($Record.PSObject.Properties.Name | Sort-Object)
+    if (($properties -join ",") -cne "Paths,Version" -or
+        -not ($Record.Version -is [int] -or $Record.Version -is [long]) -or
+        [long]$Record.Version -ne 1) {
+        throw "新建文件准备记录无效。"
+    }
+    $relativePaths = @($Record.Paths)
+    if ($relativePaths.Count -eq 0) { throw "新建文件准备记录没有目标。" }
+    $paths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    $validated = @()
+    foreach ($relativeValue in $relativePaths) {
+        if (-not ($relativeValue -is [string])) { throw "新建文件准备记录路径无效。" }
+        $relative = [string]$relativeValue
+        if ([string]::IsNullOrWhiteSpace($relative) -or
+            [System.IO.Path]::IsPathRooted($relative) -or
+            $relative -eq "." -or
+            @($relative.Split("\") | Where-Object { $_ -eq ".." }).Count -gt 0) {
+            throw "新建文件准备记录路径无效。"
+        }
+        $absolute = [System.IO.Path]::GetFullPath((Join-Path $script:ClashPatchMutationRoot $relative))
+        if ((Get-AppHomeRelativePath $absolute) -cne $relative.Replace(
+            [System.IO.Path]::AltDirectorySeparatorChar,
+            [System.IO.Path]::DirectorySeparatorChar
+        ) -or -not $paths.Add($absolute)) {
+            throw "新建文件准备记录路径无效。"
+        }
+        $validated += $absolute
+    }
+    return $validated
+}
+
+function Remove-FileTransactionPreparation([byte[]]$ExpectedBytes) {
+    $path = [string]$script:ClashPatchTransactionPreparationPath
+    if ([string]::IsNullOrWhiteSpace($path)) { return }
+    $snapshot = Get-OptionalFileSnapshot $path "新建文件准备记录"
+    if (-not $snapshot.Exists) { return }
+    if ((Get-BytesSha256 $snapshot.Bytes) -ne (Get-BytesSha256 $ExpectedBytes)) {
+        throw "新建文件准备记录在操作期间发生变化。"
+    }
+    $directoryHandles = @(Open-VerifiedDirectoryChain (Split-Path -Parent $path))
+    $handle = $null
+    $stream = $null
+    try {
+        $handle = [ClashPatch.VerifiedDeleteNative]::Open($path, $false, $false)
+        $stream = New-Object System.IO.FileStream($handle, [System.IO.FileAccess]::Read)
+        if ([ClashPatch.VerifiedDeleteNative]::GetIdentity($handle) -cne $snapshot.Identity -or
+            (Get-BytesSha256 (Get-StreamBytes $stream)) -ne (Get-BytesSha256 $ExpectedBytes)) {
+            throw "新建文件准备记录在操作期间发生变化。"
+        }
+        Set-VerifiedDeleteDisposition $stream $true
+    } finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        } elseif ($null -ne $handle) {
+            $handle.Dispose()
+        }
+        for ($index = $directoryHandles.Count - 1; $index -ge 0; $index--) {
+            $directoryHandles[$index].Dispose()
+        }
+    }
+}
+
+function Repair-InterruptedFilePreparation {
+    $path = [string]$script:ClashPatchTransactionPreparationPath
+    if ([string]::IsNullOrWhiteSpace($path)) { return }
+    $snapshot = Get-OptionalFileSnapshot $path "新建文件准备记录"
+    if (-not $snapshot.Exists) { return }
+    try {
+        $text = (New-Object System.Text.UTF8Encoding($false, $true)).GetString($snapshot.Bytes)
+        if ([regex]::Matches($text, '(?i)"Version"\s*:').Count -ne 1 -or
+            [regex]::Matches($text, '(?i)"Paths"\s*:').Count -ne 1) {
+            throw "字段重复或缺失。"
+        }
+        $record = $text | ConvertFrom-Json
+        $paths = @(Get-ValidatedFileTransactionPreparation $record)
+    } catch {
+        throw "新建文件准备记录损坏，无法安全恢复。"
+    }
+    foreach ($targetPath in $paths) {
+        $target = Get-OptionalFileSnapshot $targetPath "中断事务新建目标"
+        if (-not $target.Exists) { continue }
+        if ($target.Bytes.Length -ne 0) {
+            throw "中断事务新建目标包含无法自动合并的内容：$targetPath"
+        }
+        $directoryHandles = @(Open-VerifiedDirectoryChain (Split-Path -Parent $targetPath))
+        $handle = $null
+        $stream = $null
+        try {
+            $handle = [ClashPatch.VerifiedDeleteNative]::Open($targetPath, $false, $false)
+            $stream = New-Object System.IO.FileStream($handle, [System.IO.FileAccess]::Read)
+            if ([ClashPatch.VerifiedDeleteNative]::GetIdentity($handle) -cne $target.Identity -or
+                (Get-StreamBytes $stream).Length -ne 0) {
+                throw "中断事务新建目标在恢复前再次发生变化：$targetPath"
+            }
+            Set-VerifiedDeleteDisposition $stream $true
+        } finally {
+            if ($null -ne $stream) {
+                $stream.Dispose()
+            } elseif ($null -ne $handle) {
+                $handle.Dispose()
+            }
+            for ($index = $directoryHandles.Count - 1; $index -ge 0; $index--) {
+                $directoryHandles[$index].Dispose()
+            }
+        }
+    }
+    Remove-FileTransactionPreparation $snapshot.Bytes
+}
+
 function Write-FileTransactionJournal([object[]]$Entries) {
     if ([string]::IsNullOrWhiteSpace([string]$script:ClashPatchTransactionJournalPath) -or
         @($Entries).Count -eq 0) {
@@ -975,9 +1136,20 @@ function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$Dele
     $directoryHandles = @()
     $markedDeletes = @()
     $journalBytes = $null
+    $preparationBytes = $null
     $operationFailure = $null
     $recoveryFailures = @()
     try {
+        foreach ($action in @($actions | Sort-Object Path)) {
+            if ($action.CreateNew) {
+                if (Test-Path -LiteralPath $action.Path) {
+                    throw "目标路径在候选生成后出现，拒绝覆盖：$($action.Path)"
+                }
+            } elseif (-not (Test-Path -LiteralPath $action.Path -PathType Leaf)) {
+                throw "事务目标在候选生成后消失或不再是文件：$($action.Path)"
+            }
+        }
+        $preparationBytes = Write-FileTransactionPreparation $actions
         foreach ($action in @($actions | Sort-Object Path)) {
             $directory = Split-Path -Parent $action.Path
             $directoryHandles += @(Open-VerifiedDirectoryChain $directory)
@@ -1033,6 +1205,9 @@ function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$Dele
         }
 
         $journalBytes = Write-FileTransactionJournal $opened
+        if ($null -ne $preparationBytes) {
+            Remove-FileTransactionPreparation $preparationBytes
+        }
         foreach ($entry in @($opened | Where-Object { $_.Action -eq "write" })) {
             Write-LockedStreamBytes $entry.Stream $entry.Target.Bytes $entry.Original
         }
@@ -1091,6 +1266,13 @@ function Invoke-VerifiedPathTransaction([object[]]$WriteTargets, [object[]]$Dele
             $directoryHandles[$i].Dispose()
         } catch {
             $recoveryFailures += "关闭事务目标目录失败：$($_.Exception.Message)"
+        }
+    }
+    if ($null -ne $preparationBytes -and $recoveryFailures.Count -eq 0) {
+        try {
+            Remove-FileTransactionPreparation $preparationBytes
+        } catch {
+            $recoveryFailures += "清理新建文件准备记录失败：$($_.Exception.Message)"
         }
     }
     if ($null -ne $journalBytes -and $recoveryFailures.Count -eq 0) {

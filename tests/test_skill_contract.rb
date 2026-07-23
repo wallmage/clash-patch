@@ -1434,6 +1434,7 @@ class SkillContractTest < Minitest::Test
       "new-file transaction journal empty original bytes",
       "non-proxy route termini",
       "private transaction journal ACL",
+      "public new-target pre-journal strong-kill recovery",
       "public restore strong-kill atomicity",
       "public restore same-byte identity replacement",
       "release archive public install",
@@ -1458,6 +1459,7 @@ class SkillContractTest < Minitest::Test
     ].sort
     expected_public_kill_markers = %w[
       CLASH_PATCH_TEST_BACKUP_CRASH_READY
+      CLASH_PATCH_TEST_PREJOURNAL_CRASH_READY
       CLASH_PATCH_TEST_PUBLIC_CRASH_READY
       CLASH_PATCH_TEST_RECOVERY_CRASH_READY
       CLASH_PATCH_TEST_RESTORE_CRASH_READY

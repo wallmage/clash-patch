@@ -1080,6 +1080,8 @@ test('Windows installer is split into side-effect-free modules with stable funct
       'ConvertTo-Utf8Bytes', 'Write-Utf8Atomic', 'Get-BytesSha256', 'Get-FileSha256',
       'Get-StreamBytes', 'Get-OptionalFileSnapshot', 'Remove-VerifiedOwnedFile', 'Write-LockedStreamBytes',
       'Initialize-VerifiedFileNative', 'Open-VerifiedDirectoryChain', 'Set-VerifiedDeleteDisposition',
+      'Write-FileTransactionPreparation', 'Get-ValidatedFileTransactionPreparation',
+      'Remove-FileTransactionPreparation', 'Repair-InterruptedFilePreparation',
       'Write-FileTransactionJournal', 'Remove-FileTransactionJournal',
       'Get-ValidatedFileTransactionJournal', 'Get-InterruptedTransactionRecoveryPlan',
       'Invoke-InterruptedTransactionRecovery', 'Assert-InterruptedTransactionRecovered',
