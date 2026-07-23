@@ -37,6 +37,23 @@ function ConvertTo-NormalizedWindowsPath([string]$Path) {
     )
 }
 
+function Resolve-ClashVergeAppHome {
+    $existing = @()
+    foreach ($base in @($env:APPDATA, $env:LOCALAPPDATA)) {
+        if ([string]::IsNullOrWhiteSpace([string]$base)) { continue }
+        $candidate = Join-Path $base "io.github.clash-verge-rev.clash-verge-rev"
+        if (Test-Path -LiteralPath $candidate -PathType Container) {
+            $normalized = ConvertTo-NormalizedWindowsPath $candidate
+            if ($normalized -notin $existing) { $existing += $normalized }
+        }
+    }
+    if ($existing.Count -gt 1) {
+        throw "Clash Verge Rev 配置目录不唯一；请从客户端当前目录明确提供 -AppHome。"
+    }
+    if ($existing.Count -eq 1) { return $existing[0] }
+    return ""
+}
+
 function Get-AppHomeRelativePath([string]$Path) {
     if ([string]::IsNullOrWhiteSpace([string]$script:ClashPatchMutationRoot)) {
         throw "当前操作没有绑定 Clash Verge Rev 配置目录。"

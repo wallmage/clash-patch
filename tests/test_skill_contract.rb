@@ -1397,6 +1397,22 @@ class SkillContractTest < Minitest::Test
     assert_includes source, '(?<![A-Za-z0-9_$.])main\s*='
   end
 
+  def test_windows_default_app_home_rejects_multiple_existing_candidates
+    transaction = File.binread(
+      File.join(SKILL, "scripts/windows/install_windows/transaction.ps1")
+    ).force_encoding("UTF-8")
+    installer = File.binread(File.join(SKILL, "scripts/install_windows.ps1")).force_encoding("UTF-8")
+    uninstaller = File.binread(File.join(SKILL, "scripts/uninstall_windows.ps1")).force_encoding("UTF-8")
+
+    assert_includes transaction, "function Resolve-ClashVergeAppHome"
+    assert_includes transaction, "Clash Verge Rev 配置目录不唯一"
+    assert_includes transaction, 'if ($existing.Count -gt 1)'
+    assert_equal 1, installer.scan("Resolve-ClashVergeAppHome").length
+    assert_equal 1, uninstaller.scan("Resolve-ClashVergeAppHome").length
+    refute_includes installer, '$candidates | Where-Object'
+    refute_includes uninstaller, '$candidates | Where-Object'
+  end
+
   def test_macos_production_probe_runner_executes_all_cases_and_propagates_any_failure
     runner = File.join(ROOT, "tests/run_macos_production_probes.rb")
     assert File.file?(runner), "macOS production probes need one behaviorally testable CI runner"

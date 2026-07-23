@@ -727,6 +727,23 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_ambiguous_app_home_guard_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/install_windows/transaction.ps1",
+        '    if ($existing.Count -gt 1) {',
+        '    if ($false) {'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_windows_default_app_home_rejects_multiple_existing_candidates"
+      )
+    end
+  end
+
   def test_windows_public_uninstall_kill_probe_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

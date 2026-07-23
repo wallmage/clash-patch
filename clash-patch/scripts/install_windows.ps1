@@ -55,11 +55,12 @@ try {
 }
 
 if ([string]::IsNullOrWhiteSpace($AppHome)) {
-    $candidates = @(
-        (Join-Path $env:APPDATA "io.github.clash-verge-rev.clash-verge-rev"),
-        (Join-Path $env:LOCALAPPDATA "io.github.clash-verge-rev.clash-verge-rev")
-    )
-    $AppHome = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Container } | Select-Object -First 1
+    try {
+        $AppHome = Resolve-ClashVergeAppHome
+    } catch {
+        if (-not $Json) { [Console]::Error.WriteLine("[Clash 补丁] $($_.Exception.Message)") }
+        Complete-InstallResult 2 "invalid_request" "ambiguous_app_home" "检测到多个 Clash Verge Rev 配置目录；未执行任何操作。"
+    }
 }
 if (-not [string]::IsNullOrWhiteSpace($AppHome)) {
     $AppHome = ConvertTo-NormalizedWindowsPath $AppHome

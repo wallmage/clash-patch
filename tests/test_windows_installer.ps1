@@ -615,6 +615,27 @@ fs.writeFileSync(process.argv[4], JSON.stringify(output));
             return
         }
 
+        $ambiguousRoaming = Join-Path $sandbox "ambiguous-roaming"
+        $ambiguousLocal = Join-Path $sandbox "ambiguous-local"
+        $ambiguousName = "io.github.clash-verge-rev.clash-verge-rev"
+        New-Item -ItemType Directory -Path (Join-Path $ambiguousRoaming $ambiguousName) -Force | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $ambiguousLocal $ambiguousName) -Force | Out-Null
+        $previousAppData = $env:APPDATA
+        $previousLocalAppData = $env:LOCALAPPDATA
+        try {
+            $env:APPDATA = $ambiguousRoaming
+            $env:LOCALAPPDATA = $ambiguousLocal
+            $ambiguousInstall = Invoke-TestPowerShell $installer @("-ShowUsageProfile", "-Json")
+            $ambiguousInstallJson = Assert-JsonResult $ambiguousInstall "install" 2
+            Assert-True ($ambiguousInstallJson.code -eq "ambiguous_app_home") "installer silently selected one of two AppHome candidates"
+            $ambiguousUninstall = Invoke-TestPowerShell $uninstaller @("-Json")
+            $ambiguousUninstallJson = Assert-JsonResult $ambiguousUninstall "uninstall" 2
+            Assert-True ($ambiguousUninstallJson.code -eq "ambiguous_app_home") "uninstaller silently selected one of two AppHome candidates"
+        } finally {
+            $env:APPDATA = $previousAppData
+            $env:LOCALAPPDATA = $previousLocalAppData
+        }
+
         $invalidTransactionJournals = @(
             '{"Version":"1","Actions":[{"Action":"write","Path":"target.txt","Existed":true,"OriginalBase64":"b2xk","ReplacementBase64":"bmV3"}]}',
             '{"Version":1,"Actions":[]}',

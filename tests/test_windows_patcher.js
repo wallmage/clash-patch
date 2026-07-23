@@ -1043,7 +1043,8 @@ test('Windows installer is split into side-effect-free modules with stable funct
   const expected = {
     'common.ps1': ['Write-Info', 'Complete-InstallResult', 'Get-SavedUsageProfile', 'Save-UsageProfile'],
     'transaction.ps1': [
-      'Protect-BackupAcl', 'ConvertTo-NormalizedWindowsPath', 'Get-AppHomeRelativePath',
+      'Protect-BackupAcl', 'ConvertTo-NormalizedWindowsPath', 'Resolve-ClashVergeAppHome',
+      'Get-AppHomeRelativePath',
       'Enter-AppHomeMutationLock', 'Exit-AppHomeMutationLock',
       'Get-PathKey', 'Assert-NoReparsePointPath', 'Backup-Versioned', 'Backup-InitialOnce', 'Write-BytesAtomic',
       'ConvertTo-Utf8Bytes', 'Write-Utf8Atomic', 'Get-BytesSha256', 'Get-FileSha256',
