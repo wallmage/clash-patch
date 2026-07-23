@@ -541,6 +541,23 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_macos_real_mihomo_profile_loop_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "tests/test_macos_patcher.rb",
+        "      [1, 2, 3].each do |usage_profile|\n",
+        "      [1].each do |usage_profile|\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_macos_real_mihomo_runner_rejects_zero_or_skipped_cases"
+      )
+    end
+  end
+
   def test_macos_production_probe_failure_aggregation_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

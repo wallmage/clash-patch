@@ -1204,12 +1204,18 @@ class SkillContractTest < Minitest::Test
     assert_equal 2, workflow.scan(/ruby tests\/run_macos_mihomo_validation\.rb/).length
     refute_includes workflow,
                     "ruby tests/test_macos_patcher.rb --name test_generated_profile_passes_installed_mihomo_validation"
-    assert_includes runner, '"1 runs"'
-    assert_includes runner, '"0 failures"'
-    assert_includes runner, '"0 errors"'
-    assert_includes runner, '"0 skips"'
-    assert_match(/assertions = .*summary.*match.*to_i/m, runner)
-    assert_includes runner, "assertions.positive?"
+    assert_includes runner, 'counts == [1, counts&.fetch(1, 0), 0, 0, 0]'
+    assert_includes runner, "counts&.fetch(1, 0).positive?"
+    assert_includes runner, '"CLASH_PATCH_MIHOMO_RECEIPT_PATH"'
+    assert_includes runner, '"CLASH_PATCH_MIHOMO_RECEIPT_NONCE"'
+    assert_includes runner, '"profiles_completed" => [1, 2, 3]'
+    assert_includes runner, '"validations" => expected_validations'
+    assert_includes runner, '"core_sha256" => expected_core_sha256'
+    assert patcher_tests.include?("      [1, 2, 3].each do |usage_profile|"),
+           "real Mihomo validation must execute all three usage profiles"
+    assert_includes patcher_tests, '"profiles_completed" => profiles_completed'
+    assert_includes patcher_tests, '"validations" => validations'
+    assert_includes patcher_tests, '"core_sha256" => Digest::SHA256.file(core).hexdigest'
   end
 
   def test_ruby_coverage_requires_the_entire_transform_module_at_one_hundred_percent

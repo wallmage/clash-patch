@@ -1,4 +1,5 @@
 require "json"
+require "digest"
 require "minitest/autorun"
 require "open3"
 require "rbconfig"
@@ -3998,12 +3999,15 @@ class MacosPatcherTest < Minitest::Test
       rules:
         - MATCH,Main
     YAML
+    validations = []
+    profiles_completed = []
     Dir.mktmpdir do |directory|
       [1, 2, 3].each do |usage_profile|
         profile = File.join(directory, "profile-#{usage_profile}.yaml")
         File.write(profile, text)
         assert_equal true, ClashPatch.validate_with_mihomo(profile, core_path: core),
                      "profile #{usage_profile} baseline fixture must be valid"
+        validations << { "profile" => usage_profile, "stage" => "baseline" }
         validator = ->(path) { ClashPatch.validate_with_mihomo(path, core_path: core) }
         result = ClashPatch.patch_path(
           profile, @policy, validator: validator, usage_profile: usage_profile
@@ -4011,7 +4015,21 @@ class MacosPatcherTest < Minitest::Test
         assert_equal :updated, result.fetch(:status), "profile #{usage_profile}"
         assert_equal true, ClashPatch.validate_with_mihomo(profile, core_path: core),
                      "profile #{usage_profile} patch must stay valid"
+        validations << { "profile" => usage_profile, "stage" => "patched" }
+        profiles_completed << usage_profile
       end
+    end
+    receipt_path = ENV["CLASH_PATCH_MIHOMO_RECEIPT_PATH"].to_s
+    unless receipt_path.empty?
+      receipt = {
+        "schema" => "clash-patch.mihomo-validation",
+        "version" => 1,
+        "nonce" => ENV.fetch("CLASH_PATCH_MIHOMO_RECEIPT_NONCE"),
+        "core_sha256" => Digest::SHA256.file(core).hexdigest,
+        "profiles_completed" => profiles_completed,
+        "validations" => validations
+      }
+      File.write(receipt_path, JSON.generate(receipt))
     end
   end
 
