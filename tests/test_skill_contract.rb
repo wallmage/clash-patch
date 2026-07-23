@@ -1129,7 +1129,7 @@ class SkillContractTest < Minitest::Test
     assert_includes workflow, "-RealMihomoOnly"
     assert_includes workflow, "executable: powershell.exe"
     assert_includes workflow, "executable: pwsh.exe"
-    assert_equal 4, workflow.scan(/- version: v1\.19\.(?:27|29)\n\s+sha256: "[0-9a-f]{64}"\n\s+shell: (?:powershell|pwsh)/).length
+    assert_equal 4, workflow.scan(/- version: v1\.19\.(?:27|29)\n\s+sha256: "[0-9a-f]{64}"\n\s+executable: (?:powershell|pwsh)\.exe\n\s+edition: (?:Desktop|Core)\n\s+major: [57]/).length
     assert_includes workflow, "--connect-timeout 15 --max-time 300"
     assert_includes workflow, "shell: powershell"
     assert_includes workflow, "Get-Command powershell.exe"
@@ -1144,6 +1144,15 @@ class SkillContractTest < Minitest::Test
     assert_includes workflow, "github.event.before"
     assert_includes workflow, "github.event.pull_request.base.sha"
     assert_equal 6, workflow.scan(/timeout-minutes:\s*20/).length
+  end
+
+  def test_github_actions_shell_fields_are_static
+    workflow = File.read(File.join(ROOT, ".github/workflows/test.yml"))
+    shell_values = workflow.scan(/^\s+shell:\s*(.+)$/).flatten
+
+    refute_empty shell_values
+    assert shell_values.all? { |value| %w[bash powershell pwsh].include?(value) },
+           "GitHub rejects expression contexts in steps[*].shell before any job starts"
   end
 
   def test_ruby_coverage_requires_the_entire_transform_module_at_one_hundred_percent

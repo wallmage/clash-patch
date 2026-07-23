@@ -175,25 +175,21 @@ jobs:
         include:
           - version: v1.19.27
             sha256: "34b4c5bc0c176eebd298f6624aa23ea41985a2c54efb04eb0e9c4542e45190ee"
-            shell: powershell
             executable: powershell.exe
             edition: Desktop
             major: 5
           - version: v1.19.29
             sha256: "1a8520cfe425441eba3eba8623b27b985020031243fe1ecaa1af2b92358a03f9"
-            shell: powershell
             executable: powershell.exe
             edition: Desktop
             major: 5
           - version: v1.19.27
             sha256: "34b4c5bc0c176eebd298f6624aa23ea41985a2c54efb04eb0e9c4542e45190ee"
-            shell: pwsh
             executable: pwsh.exe
             edition: Core
             major: 7
           - version: v1.19.29
             sha256: "1a8520cfe425441eba3eba8623b27b985020031243fe1ecaa1af2b92358a03f9"
-            shell: pwsh
             executable: pwsh.exe
             edition: Core
             major: 7
@@ -205,7 +201,7 @@ jobs:
         with:
           node-version: "22"
       - name: Download and verify official Windows Mihomo
-        shell: ${{ matrix.shell }}
+        shell: powershell
         env:
           MIHOMO_VERSION: ${{ matrix.version }}
           MIHOMO_SHA256: ${{ matrix.sha256 }}
@@ -222,14 +218,16 @@ jobs:
           $core = @(Get-ChildItem -LiteralPath $destination -Filter "mihomo*.exe" -File -Recurse)
           if ($core.Count -ne 1) { throw "Mihomo archive did not contain exactly one executable" }
       - name: Validate all Windows profiles through the public installer
-        shell: ${{ matrix.shell }}
+        shell: powershell
         run: |
           $destination = Join-Path $env:RUNNER_TEMP "mihomo-windows-amd64"
           $core = @(Get-ChildItem -LiteralPath $destination -Filter "mihomo*.exe" -File -Recurse)
           if ($core.Count -ne 1) { throw "Mihomo executable is missing before validation" }
-          ./tests/test_windows_installer.ps1 `
-            -PowerShellPath (Get-Command '${{ matrix.executable }}').Source `
+          $targetPowerShell = (Get-Command '${{ matrix.executable }}').Source
+          & $targetPowerShell -NoLogo -NoProfile -File ./tests/test_windows_installer.ps1 `
+            -PowerShellPath $targetPowerShell `
             -ExpectedPSEdition '${{ matrix.edition }}' `
             -ExpectedPSMajor ${{ matrix.major }} `
             -RealMihomoPaths @($core[0].FullName) `
             -RealMihomoOnly
+          if ($LASTEXITCODE -ne 0) { throw "Windows real Mihomo suite failed" }

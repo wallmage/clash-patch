@@ -439,6 +439,23 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_github_actions_dynamic_shell_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        ".github/workflows/test.yml",
+        "      - name: Download and verify official Windows Mihomo\n        shell: powershell",
+        "      - name: Download and verify official Windows Mihomo\n        shell: ${{ matrix.shell }}"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_github_actions_shell_fields_are_static"
+      )
+    end
+  end
+
   def test_macos_production_probe_inventory_mutation_is_killed
     with_repo_copy do |root|
       replace_once(
