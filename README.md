@@ -198,6 +198,7 @@ bash clash-patch/scripts/install_macos.sh --profile N
 - 每份顶层 YAML 都经过 YAML 1.2 读取、二次转换和 Mihomo 校验，最长等待 30 秒。第一次运行保存初始快照；以后每次写入前都创建带日期时间的版本化备份（独占创建，目录权限 `700`、文件权限 `600`），保存在 `~/Library/Application Support/ClashPatch/backups`。
 - 写入有并发保护：文件加独占锁，校验或写入期间订阅被客户端刷新会重新读取并重试，连续变化则跳过该份并标记稍后重试；符号链接订阅写入真实目标，不用重命名替换符号链接本身。
 - 当前订阅写入后通过本地控制器自动刷新（`PUT /configs?force=true`），依次清除旧 Fake-IP 与 DNS 缓存，再检查 TUN 仍启用、原有代理组选择没有变化、国内和境外 DNS 查询成功、外网可连接；任一步失败都在当前进程内恢复修改前的内容，候选已被内核采用时再次加载原配置。不调用 AppleScript，不切换 TUN、订阅、代理组或节点。
+- 普通 Patch 若在当前订阅已经加载候选后被强制结束，下一次 Patch 会先恢复原文件，再重新加载原订阅并完成运行检查，然后才允许校验或写入新候选；自动刷新失败后原运行配置仍未恢复时同样保留事务记录，供下次 Patch 继续。此时使用 `--no-reload` 只恢复文件并保留事务，不处理新候选，不能让文件与实际运行配置长期不一致。
 - 不安装永久监听、LaunchAgent、`WatchPaths` 或计划任务；只删除能通过 `Label` 和启动参数确认属于旧版 Clash Patch 的遗留监听（`com.clashpatch.profiles`、`com.wallny.clash-profile-patcher`）。
 
 ## Windows 平台机制

@@ -141,6 +141,38 @@ module ClashPatch
     false
   end
 
+  def reload_recovered_profile_runtime(work_items, usage_profile:, socket: nil, requester: nil,
+                                       connectivity_checker: nil)
+    active = work_items.find { |item| item.fetch(:active) }
+    return true unless active
+
+    if requester.nil?
+      socket ||= controller_socket
+      return false unless socket
+
+      requester = ->(method, endpoint, body) { controller_request(socket, method, endpoint, body) }
+    end
+    connectivity_checker ||= method(:default_connectivity_healthy?)
+    selections = runtime_selections(requester)
+    return false unless selections
+
+    config = load_yaml(File.read(active.fetch(:path), encoding: "UTF-8"), active.fetch(:path))
+    selector_names = selectable_groups(config).map { |group| group.fetch("name") }
+    selections = selections.select { |name, _selected| selector_names.include?(name) }
+    expected_tun = usage_profile >= 2 ? :enabled : :ignore
+    code, _body = requester.call(
+      "PUT", "/configs?force=true", JSON.generate("path" => File.expand_path(active.fetch(:path)))
+    )
+    return false unless code == 204
+
+    runtime_health_healthy?(
+      requester, selections: selections, expected_tun: expected_tun,
+      connectivity_checker: connectivity_checker
+    )
+  rescue StandardError
+    false
+  end
+
   def activate_updated_profile(result, socket: nil, requester: nil, connectivity_checker: nil, require_tun: true)
     if requester.nil?
       socket ||= controller_socket

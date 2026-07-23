@@ -373,6 +373,188 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_next_run_recovers_runtime_killed_after_active_reload
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "active.yaml")
+      backup_root = File.join(directory, "backups")
+      runtime_state = File.join(directory, "runtime-state.json")
+      gate_seen = File.join(directory, "reload-gated")
+      original_config = base_config
+      original_config["proxy-groups"].reject! { |group| group["name"] == "AI" }
+      original_config["rules"] = ["GEOSITE,CN,DIRECT", "MATCH,Main"]
+      original = YAML.dump(original_config)
+      File.binwrite(profile, original)
+      File.write(runtime_state, JSON.generate("Main" => "Taiwan"))
+      ready_reader, ready_writer = IO.pipe
+      gate_reader, gate_writer = IO.pipe
+      child_id = nil
+      provider_name = @policy.fetch("cn_domain_provider").fetch("name")
+      requester = lambda do |method, endpoint, body = nil|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          selections = JSON.parse(File.read(runtime_state))
+          proxies = selections.to_h do |name, selected|
+            [name, { "type" => "Selector", "now" => selected }]
+          end
+          [200, JSON.generate("proxies" => proxies)]
+        when ["PUT", "/configs?force=true"]
+          path = JSON.parse(body).fetch("path")
+          config = ClashPatch.load_yaml(File.read(path))
+          marker = config.fetch("rule-providers", {}).key?(provider_name) ? "candidate" : "original"
+          selections = ClashPatch.selectable_groups(config).to_h do |group|
+            [group.fetch("name"), "Taiwan"]
+          end
+          File.write(runtime_state, JSON.generate(selections))
+          if marker == "candidate" && !File.exist?(gate_seen)
+            File.write(gate_seen, "1")
+            ready_writer.write(".")
+            ready_writer.flush
+            gate_reader.read(1)
+          end
+          [204, ""]
+        when ["POST", "/cache/fakeip/flush"], ["POST", "/cache/dns/flush"]
+          [204, ""]
+        when ["GET", "/configs"]
+          [200, JSON.generate("tun" => { "enable" => true })]
+        else
+          if method == "GET" && endpoint.start_with?("/dns/query?")
+            [200, JSON.generate("Status" => 0, "Answer" => [{ "data" => "203.0.113.1" }])]
+          else
+            [404, ""]
+          end
+        end
+      end
+
+      begin
+        child_id = fork do
+          ready_reader.close
+          gate_writer.close
+          ClashPatch.run(
+            directory: directory, policy_path: POLICY_PATH, backup_root: backup_root,
+            selected_name: "active", validator: ->(_path) { true },
+            auto_reload: true, requester: requester,
+            connectivity_checker: -> { true }, usage_profile: 3
+          )
+          exit! 0
+        end
+        ready_writer.close
+        gate_reader.close
+        assert IO.select([ready_reader], nil, nil, 10), "child never loaded the active candidate"
+        ready_reader.read(1)
+        Process.kill("KILL", child_id)
+        _waited_id, status = Process.wait2(child_id)
+        child_id = nil
+        assert_equal 9, status.termsig
+        candidate_selections = JSON.parse(File.read(runtime_state))
+        assert_operator candidate_selections.length, :>, 1
+        transaction_path = ClashPatch.profile_transaction_path(backup_root)
+        validator_called = false
+
+        blocked_results = ClashPatch.run(
+          directory: directory, policy_path: POLICY_PATH, backup_root: backup_root,
+          selected_name: "active", validator: ->(_path) { validator_called = true; false },
+          auto_reload: false, connectivity_checker: -> { true }, usage_profile: 3
+        )
+
+        assert blocked_results.any? do |result|
+          result.fetch(:status) == :reload_failed_restore_pending
+        end
+        refute validator_called
+        assert_equal original.b, File.binread(profile)
+        assert_equal candidate_selections, JSON.parse(File.read(runtime_state))
+        assert File.exist?(transaction_path)
+
+        controller_requester = lambda do |_socket, method, endpoint, body = nil|
+          requester.call(method, endpoint, body)
+        end
+        results = ClashPatch.stub(:controller_socket, "fixture.sock") do
+          ClashPatch.stub(:controller_request, controller_requester) do
+            ClashPatch.run(
+              directory: directory, policy_path: POLICY_PATH, backup_root: backup_root,
+              selected_name: "active", validator: ->(_path) { false },
+              auto_reload: true, connectivity_checker: -> { true }, usage_profile: 3
+            )
+          end
+        end
+
+        assert results.any? { |result| result.fetch(:status) == :validation_failed }
+        assert_equal original.b, File.binread(profile)
+        assert_equal({ "Main" => "Taiwan" }, JSON.parse(File.read(runtime_state)))
+      ensure
+        gate_writer.write(".") rescue nil
+        Process.kill("KILL", child_id) rescue nil
+        Process.waitpid(child_id) rescue nil
+        [ready_reader, ready_writer, gate_reader, gate_writer].each { |io| io.close rescue nil }
+      end
+    end
+  end
+
+  def test_recovered_runtime_helper_fails_closed_if_active_profile_disappears
+    Dir.mktmpdir do |directory|
+      requester = lambda do |method, endpoint, _body = nil|
+        if [method, endpoint] == ["GET", "/proxies"]
+          [200, JSON.generate("proxies" => {
+            "Main" => { "type" => "Selector", "now" => "Taiwan" }
+          })]
+        else
+          flunk "runtime recovery continued after the active profile disappeared"
+        end
+      end
+      work_items = [{ path: File.join(directory, "missing-active.yaml"), active: true }]
+
+      refute ClashPatch.reload_recovered_profile_runtime(
+        work_items, usage_profile: 1, requester: requester,
+        connectivity_checker: -> { true }
+      )
+    end
+  end
+
+  def test_failed_pending_runtime_recovery_keeps_transaction_and_skips_new_patch
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "active.yaml")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config)
+      File.binwrite(profile, original)
+      preview = ClashPatch.patch_path(
+        profile, @policy, dry_run: true, validator: ->(_path) { true },
+        usage_profile: 1, capture_transaction: true
+      )
+      candidate = preview.fetch(:transaction_candidate)
+      ClashPatch.prepare_profile_transaction(
+        [{ path: profile, original: original.b, candidate: candidate }],
+        backup_root
+      )
+      File.binwrite(profile, candidate)
+      transaction_path = ClashPatch.profile_transaction_path(backup_root)
+      validator_called = false
+      requester = lambda do |method, endpoint, _body = nil|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          [200, JSON.generate("proxies" => {
+            "Main" => { "type" => "Selector", "now" => "Taiwan" },
+            "Clash Patch AI" => { "type" => "Selector", "now" => "Taiwan" }
+          })]
+        when ["PUT", "/configs?force=true"]
+          [503, ""]
+        else
+          [404, ""]
+        end
+      end
+
+      results = ClashPatch.run(
+        directory: directory, policy_path: POLICY_PATH, backup_root: backup_root,
+        selected_name: "active", validator: ->(_path) { validator_called = true; true },
+        auto_reload: true, requester: requester,
+        connectivity_checker: -> { true }, usage_profile: 1
+      )
+
+      assert results.any? { |result| result.fetch(:status) == :reload_failed_restore_pending }
+      assert_equal original.b, File.binread(profile)
+      assert File.exist?(transaction_path)
+      refute validator_called
+    end
+  end
+
   def test_production_probe_next_safe_update_recovers_batch_killed_after_first_swap
     require_production_probe!
     Dir.mktmpdir do |directory|
@@ -3467,13 +3649,18 @@ class MacosPatcherTest < Minitest::Test
   def test_failed_active_reload_restores_the_exact_original_profile
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
+      backup_root = File.join(directory, "backups")
       original = YAML.dump(base_config)
       File.binwrite(profile, original)
+      reloads = 0
       requester = lambda do |method, endpoint, _body|
         if method == "GET" && endpoint == "/proxies"
           [200, JSON.generate("proxies" => { "Main" => { "type" => "Selector", "now" => "台湾家宽 01" } })]
         elsif method == "PUT" && endpoint == "/configs?force=true"
-          [401, ""]
+          reloads += 1
+          [reloads == 1 ? 204 : 401, ""]
+        elsif method == "POST" && endpoint == "/cache/fakeip/flush"
+          [503, ""]
         else
           [404, ""]
         end
@@ -3482,7 +3669,7 @@ class MacosPatcherTest < Minitest::Test
       result = ClashPatch.run(
         directory: directory,
         policy_path: POLICY_PATH,
-        backup_root: File.join(directory, "backups"),
+        backup_root: backup_root,
         selected_name: "friend",
         auto_reload: true,
         requester: requester,
@@ -3491,6 +3678,8 @@ class MacosPatcherTest < Minitest::Test
 
       assert_equal :reload_failed_restore_pending, result.fetch(:status)
       assert_equal original.b, File.binread(profile)
+      assert_equal 2, reloads
+      assert File.exist?(ClashPatch.profile_transaction_path(backup_root))
       assert_includes ClashPatch.chinese_status(result), "运行内核恢复失败"
     end
   end

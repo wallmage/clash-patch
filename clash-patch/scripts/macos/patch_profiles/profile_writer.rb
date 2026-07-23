@@ -167,7 +167,7 @@ module ClashPatch
     true
   end
 
-  def recover_profile_transaction(backup_root, roots:, allow_concurrent_paths: [])
+  def recover_profile_transaction(backup_root, roots:, allow_concurrent_paths: [], keep_transaction: false)
     path = profile_transaction_path(backup_root)
     return true unless File.exist?(path) || File.symlink?(path)
 
@@ -211,7 +211,8 @@ module ClashPatch
       )
       raise IOError, "配置事务恢复失败" unless restored
     end
-    remove_profile_transaction(snapshot)
+    remove_profile_transaction(snapshot) unless keep_transaction
+    snapshot
   rescue ArgumentError, JSON::ParserError
     raise InvalidConfigError, "配置事务记录无效"
   end
@@ -359,7 +360,15 @@ module ClashPatch
     active_root = active_directory || active_profile_root(roots, selected, directory)
     operation_lock = profile_operation_lock(backup_root) if !dry_run && backup_root
     begin
-      recover_profile_transaction(backup_root, roots: roots) if !dry_run && backup_root
+      pending_runtime_restore = !dry_run && backup_root &&
+                                (File.exist?(profile_transaction_path(backup_root)) ||
+                                 File.symlink?(profile_transaction_path(backup_root)))
+      recovered_transaction = if !dry_run && backup_root
+                                recover_profile_transaction(
+                                  backup_root, roots: roots,
+                                  keep_transaction: pending_runtime_restore
+                                )
+                              end
 
       work_items = roots.flat_map do |root|
         paths = profile_paths(root)
@@ -374,6 +383,19 @@ module ClashPatch
               active_profile?(path, selected)
           }
         end
+      end
+      if pending_runtime_restore
+        recovered = auto_reload && reload_recovered_profile_runtime(
+          work_items, usage_profile: usage_profile, socket: socket, requester: requester,
+          connectivity_checker: connectivity_checker
+        )
+        unless recovered
+          return work_items.map do |item|
+            status = item.fetch(:active) ? :reload_failed_restore_pending : :batch_aborted
+            base_result(nil, status).merge(path: item.fetch(:path), active: item.fetch(:active))
+          end
+        end
+        remove_profile_transaction(recovered_transaction)
       end
       identities = work_items.map do |item|
         stat = File.stat(File.realpath(item.fetch(:path)))
@@ -470,7 +492,10 @@ module ClashPatch
               end
             end
             recover_profile_transaction(
-              backup_root, roots: roots, allow_concurrent_paths: allowed_concurrent_paths
+              backup_root, roots: roots, allow_concurrent_paths: allowed_concurrent_paths,
+              keep_transaction: results.any? do |result|
+                result[:status] == :reload_failed_restore_pending
+              end
             )
           end
         end
