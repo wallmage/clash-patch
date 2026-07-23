@@ -101,6 +101,25 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_safe_update_precommit_journal_cleanup_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        "        remove_profile_transaction(transaction)\n" \
+          "        return { status: :aborted, failed_profile: \"\", reason: :concurrent_change }\n",
+        "        true\n" \
+          "        return { status: :aborted, failed_profile: \"\", reason: :concurrent_change }\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_safe_update_all_discards_an_uncommitted_journal_after_a_preflight_refresh"
+      )
+    end
+  end
+
   def test_early_profile_save_mutation_is_killed
     with_repo_copy do |root|
       early_save = <<~SH

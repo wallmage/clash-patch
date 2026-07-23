@@ -501,6 +501,7 @@ module ClashPatch
                locked_profile_current?(handle, item.fetch(:path)) &&
                  handle.rewind && handle.read == item.fetch(:original)
              end
+        remove_profile_transaction(transaction)
         return { status: :aborted, failed_profile: "", reason: :concurrent_change }
       end
 

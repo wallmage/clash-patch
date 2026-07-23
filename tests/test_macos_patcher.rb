@@ -2166,6 +2166,48 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_safe_update_all_discards_an_uncommitted_journal_after_a_preflight_refresh
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "friend.yaml")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old"))
+      refreshed = YAML.dump(base_config.merge("subscription-marker" => "external-refresh"))
+      File.binwrite(path, original)
+      target = { name: "friend", path: path, url: "https://subscriptions.invalid/friend" }
+      refresh_injected = false
+      fetcher = lambda do |_target|
+        unless refresh_injected
+          replacement = File.join(directory, "replacement.yaml")
+          File.binwrite(replacement, refreshed)
+          File.rename(replacement, path)
+          refresh_injected = true
+        end
+        YAML.dump(base_config.merge("subscription-marker" => "downloaded"))
+      end
+
+      first = ClashPatch.safe_update_all(
+        targets: [target], policy: @policy, backup_root: backup_root, usage_profile: 1,
+        fetcher: fetcher, validator: ->(_path) { true },
+        activation: ->(_items) { flunk "preflight conflict must not activate" }
+      )
+
+      assert refresh_injected
+      assert_equal :aborted, first.fetch(:status)
+      assert_equal :concurrent_change, first.fetch(:reason)
+      assert_equal refreshed.b, File.binread(path)
+      refute File.exist?(ClashPatch.profile_transaction_path(backup_root)),
+             "a preflight-only transaction must not block the next public operation"
+
+      second = ClashPatch.safe_update_all(
+        targets: [target], policy: @policy, backup_root: backup_root, usage_profile: 1,
+        fetcher: ->(_target) { YAML.dump(base_config.merge("subscription-marker" => "retry")) },
+        validator: ->(_path) { true }, activation: ->(_items) { true }
+      )
+      assert_equal :updated, second.fetch(:status)
+      assert_equal "retry", ClashPatch.load_yaml(File.binread(path)).fetch("subscription-marker")
+    end
+  end
+
   def test_safe_update_all_preserves_an_atomic_refresh_during_backup
     Dir.mktmpdir do |directory|
       backup_root = File.join(directory, "backups")
