@@ -123,8 +123,11 @@ class MutationSafetyTest < Minitest::Test
       replace_once(
         root,
         "clash-patch/scripts/macos/patch_profiles/backups.rb",
-        "    recover_profile_transaction(backup_root, roots: directories)\n",
-        "    true\n"
+        "      recovery = resume_profile_transaction(\n" \
+          "        backup_root, roots: directories, work_items: work_items, reload_runtime: true,\n" \
+          "        require_tun: :preserve\n" \
+          "      )\n",
+        "      recovery = :recovered\n"
       )
 
       assert_mutation_is_killed(
@@ -194,11 +197,13 @@ class MutationSafetyTest < Minitest::Test
       replace_once(
         root,
         "clash-patch/scripts/macos/patch_profiles/profile_writer.rb",
-        "        recovered = auto_reload && reload_recovered_profile_runtime(\n" \
-          "          work_items, usage_profile: usage_profile, socket: socket, requester: requester,\n" \
-          "          connectivity_checker: connectivity_checker\n" \
-          "        )\n",
-        "        recovered = true\n"
+        "    return :runtime_restore_pending unless\n" \
+          "      reload_runtime &&\n" \
+          "      reload_recovered_profile_runtime(\n" \
+          "        work_items, require_tun: require_tun, socket: socket, requester: requester,\n" \
+          "        connectivity_checker: connectivity_checker\n" \
+          "      )\n",
+        "    return :runtime_restore_pending unless true\n"
       )
 
       assert_mutation_is_killed(
@@ -214,8 +219,8 @@ class MutationSafetyTest < Minitest::Test
       replace_once(
         root,
         "clash-patch/scripts/macos/patch_profiles/profile_writer.rb",
-        "                                  keep_transaction: pending_runtime_restore\n",
-        "                                  keep_transaction: false\n"
+        "      backup_root, roots: roots, keep_transaction: pending\n",
+        "      backup_root, roots: roots, keep_transaction: false\n"
       )
 
       assert_mutation_is_killed(
@@ -231,8 +236,8 @@ class MutationSafetyTest < Minitest::Test
       replace_once(
         root,
         "clash-patch/scripts/macos/patch_profiles/profile_writer.rb",
-        "      pending_runtime_restore = !dry_run && backup_root &&\n",
-        "      pending_runtime_restore = !dry_run && backup_root && auto_reload &&\n"
+        "          backup_root, roots: roots, work_items: work_items, reload_runtime: auto_reload,\n",
+        "          backup_root, roots: roots, work_items: work_items, reload_runtime: true,\n"
       )
 
       assert_mutation_is_killed(
@@ -258,6 +263,85 @@ class MutationSafetyTest < Minitest::Test
         root,
         RbConfig.ruby, "tests/test_macos_patcher.rb",
         "--name", "test_failed_active_reload_restores_the_exact_original_profile"
+      )
+    end
+  end
+
+  def test_restore_backup_transaction_creation_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/backups.rb",
+        "    create_versioned_backup(target, backup_root, content: current_bytes, reason: \"pre-restore\")\n" \
+          "    transaction = prepare_profile_transaction(\n" \
+          "      [{ path: target, original: current_bytes, candidate: backup_bytes }], backup_root\n" \
+          "    )\n",
+        "    create_versioned_backup(target, backup_root, content: current_bytes, reason: \"pre-restore\")\n" \
+          "    transaction = {}\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_next_patch_recovers_backup_restore_killed_after_file_commit"
+      )
+    end
+  end
+
+  def test_restore_backup_activation_order_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/backups.rb",
+        "    result = activation.call(result) if activation\n" \
+          "    finish_backup_restore_transaction(transaction, result)\n",
+        "    remove_profile_transaction(transaction)\n" \
+          "    result = activation.call(result) if activation\n" \
+          "    finish_backup_restore_transaction(transaction, result)\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_restore_backup_commits_transaction_only_after_active_runtime_check"
+      )
+    end
+  end
+
+  def test_restore_backup_pending_runtime_retention_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/backups.rb",
+        "    if %i[updated no_change reload_failed_rolled_back].include?(result.fetch(:status))\n",
+        "    if true\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_restore_backup_keeps_transaction_when_active_runtime_rollback_is_pending"
+      )
+    end
+  end
+
+  def test_restore_backup_no_change_transaction_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/backups.rb",
+        "    if current_bytes == backup_bytes\n" \
+          "      transaction = prepare_profile_transaction(\n" \
+          "        [{ path: target, original: current_bytes, candidate: backup_bytes }], backup_root\n" \
+          "      )\n",
+        "    if current_bytes == backup_bytes\n" \
+          "      transaction = {}\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_restore_backup_no_change_runtime_failure_stays_retryable"
       )
     end
   end

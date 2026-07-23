@@ -140,6 +140,11 @@ module ClashPatch
     File.join(File.expand_path(backup_root), PROFILE_TRANSACTION_BASENAME)
   end
 
+  def profile_transaction_pending?(backup_root)
+    path = profile_transaction_path(backup_root)
+    File.exist?(path) || File.symlink?(path)
+  end
+
   def profile_path_allowed?(path, roots)
     expanded = File.expand_path(path)
     roots.any? do |root|
@@ -243,6 +248,42 @@ module ClashPatch
       File.rename(temporary.path, path)
     end
     regular_file_snapshot_once(path, "配置事务记录")
+  end
+
+  def profile_work_items(roots, selected, active_root)
+    roots.flat_map do |root|
+      paths = profile_paths(root)
+      unless active_profile?(File.join(root, "config.yaml"), selected)
+        paths = paths.reject { |path| File.basename(path).casecmp("config.yaml").zero? }
+      end
+      paths.map do |path|
+        {
+          path: path,
+          active: active_root &&
+            File.expand_path(File.dirname(path)) == File.expand_path(active_root) &&
+            active_profile?(path, selected)
+        }
+      end
+    end
+  end
+
+  def resume_profile_transaction(backup_root, roots:, work_items:, reload_runtime:,
+                                 require_tun:, socket: nil, requester: nil,
+                                 connectivity_checker: nil)
+    pending = profile_transaction_pending?(backup_root)
+    transaction = recover_profile_transaction(
+      backup_root, roots: roots, keep_transaction: pending
+    )
+    return :none unless pending
+    return :runtime_restore_pending unless
+      reload_runtime &&
+      reload_recovered_profile_runtime(
+        work_items, require_tun: require_tun, socket: socket, requester: requester,
+        connectivity_checker: connectivity_checker
+      )
+
+    remove_profile_transaction(transaction)
+    :recovered
   end
 
   def patch_path_once(path, policy, dry_run:, backup_root:, validator:, usage_profile: 3,
@@ -360,42 +401,19 @@ module ClashPatch
     active_root = active_directory || active_profile_root(roots, selected, directory)
     operation_lock = profile_operation_lock(backup_root) if !dry_run && backup_root
     begin
-      pending_runtime_restore = !dry_run && backup_root &&
-                                (File.exist?(profile_transaction_path(backup_root)) ||
-                                 File.symlink?(profile_transaction_path(backup_root)))
-      recovered_transaction = if !dry_run && backup_root
-                                recover_profile_transaction(
-                                  backup_root, roots: roots,
-                                  keep_transaction: pending_runtime_restore
-                                )
-                              end
-
-      work_items = roots.flat_map do |root|
-        paths = profile_paths(root)
-        unless active_profile?(File.join(root, "config.yaml"), selected)
-          paths = paths.reject { |path| File.basename(path).casecmp("config.yaml").zero? }
-        end
-        paths.map do |path|
-          {
-            path: path,
-            active: active_root &&
-              File.expand_path(File.dirname(path)) == File.expand_path(active_root) &&
-              active_profile?(path, selected)
-          }
-        end
-      end
-      if pending_runtime_restore
-        recovered = auto_reload && reload_recovered_profile_runtime(
-          work_items, usage_profile: usage_profile, socket: socket, requester: requester,
+      work_items = profile_work_items(roots, selected, active_root)
+      if !dry_run && backup_root
+        recovery = resume_profile_transaction(
+          backup_root, roots: roots, work_items: work_items, reload_runtime: auto_reload,
+          require_tun: usage_profile >= 2, socket: socket, requester: requester,
           connectivity_checker: connectivity_checker
         )
-        unless recovered
+        if recovery == :runtime_restore_pending
           return work_items.map do |item|
             status = item.fetch(:active) ? :reload_failed_restore_pending : :batch_aborted
             base_result(nil, status).merge(path: item.fetch(:path), active: item.fetch(:active))
           end
         end
-        remove_profile_transaction(recovered_transaction)
       end
       identities = work_items.map do |item|
         stat = File.stat(File.realpath(item.fetch(:path)))

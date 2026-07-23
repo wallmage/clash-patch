@@ -293,19 +293,20 @@ module ClashPatch
     end
 
     if options[:restore_backup]
-      result = restore_backup(
-        options[:restore_backup], directories: directories, backup_root: options[:backup_root],
-        expected_current_sha256: options[:expected_current_sha256], validator: method(:validate_with_mihomo)
-      )
-      if %i[updated no_change].include?(result[:status]) && result[:path]
-        selected = selected_profile_name
+      selected = selected_profile_name
+      activation = lambda do |restore_result|
         active_root = active_profile_root(directories, selected)
         active = active_root &&
-                 File.expand_path(File.dirname(result.fetch(:path))) == File.expand_path(active_root) &&
-                 active_profile?(result.fetch(:path), selected)
-        result = result.merge(active: !!active)
-        result = activate_updated_profile(result, require_tun: :preserve) if active
+                 File.expand_path(File.dirname(restore_result.fetch(:path))) == File.expand_path(active_root) &&
+                 active_profile?(restore_result.fetch(:path), selected)
+        restore_result = restore_result.merge(active: !!active)
+        active ? activate_updated_profile(restore_result, require_tun: :preserve) : restore_result
       end
+      result = restore_backup(
+        options[:restore_backup], directories: directories, backup_root: options[:backup_root],
+        expected_current_sha256: options[:expected_current_sha256], validator: method(:validate_with_mihomo),
+        selected_name: selected, activation: activation
+      )
 
       status, code, summary = case result[:status]
                               when :updated

@@ -189,12 +189,37 @@ module ClashPatch
     }
   end
 
-  def restore_backup(backup_id, directories:, backup_root:, expected_current_sha256:, validator:)
+  def finish_backup_restore_transaction(transaction, result)
+    if %i[updated no_change reload_failed_rolled_back].include?(result.fetch(:status))
+      remove_profile_transaction(transaction)
+    end
+    result
+  end
+
+  def restore_backup(backup_id, directories:, backup_root:, expected_current_sha256:, validator:,
+                     selected_name: nil, activation: nil)
     operation_lock = nil
     return { status: :restore_conflict } unless expected_current_sha256.to_s.match?(/\A[0-9a-f]{64}\z/i)
 
     operation_lock = profile_operation_lock(backup_root)
-    recover_profile_transaction(backup_root, roots: directories)
+    if profile_transaction_pending?(backup_root)
+      selected = selected_name.nil? ? selected_profile_name : selected_name
+      active_root = active_profile_root(directories, selected)
+      work_items = profile_work_items(directories, selected, active_root)
+      recovery = resume_profile_transaction(
+        backup_root, roots: directories, work_items: work_items, reload_runtime: true,
+        require_tun: :preserve
+      )
+      if recovery == :runtime_restore_pending
+        active = work_items.find { |item| item.fetch(:active) }
+        return {
+          status: :reload_failed_restore_pending,
+          path: active&.fetch(:path), active: !active.nil?
+        }
+      end
+    else
+      recover_profile_transaction(backup_root, roots: directories)
+    end
     backup_path = resolve_backup_id(backup_id, backup_root)
     target = find_backup_target(backup_id, directories)
     write_path = File.realpath(target)
@@ -217,25 +242,38 @@ module ClashPatch
     current_bytes = current_snapshot.fetch(:bytes)
     return { status: :restore_conflict, path: target } unless Digest::SHA256.hexdigest(current_bytes).casecmp(expected_current_sha256).zero?
     if current_bytes == backup_bytes
-      return {
+      transaction = prepare_profile_transaction(
+        [{ path: target, original: current_bytes, candidate: backup_bytes }], backup_root
+      )
+      result = {
         status: :no_change, path: target, rollback_bytes: current_bytes,
         patched_digest: Digest::SHA256.hexdigest(backup_bytes), restored_backup: backup_id
       }
+      result = activation.call(result) if activation
+      return finish_backup_restore_transaction(transaction, result)
     end
 
     create_versioned_backup(target, backup_root, content: current_bytes, reason: "pre-restore")
-    return { status: :restore_conflict, path: target } unless
-      atomic_compare_and_swap_bytes(
-        target, current_bytes, backup_bytes,
-        expected_identity: current_snapshot.fetch(:identity), expected_path: write_path
-      )
-    {
+    transaction = prepare_profile_transaction(
+      [{ path: target, original: current_bytes, candidate: backup_bytes }], backup_root
+    )
+    replaced = atomic_compare_and_swap_bytes(
+      target, current_bytes, backup_bytes,
+      expected_identity: current_snapshot.fetch(:identity), expected_path: write_path
+    )
+    unless replaced
+      remove_profile_transaction(transaction)
+      return { status: :restore_conflict, path: target }
+    end
+    result = {
       status: :updated,
       path: target,
       rollback_bytes: current_bytes,
       patched_digest: Digest::SHA256.hexdigest(backup_bytes),
       restored_backup: backup_id
     }
+    result = activation.call(result) if activation
+    finish_backup_restore_transaction(transaction, result)
   rescue Psych::Exception, InvalidConfigError, SystemStackError
     { status: :invalid_backup }
   rescue SystemCallError, IOError

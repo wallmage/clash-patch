@@ -226,6 +226,8 @@ bash clash-patch/scripts/install_macos.sh --profile N
 
 只有配置差异与现场证据相符时才恢复。恢复（`--restore-backup ID --expected-current-sha256 SHA256` / `-RestoreBackup ID -ExpectedCurrentSha256 SHA256`）前先校验备份内容、确认当前文件仍与比较时相同，并再备份一次当前版本；恢复后回到原应用和原操作复测，没有改善或验收失败时恢复回滚前版本。内部安装、用途档位、自动更新所有权和安全更新状态不能通过普通单文件备份接口恢复，避免状态与实际配置错代。macOS 恢复当前订阅后会通过本地控制器重新加载，并确认 TUN 开关、代理组选择、DNS 与连接状态；检查失败时恢复回滚前版本，文件恢复但运行内核未恢复时会明确报错。恢复其他订阅不会切换当前订阅。Windows 客户端正在运行时不会为了回滚而结束它，只完成安全比较并说明当前不能自动恢复。
 
+macOS 恢复备份前若发现未完成的 Patch，会先恢复原文件和原运行配置；运行恢复失败时保留事务并停止，不进入备份校验。备份写入本身也使用持久事务；即使文件已经与备份相同，当前订阅的事务也要等重新加载和运行检查完成后才提交。进程在文件替换后被强制结束时，下一次 Patch 会恢复备份操作前的文件与运行配置。
+
 ## 第三档验证
 
 先检查实时分流：macOS 使用 `scripts/macos/verify_routes.rb`，Windows 使用 `scripts/windows/verify_routes.ps1`。两个脚本都让各自启动的 curl 绑定独立源端口，只接受 `/connections` 中同一源端口、TCP、目标域名和新连接 ID 同时匹配的记录，避免把浏览器或后台程序的并发流量误算成测试结果。Google 应经过主代理组，或订阅明确提供且当前选择有效代理节点的非 AI 专用组，不能经过 `DIRECT` 或 AI 分组；OpenAI、Anthropic 和 Claude 应经过 AI 分组当前节点。国内网站的大陆 CDN、HTTPS 耗时与 `DIRECT` 连接在随后步骤中单独核对。只看配置文件或网页出口 IP 不足以证明分流正确。然后测试：

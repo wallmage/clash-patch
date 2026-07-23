@@ -141,7 +141,7 @@ module ClashPatch
     false
   end
 
-  def reload_recovered_profile_runtime(work_items, usage_profile:, socket: nil, requester: nil,
+  def reload_recovered_profile_runtime(work_items, require_tun:, socket: nil, requester: nil,
                                        connectivity_checker: nil)
     active = work_items.find { |item| item.fetch(:active) }
     return true unless active
@@ -159,7 +159,14 @@ module ClashPatch
     config = load_yaml(File.read(active.fetch(:path), encoding: "UTF-8"), active.fetch(:path))
     selector_names = selectable_groups(config).map { |group| group.fetch("name") }
     selections = selections.select { |name, _selected| selector_names.include?(name) }
-    expected_tun = usage_profile >= 2 ? :enabled : :ignore
+    expected_tun = if require_tun == :preserve
+                     tun_state(requester: requester)
+                   elsif require_tun
+                     :enabled
+                   else
+                     :ignore
+                   end
+    return false if expected_tun == :unknown
     code, _body = requester.call(
       "PUT", "/configs?force=true", JSON.generate("path" => File.expand_path(active.fetch(:path)))
     )
