@@ -68,12 +68,23 @@ function Get-ConnectionIds {
     return $ids
 }
 
+function Get-AvailableSourcePort {
+    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    try {
+        $listener.Start()
+        return ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+    } finally {
+        $listener.Stop()
+    }
+}
+
 function Start-TestTraffic([string]$Url) {
     $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
     if ($null -eq $curl) { throw "找不到 Windows 自带的 curl.exe。" }
+    $sourcePort = Get-AvailableSourcePort
     $start = New-Object System.Diagnostics.ProcessStartInfo
     $start.FileName = $curl.Source
-    $start.Arguments = '--http1.1 -L --max-time 15 --limit-rate 2k --output NUL --silent "' + $Url.Replace('"', '\"') + '"'
+    $start.Arguments = '--http1.1 -L --max-time 15 --limit-rate 2k --local-port ' + $sourcePort + ' --output NUL --silent "' + $Url.Replace('"', '\"') + '"'
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true
@@ -81,7 +92,7 @@ function Start-TestTraffic([string]$Url) {
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $start
     if (-not $process.Start()) { throw "无法启动分流测试请求。" }
-    return $process
+    return [pscustomobject]@{ Process = $process; SourcePort = $sourcePort }
 }
 
 function Test-RouteChains(
@@ -99,6 +110,7 @@ function Test-RouteChains(
     if ($Chains -contains $AiGroup) { return $false }
     if (($Chains -contains $ExpectedGroup) -and ($Chains -contains $ExpectedSelection)) { return $true }
     foreach ($name in $Chains) {
+        if ($name -notmatch '(?i)google') { continue }
         $property = $Proxies.PSObject.Properties[$name]
         if ($null -eq $property) { continue }
         $selection = [string]$property.Value.now
@@ -120,7 +132,9 @@ function Observe-Route(
     [bool]$AllowExplicitProxyGroup
 ) {
     $known = Get-ConnectionIds
-    $process = Start-TestTraffic $Url
+    $traffic = Start-TestTraffic $Url
+    $process = $traffic.Process
+    $sourcePort = [int]$traffic.SourcePort
     try {
         $deadline = [DateTime]::UtcNow.AddSeconds($ObservationSeconds)
         while ([DateTime]::UtcNow -lt $deadline) {
@@ -130,6 +144,10 @@ function Observe-Route(
                 if ($null -eq $connection -or $known.ContainsKey([string]$connection.id)) { continue }
                 $connectionHost = [string]$connection.metadata.host
                 if ($connectionHost -notmatch $HostPattern) { continue }
+                if ([string]$connection.metadata.network -notmatch '^(?i:tcp)$') { continue }
+                $connectionSourcePort = 0
+                if (-not [int]::TryParse([string]$connection.metadata.sourcePort, [ref]$connectionSourcePort)) { continue }
+                if ($connectionSourcePort -ne $sourcePort) { continue }
                 $chains = @($connection.chains | ForEach-Object { [string]$_ })
                 $passed = Test-RouteChains $Proxies $chains $ExpectedGroup $ExpectedSelection $AiGroup $AllowExplicitProxyGroup
                 [void]$script:ClashPatchChecks.Add([ordered]@{ name = $Label.ToLowerInvariant(); ok = $passed; status = $(if ($passed) { "passed" } else { "failed" }) })

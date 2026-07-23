@@ -92,14 +92,17 @@ class SkillContractTest < Minitest::Test
     assert_includes instructions, "不得把“尚未 commit 或 push”作为常规收尾"
   end
 
-  def test_public_guides_keep_readable_size_and_point_to_detailed_policy
+  def test_public_guides_define_their_roles_and_point_to_detailed_policy
     readme = File.read(File.join(ROOT, "README.md"))
     skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
 
-    assert_operator readme.lines.length, :<=, 320
-    assert_operator skill.lines.length, :<=, 110
-    assert_includes readme, "patch-policy.md"
-    assert_includes skill, "详细产品规则和全部状态以"
+    assert_includes readme, "本文档面向用户"
+    assert_includes readme, "给代理执行的流程规定在 `clash-patch/SKILL.md`"
+    assert_includes readme, "产品规则和全部状态文案以 `clash-patch/references/patch-policy.md` 为准"
+    assert_includes skill, "开始前完整阅读 [references/patch-policy.md](references/patch-policy.md)"
+    assert_includes skill, "详细产品规则和全部状态以该文件为准"
+    assert_includes policy, "# Clash 补丁策略"
   end
 
   def test_skill_exposes_patch_and_diagnostics_as_separate_modules
@@ -968,6 +971,16 @@ class SkillContractTest < Minitest::Test
     assert_equal 2, workflow.scan(/timeout-minutes:\s*20/).length
   end
 
+  def test_ruby_coverage_requires_the_entire_transform_module_at_one_hundred_percent
+    source = File.read(File.join(ROOT, "tests/coverage_ruby.rb"))
+
+    assert_includes source, 'TRANSFORM_PATH = File.join(MACOS_RUBY_ROOT, "patch_profiles", "transform.rb")'
+    assert_includes source, "MINIMUM_TRANSFORM_LINE_COVERAGE = 100.0"
+    assert_includes source, "path == TRANSFORM_PATH"
+    refute_includes source, "TRANSFORM_CORE_METHODS"
+    refute_includes source, "RubyVM::AbstractSyntaxTree"
+  end
+
   def test_windows_runtime_tests_use_powershell_ast_for_automatic_variable_writes
     source = File.read(File.join(ROOT, "tests/test_windows_installer.ps1"))
 
@@ -988,6 +1001,16 @@ class SkillContractTest < Minitest::Test
     refute_empty entrypoints
     entrypoints.each do |path|
       assert_includes workflow, File.basename(path), "test entrypoint is not executed by CI: #{path}"
+    end
+  end
+
+  def test_every_local_test_entrypoint_is_in_the_precommit_release_list
+    instructions = File.read(File.join(ROOT, "AGENTS.md"))
+    local_entrypoints = Dir[File.join(ROOT, "tests/test_*.{rb,js}")].sort
+
+    refute_empty local_entrypoints
+    local_entrypoints.each do |path|
+      assert_includes instructions, File.basename(path), "local test entrypoint is missing from AGENTS.md: #{path}"
     end
   end
 

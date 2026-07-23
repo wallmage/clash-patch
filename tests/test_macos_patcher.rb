@@ -897,6 +897,17 @@ class MacosPatcherTest < Minitest::Test
       assert_equal "kAutoUpdateEnable", backup.fetch("Key")
       assert_equal "1", backup.fetch("Value")
       refute_includes File.read(backups.first), "kRemoteConfigs"
+      state = JSON.parse(File.read(File.join(directory, "clashx-meta-kAutoUpdateEnable.state.json")))
+      assert_equal(
+        {
+          "Version" => 1,
+          "Domain" => "com.metacubex.ClashX.meta",
+          "Key" => "kAutoUpdateEnable",
+          "OriginalState" => "enabled",
+          "InstalledState" => "disabled"
+        },
+        state
+      )
     end
   end
 
@@ -916,6 +927,130 @@ class MacosPatcherTest < Minitest::Test
 
       assert_equal :already_disabled, result.fetch(:status)
       assert_empty Dir.glob(File.join(directory, "*.backup"))
+      refute File.exist?(File.join(directory, "clashx-meta-kAutoUpdateEnable.state.json"))
+    end
+  end
+
+  def test_restores_only_owned_subscription_auto_update_state
+    Dir.mktmpdir do |directory|
+      state_path = File.join(directory, "clashx-meta-kAutoUpdateEnable.state.json")
+      File.write(state_path, JSON.generate(
+        "Version" => 1,
+        "Domain" => "com.metacubex.ClashX.meta",
+        "Key" => "kAutoUpdateEnable",
+        "OriginalState" => "enabled",
+        "InstalledState" => "disabled"
+      ))
+      calls = []
+      values = ["0", "1"]
+      runner = lambda do |*arguments, **_options|
+        calls << arguments
+        if arguments[1] == "export"
+          ["plist", "", Struct.new(:success?).new(true)]
+        elsif arguments[1] == "write"
+          ["", "", Struct.new(:success?).new(true)]
+        elsif arguments[0] == "/usr/bin/plutil"
+          [values.shift, "", Struct.new(:success?).new(true)]
+        else
+          flunk("unexpected command: #{arguments.inspect}")
+        end
+      end
+
+      result = ClashPatch.restore_owned_subscription_auto_update(backup_root: directory, runner: runner)
+
+      assert_equal :restored, result.fetch(:status)
+      assert_includes calls, [
+        "/usr/bin/defaults", "write", "com.metacubex.ClashX.meta",
+        "kAutoUpdateEnable", "-bool", "true"
+      ]
+      refute File.exist?(state_path)
+    end
+  end
+
+  def test_owned_auto_update_restore_accepts_a_user_already_restored_value
+    Dir.mktmpdir do |directory|
+      state_path = File.join(directory, "clashx-meta-kAutoUpdateEnable.state.json")
+      File.write(state_path, JSON.generate(
+        "Version" => 1,
+        "Domain" => "com.metacubex.ClashX.meta",
+        "Key" => "kAutoUpdateEnable",
+        "OriginalState" => "enabled",
+        "InstalledState" => "disabled"
+      ))
+      runner = lambda do |*arguments, **_options|
+        if arguments[1] == "export"
+          ["plist", "", Struct.new(:success?).new(true)]
+        elsif arguments[0] == "/usr/bin/plutil"
+          ["1", "", Struct.new(:success?).new(true)]
+        else
+          flunk("already restored preference was overwritten: #{arguments.inspect}")
+        end
+      end
+
+      result = ClashPatch.restore_owned_subscription_auto_update(backup_root: directory, runner: runner)
+
+      assert_equal :already_restored, result.fetch(:status)
+      refute File.exist?(state_path)
+    end
+  end
+
+  def test_owned_auto_update_restore_does_nothing_without_an_ownership_state
+    Dir.mktmpdir do |directory|
+      result = ClashPatch.restore_owned_subscription_auto_update(
+        backup_root: directory,
+        runner: ->(*arguments, **_options) { flunk("unexpected preference access: #{arguments.inspect}") }
+      )
+
+      assert_equal :not_owned, result.fetch(:status)
+    end
+  end
+
+  def test_owned_auto_update_restore_rejects_an_invalid_state_before_reading_preferences
+    Dir.mktmpdir do |directory|
+      state_path = File.join(directory, "clashx-meta-kAutoUpdateEnable.state.json")
+      File.write(state_path, '{"Version":1,"Domain":"attacker.invalid","Key":"kAutoUpdateEnable"}')
+
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.restore_owned_subscription_auto_update(
+          backup_root: directory,
+          runner: ->(*arguments, **_options) { flunk("invalid state reached preferences: #{arguments.inspect}") }
+        )
+      end
+      assert File.file?(state_path)
+    end
+  end
+
+  def test_auto_update_disable_restores_the_preference_when_ownership_state_cannot_be_recorded
+    Dir.mktmpdir do |directory|
+      state_path = File.join(directory, "clashx-meta-kAutoUpdateEnable.state.json")
+      File.write(state_path, '{"Version":1,"Domain":"attacker.invalid"}')
+      calls = []
+      values = ["1", "0", "0", "1"]
+      runner = lambda do |*arguments, **_options|
+        calls << arguments
+        if arguments[1] == "export"
+          ["plist", "", Struct.new(:success?).new(true)]
+        elsif arguments[1] == "write"
+          ["", "", Struct.new(:success?).new(true)]
+        elsif arguments[0] == "/usr/bin/plutil"
+          [values.shift, "", Struct.new(:success?).new(true)]
+        else
+          flunk("unexpected command: #{arguments.inspect}")
+        end
+      end
+
+      assert_raises(IOError) do
+        ClashPatch.disable_subscription_auto_update(backup_root: directory, runner: runner)
+      end
+      assert_includes calls, [
+        "/usr/bin/defaults", "write", "com.metacubex.ClashX.meta",
+        "kAutoUpdateEnable", "-bool", "false"
+      ]
+      assert_includes calls, [
+        "/usr/bin/defaults", "write", "com.metacubex.ClashX.meta",
+        "kAutoUpdateEnable", "-bool", "true"
+      ]
+      assert File.file?(state_path)
     end
   end
 
@@ -2850,6 +2985,26 @@ class MacosPatcherTest < Minitest::Test
         assert_empty error
         assert_equal "auto_update_restore_failed", JSON.parse(output).fetch("code")
       end
+      ClashPatch.stub(:restore_owned_subscription_auto_update, { status: :restored }) do
+        output, = capture_io do
+          assert_equal 0, ClashPatch.cli([
+            "--json", "--backup-dir", directory, "--restore-owned-subscription-auto-update"
+          ])
+        end
+        result = JSON.parse(output)
+        assert_equal "restore_owned_subscription_auto_update", result.fetch("operation")
+        assert_equal "restored", result.fetch("code")
+        assert_equal ["subscription_auto_update"], result.fetch("changes")
+      end
+      ClashPatch.stub(:restore_owned_subscription_auto_update, ->(**_args) { raise ClashPatch::InvalidConfigError }) do
+        output, error = capture_io do
+          assert_equal 1, ClashPatch.cli([
+            "--json", "--backup-dir", directory, "--restore-owned-subscription-auto-update"
+          ])
+        end
+        assert_empty error
+        assert_equal "auto_update_restore_failed", JSON.parse(output).fetch("code")
+      end
     end
   end
 
@@ -3116,19 +3271,74 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_route_verifier_reserves_and_releases_a_local_source_port
+    port = ClashRouteVerifier.reserve_local_port
+    assert_operator port, :>, 0
+    listener = TCPServer.new("127.0.0.1", port)
+    listener.close
+  end
+
   def test_route_verifier_observes_a_new_matching_connection_and_reaps_curl
     calls = 0
     connections = [
       { "connections" => [{ "id" => "old", "metadata" => { "host" => "www.google.com" } }] },
-      { "connections" => [{ "id" => "old" }, { "id" => "new", "metadata" => { "host" => "www.google.com" }, "chains" => ["Main"] }] }
+      {
+        "connections" => [
+          { "id" => "old" },
+          {
+            "id" => "new",
+            "metadata" => { "host" => "www.google.com", "network" => "tcp", "sourcePort" => 45_555 },
+            "chains" => ["Main"]
+          }
+        ]
+      }
     ]
 
     ClashRouteVerifier.stub(:get_json, ->(*_args) { entry = connections[calls]; calls += 1; entry || { "connections" => [] } }) do
-      Process.stub(:spawn, 42) do
+      ClashRouteVerifier.stub(:reserve_local_port, 45_555) do
+        Process.stub(:spawn, 42) do
+          Process.stub(:kill, true) do
+            Process.stub(:wait, true) do
+              observed = ClashRouteVerifier.observe_connection("socket", "https://www.google.com", /google/i)
+              assert_equal "new", observed.fetch("id")
+            end
+          end
+        end
+      end
+    end
+  end
+
+  def test_route_verifier_ignores_same_host_traffic_from_another_source_port
+    calls = 0
+    spawn_arguments = nil
+    controller = lambda do |*_args|
+      calls += 1
+      next({ "connections" => [] }) if calls == 1
+
+      local_port_index = spawn_arguments&.index("--local-port")
+      curl_port = local_port_index ? spawn_arguments.fetch(local_port_index + 1).to_i : 45_555
+      {
+        "connections" => [
+          {
+            "id" => "background", "metadata" => {
+              "host" => "www.google.com", "network" => "tcp", "sourcePort" => curl_port + 1
+            }
+          },
+          {
+            "id" => "curl", "metadata" => {
+              "host" => "www.google.com", "network" => "tcp", "sourcePort" => curl_port
+            }
+          }
+        ]
+      }
+    end
+
+    ClashRouteVerifier.stub(:get_json, controller) do
+      Process.stub(:spawn, ->(*arguments) { spawn_arguments = arguments; 42 }) do
         Process.stub(:kill, true) do
           Process.stub(:wait, true) do
             observed = ClashRouteVerifier.observe_connection("socket", "https://www.google.com", /google/i)
-            assert_equal "new", observed.fetch("id")
+            assert_equal "curl", observed.fetch("id")
           end
         end
       end
@@ -3138,13 +3348,20 @@ class MacosPatcherTest < Minitest::Test
   def test_route_verifier_ignores_missing_curl_process_during_cleanup
     responses = [
       { "connections" => [] },
-      { "connections" => [{ "id" => "new", "metadata" => { "host" => "www.google.com" } }] }
+      {
+        "connections" => [{
+          "id" => "new",
+          "metadata" => { "host" => "www.google.com", "network" => "tcp", "sourcePort" => 45_555 }
+        }]
+      }
     ]
     ClashRouteVerifier.stub(:get_json, ->(*_args) { responses.shift || { "connections" => [] } }) do
-      Process.stub(:spawn, 42) do
-        Process.stub(:kill, ->(*_args) { raise Errno::ESRCH }) do
-          Process.stub(:wait, ->(*_args) { raise Errno::ECHILD }) do
-            assert_equal "new", ClashRouteVerifier.observe_connection("socket", "https://www.google.com", /google/i).fetch("id")
+      ClashRouteVerifier.stub(:reserve_local_port, 45_555) do
+        Process.stub(:spawn, 42) do
+          Process.stub(:kill, ->(*_args) { raise Errno::ESRCH }) do
+            Process.stub(:wait, ->(*_args) { raise Errno::ECHILD }) do
+              assert_equal "new", ClashRouteVerifier.observe_connection("socket", "https://www.google.com", /google/i).fetch("id")
+            end
           end
         end
       end

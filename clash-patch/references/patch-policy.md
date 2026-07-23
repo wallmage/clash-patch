@@ -50,7 +50,7 @@ Clash Patch 有两个独立模块：
 
 用户明确说要配置 Claude 或 Claude Code 时，该表达本身就是档位 3 的选择；明确说要配置 ChatGPT、Codex、Gemini、Perplexity 等其他海外 AI，且排除 Claude 时，就是档位 2。
 
-用户可以随时改档。升档只增加新档位所需能力。从档位 3 降到档位 1 或 2 时，先读取并记录旧档位，再运行对应平台的安全卸载程序，最后保存和执行新档位。安全卸载成功后清除旧用途档位；卸载失败时必须保留，不能绕过未完成的恢复。只撤销能确认由本工具写入、且之后没有被用户或客户端继续修改的部分；不能为了降档覆盖后来产生的用户改动。macOS 已写入当前订阅的内容不能凭猜测还原；Windows 客户端运行时也不会改写应用设置。因此旧订阅增强仍可能保留，必须明确告诉用户“新档位已保存，但这部分旧增强仍保留”，不能伪装成已经恢复。
+用户可以随时改档。升档只增加新档位所需能力。从档位 3 降到档位 1 或 2 时，先读取并记录旧档位，再运行对应平台的安全卸载程序，最后保存和执行新档位。安全卸载成功后清除旧用途档位；卸载失败时必须保留，不能绕过未完成的恢复。只撤销能确认由本工具写入、且之后没有被用户或客户端继续修改的部分；不能为了降档覆盖后来产生的用户改动。macOS 只有从已开启改为关闭时才写订阅自动更新所有权状态；卸载时当前值仍关闭才恢复为开启，用户已经恢复、原本已关闭或没有状态时不写，恢复及回读失败时保留用途档位和状态。macOS 已写入当前订阅的内容不能凭猜测还原；Windows 客户端运行时也不会改写应用设置。因此旧订阅增强仍可能保留，必须明确告诉用户“新档位已保存，但这部分旧增强仍保留”，不能伪装成已经恢复。
 
 ### 三档行为
 
@@ -435,7 +435,7 @@ Windows 全局脚本也必须做二次转换一致性检查；结果不一致时
 
 档位 1 只验收系统代理与 Google、Twitter、用户常用站点；档位 2 只验收 TUN、Clash 自己的系统代理开关、Google、Twitter、ChatGPT、Gemini 和一个命令行或 Agent 连接。不能因为未运行泄漏测试而把档位 1、2判为失败。以下完整验收只属于档位 3。
 
-先生成 Google、OpenAI 和 Claude/Anthropic 的真实连接，同时读取 Mihomo `/connections` 与 `/proxies`。macOS 运行 `ruby scripts/macos/verify_routes.rb`；Windows 运行 `powershell.exe -NoProfile -File scripts/windows/verify_routes.ps1`。Google 的连接链必须包含当前主代理组及其所选节点；若订阅有明确的 Google 专用组，也可包含该非 AI 组及其有效代理选择，但连接链出现 `DIRECT` 或 AI 分组仍失败。AI 网站的连接链必须包含 AI 分组及其所选节点。只看配置文件或网页出口 IP 不足以证明分流正确。
+先生成 Google、OpenAI 和 Claude/Anthropic 的真实连接，同时读取 Mihomo `/connections` 与 `/proxies`。macOS 运行 `ruby scripts/macos/verify_routes.rb`；Windows 运行 `powershell.exe -NoProfile -File scripts/windows/verify_routes.ps1`。每个测试请求必须先绑定独立源端口，观察器只接受启动后出现且 TCP、源端口和目标域名全部匹配的连接 ID；同域名的浏览器、更新器或后台连接不得代替测试请求。Google 的连接链必须包含当前主代理组及其所选节点；若订阅有明确的 Google 专用组，也可包含该非 AI 组及其有效代理选择，但连接链出现 `DIRECT` 或 AI 分组仍失败。AI 网站的连接链必须包含 AI 分组及其所选节点。只看配置文件或网页出口 IP 不足以证明分流正确。
 
 然后必须测试：
 

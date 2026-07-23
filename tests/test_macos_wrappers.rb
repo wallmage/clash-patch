@@ -82,6 +82,17 @@ class MacosWrapperTest < Minitest::Test
     end
   end
 
+  def with_uninstaller_package(patcher_source:)
+    Dir.mktmpdir do |package|
+      scripts = File.join(package, "scripts")
+      FileUtils.mkdir_p(File.join(scripts, "macos"))
+      FileUtils.cp(UNINSTALLER, File.join(scripts, "uninstall_macos.sh"))
+      FileUtils.cp(RESULT_CONTRACT, File.join(scripts, "macos", "result_contract.rb"))
+      File.write(File.join(scripts, "macos", "patch_profiles.rb"), patcher_source)
+      yield File.join(scripts, "uninstall_macos.sh")
+    end
+  end
+
   def assert_json_result(stdout, status, command:)
     result = JSON.parse(stdout)
     assert_equal REQUIRED_RESULT_FIELDS.sort, result.keys.sort
@@ -345,8 +356,8 @@ class MacosWrapperTest < Minitest::Test
         puts "disabled"
         exit 0
       end
-      if ARGV.include?("--enable-subscription-auto-update")
-        puts "enabled"
+      if ARGV.include?("--restore-owned-subscription-auto-update")
+        puts "restored"
         exit 0
       end
       exit 1 if ARGV.include?("--snapshot-initial")
@@ -361,10 +372,10 @@ class MacosWrapperTest < Minitest::Test
           assert_includes stdout, "无法创建初始快照"
           calls = File.read(File.join(home, "patcher-calls.log")).lines.map(&:strip)
           disable_index = calls.index { |call| call.include?("--disable-subscription-auto-update") }
-          enable_index = calls.index { |call| call.include?("--enable-subscription-auto-update") }
+          restore_index = calls.index { |call| call.include?("--restore-owned-subscription-auto-update") }
           refute_nil disable_index
-          refute_nil enable_index
-          assert_operator enable_index, :>, disable_index
+          refute_nil restore_index
+          assert_operator restore_index, :>, disable_index
         end
       end
     end
@@ -406,7 +417,7 @@ class MacosWrapperTest < Minitest::Test
         puts "disabled"
         exit 0
       end
-      exit 1 if ARGV.include?("--enable-subscription-auto-update")
+      exit 1 if ARGV.include?("--restore-owned-subscription-auto-update")
       exit 1 if ARGV.include?("--snapshot-initial")
       exit 0
     RUBY
@@ -545,6 +556,64 @@ class MacosWrapperTest < Minitest::Test
       assert File.file?(unowned_agent)
       assert_includes stdout, "备份仍保留"
       assert_includes stdout, "无法确认"
+    end
+  end
+
+  def test_uninstaller_restores_owned_subscription_auto_update_before_removing_profile_state
+    patcher = <<~RUBY
+      if ARGV.include?("--restore-owned-subscription-auto-update")
+        File.write(File.join(ENV.fetch("HOME"), "restore-auto-update-arguments"), ARGV.join("\\n"))
+        backup_dir = ARGV.fetch(ARGV.index("--backup-dir") + 1)
+        File.delete(File.join(backup_dir, "clashx-meta-kAutoUpdateEnable.state.json"))
+        puts "restored"
+        exit 0
+      end
+      exit 1
+    RUBY
+    with_uninstaller_package(patcher_source: patcher) do |uninstaller|
+      Dir.mktmpdir do |home|
+        backup_dir = File.join(home, "Library", "Application Support", "ClashPatch", "backups")
+        FileUtils.mkdir_p(backup_dir)
+        File.write(File.join(backup_dir, "clashx-meta-kAutoUpdateEnable.state.json"), "{}")
+        usage_state = File.join(home, "usage-profile.plist")
+        File.write(usage_state, "owned")
+
+        stdout, _stderr, status = run_script(uninstaller, home: home)
+
+        assert status.success?, stdout
+        arguments = File.read(File.join(home, "restore-auto-update-arguments"))
+        assert_includes arguments, "--restore-owned-subscription-auto-update"
+        assert_includes arguments, "--backup-dir"
+        refute File.exist?(usage_state)
+        assert_includes stdout, "订阅自动更新"
+      end
+    end
+  end
+
+  def test_uninstaller_keeps_profile_and_ownership_state_when_auto_update_restore_fails
+    patcher = <<~RUBY
+      if ARGV.include?("--restore-owned-subscription-auto-update")
+        warn "restore failed"
+        exit 1
+      end
+      exit 1
+    RUBY
+    with_uninstaller_package(patcher_source: patcher) do |uninstaller|
+      Dir.mktmpdir do |home|
+        backup_dir = File.join(home, "Library", "Application Support", "ClashPatch", "backups")
+        FileUtils.mkdir_p(backup_dir)
+        ownership = File.join(backup_dir, "clashx-meta-kAutoUpdateEnable.state.json")
+        File.write(ownership, "{}")
+        usage_state = File.join(home, "usage-profile.plist")
+        File.write(usage_state, "owned")
+
+        stdout, _stderr, status = run_script(uninstaller, home: home)
+
+        assert_equal 1, status.exitstatus
+        assert File.file?(ownership)
+        assert File.file?(usage_state)
+        assert_includes stdout, "无法恢复"
+      end
     end
   end
 

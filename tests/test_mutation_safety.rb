@@ -171,6 +171,24 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_route_source_port_binding_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/verify_routes.rb",
+        "          metadata[\"network\"].to_s.casecmp(\"tcp\").zero? &&\n" \
+          "          metadata[\"sourcePort\"].to_i == source_port\n",
+        "          metadata[\"network\"].to_s.casecmp(\"tcp\").zero?\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_route_verifier_ignores_same_host_traffic_from_another_source_port"
+      )
+    end
+  end
+
   def test_normal_batch_preflight_mutation_is_killed
     with_repo_copy do |root|
       replace_once(
@@ -201,6 +219,23 @@ class MutationSafetyTest < Minitest::Test
         root,
         RbConfig.ruby, "tests/test_macos_wrappers.rb",
         "--name", "test_profile_three_restores_auto_update_when_a_later_step_fails"
+      )
+    end
+  end
+
+  def test_auto_update_ownership_state_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        "      ownership_path = create_auto_update_ownership_state(backup_root, domain)\n",
+        "      ownership_path = nil\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_disables_subscription_auto_update_through_defaults_and_verifies_it"
       )
     end
   end

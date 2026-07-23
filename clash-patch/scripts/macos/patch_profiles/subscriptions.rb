@@ -1,8 +1,63 @@
 module ClashPatch
   module_function
 
+  AUTO_UPDATE_OWNERSHIP_BASENAME = "clashx-meta-kAutoUpdateEnable.state.json".freeze
+  AUTO_UPDATE_DOMAINS = %w[com.metacubex.ClashX.meta com.MetaCubeX.ClashX.meta].freeze
+
+  def auto_update_ownership_path(backup_root)
+    File.join(File.expand_path(backup_root), AUTO_UPDATE_OWNERSHIP_BASENAME)
+  end
+
+  def auto_update_ownership_state(backup_root)
+    path = auto_update_ownership_path(backup_root)
+    return nil unless File.exist?(path) || File.symlink?(path)
+    raise InvalidConfigError, "订阅自动更新所有权状态无效" if File.symlink?(path) || !File.file?(path)
+
+    state = JSON.parse(File.read(path, encoding: "UTF-8"))
+    expected_keys = %w[Domain InstalledState Key OriginalState Version]
+    valid = state.is_a?(Hash) &&
+            state.keys.sort == expected_keys &&
+            state["Version"] == 1 &&
+            AUTO_UPDATE_DOMAINS.include?(state["Domain"]) &&
+            state["Key"] == "kAutoUpdateEnable" &&
+            state["OriginalState"] == "enabled" &&
+            state["InstalledState"] == "disabled"
+    raise InvalidConfigError, "订阅自动更新所有权状态无效" unless valid
+
+    state.merge("Path" => path)
+  rescue JSON::ParserError, EncodingError
+    raise InvalidConfigError, "订阅自动更新所有权状态无效"
+  end
+
+  def create_auto_update_ownership_state(backup_root, domain)
+    root = secure_backup_root!(backup_root)
+    existing = auto_update_ownership_state(root)
+    return existing.fetch("Path") if existing
+
+    state = {
+      "Version" => 1,
+      "Domain" => domain,
+      "Key" => "kAutoUpdateEnable",
+      "OriginalState" => "enabled",
+      "InstalledState" => "disabled"
+    }
+    path = auto_update_ownership_path(root)
+    created = false
+    File.open(path, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |file|
+      created = true
+      file.write(JSON.generate(state) + "\n")
+      file.flush
+      file.fsync
+    end
+    FileUtils.chmod(0o600, path)
+    path
+  rescue StandardError
+    FileUtils.rm_f(path) if defined?(created) && created && path && File.exist?(path) && !File.symlink?(path)
+    raise
+  end
+
   def defaults_export_domain(runner: Open3.method(:capture3))
-    %w[com.metacubex.ClashX.meta com.MetaCubeX.ClashX.meta].each do |domain|
+    AUTO_UPDATE_DOMAINS.each do |domain|
       plist, _export_error, export_status = runner.call("/usr/bin/defaults", "export", domain, "-")
       next unless export_status.success? && !plist.empty?
 
@@ -79,7 +134,18 @@ module ClashPatch
       raise IOError, "ClashX Meta 订阅自动更新设置回读失败，已经恢复原值"
     end
 
-    { status: :disabled, domain: domain, backup: created_backup }
+    begin
+      ownership_path = create_auto_update_ownership_state(backup_root, domain)
+    rescue StandardError => state_error
+      begin
+        enable_subscription_auto_update(runner: runner)
+      rescue InvalidConfigError, SystemCallError, IOError => restore_error
+        raise IOError, "无法记录订阅自动更新所有权，且恢复原值失败：#{restore_error.message}"
+      end
+      raise IOError, "无法记录订阅自动更新所有权，已经恢复原值：#{state_error.message}"
+    end
+
+    { status: :disabled, domain: domain, backup: created_backup, ownership: ownership_path }
   end
 
   def enable_subscription_auto_update(runner: Open3.method(:capture3))
@@ -106,6 +172,40 @@ module ClashPatch
     raise IOError, "ClashX Meta 订阅自动更新恢复后回读失败" unless subscription_auto_update_state(verified_value) == :enabled
 
     { status: :enabled, domain: domain }
+  end
+
+  def restore_owned_subscription_auto_update(backup_root:, runner: Open3.method(:capture3))
+    ownership = auto_update_ownership_state(backup_root)
+    return { status: :not_owned } unless ownership
+
+    exported = defaults_export_domain(runner: runner)
+    raise InvalidConfigError, "无法读取 ClashX Meta 偏好设置" unless exported
+    raise InvalidConfigError, "ClashX Meta 偏好设置域与所有权状态不一致" unless exported.fetch(:domain) == ownership.fetch("Domain")
+
+    current = plist_raw_value(exported.fetch(:plist), "kAutoUpdateEnable", runner: runner)
+    state = subscription_auto_update_state(current)
+    if state == :disabled
+      _output, error, write_status = runner.call(
+        "/usr/bin/defaults", "write", ownership.fetch("Domain"), "kAutoUpdateEnable", "-bool", "true"
+      )
+      raise IOError, "无法恢复 ClashX Meta 订阅自动更新：#{error.to_s.strip}" unless write_status.success?
+
+      verified_export = defaults_export_domain(runner: runner)
+      verified_value = if verified_export && verified_export.fetch(:domain) == ownership.fetch("Domain")
+                         plist_raw_value(verified_export.fetch(:plist), "kAutoUpdateEnable", runner: runner)
+                       else
+                         ""
+                       end
+      raise IOError, "ClashX Meta 订阅自动更新恢复后回读失败" unless subscription_auto_update_state(verified_value) == :enabled
+      result = :restored
+    elsif state == :enabled
+      result = :already_restored
+    else
+      raise InvalidConfigError, "无法确认 ClashX Meta 订阅自动更新状态"
+    end
+
+    File.unlink(ownership.fetch("Path"))
+    { status: result, domain: ownership.fetch("Domain") }
   end
 
   def selected_profile_name

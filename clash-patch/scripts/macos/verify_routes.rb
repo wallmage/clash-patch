@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 
 require "json"
+require "socket"
 require "stringio"
 
 module ClashRouteBootstrap
@@ -56,17 +57,30 @@ module ClashRouteVerifier
     nil
   end
 
+  def reserve_local_port
+    listener = TCPServer.new("127.0.0.1", 0)
+    listener.local_address.ip_port
+  ensure
+    listener&.close
+  end
+
   def observe_connection(socket, url, host_pattern)
     existing = Array(get_json(socket, "/connections")&.fetch("connections", [])).map { |entry| entry["id"] }
+    source_port = reserve_local_port
     pid = Process.spawn(
-      "/usr/bin/curl", "--http1.1", "-L", "--max-time", "15", "--limit-rate", "2k", url,
+      "/usr/bin/curl", "--http1.1", "-L", "--max-time", "15", "--limit-rate", "2k",
+      "--local-port", source_port.to_s, url,
       out: File::NULL, err: File::NULL
     )
     100.times do
       sleep 0.1
       connections = Array(get_json(socket, "/connections")&.fetch("connections", []))
       observed = connections.find do |entry|
-        !existing.include?(entry["id"]) && entry.dig("metadata", "host").to_s.match?(host_pattern)
+        metadata = entry["metadata"] || {}
+        !existing.include?(entry["id"]) &&
+          metadata["host"].to_s.match?(host_pattern) &&
+          metadata["network"].to_s.casecmp("tcp").zero? &&
+          metadata["sourcePort"].to_i == source_port
       end
       return observed if observed
     end

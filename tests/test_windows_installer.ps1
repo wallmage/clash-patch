@@ -420,15 +420,20 @@ function Get-ConnectionIds { return @{} }
 function Start-TestTraffic([string]$Url) {
     $process = [pscustomobject]@{ HasExited = $true }
     $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
-    return $process
+    return [pscustomobject]@{ Process = $process; SourcePort = 45555 }
 }
 function Start-Sleep { }
 function Invoke-ControllerJson([string]$Endpoint) {
     return [pscustomobject]@{
         connections = @(
             [pscustomobject]@{
-                id = "new-google-connection"
-                metadata = [pscustomobject]@{ host = "www.google.com" }
+                id = "background-google-connection"
+                metadata = [pscustomobject]@{ host = "www.google.com"; network = "tcp"; sourcePort = 45556 }
+                chains = @("Wrong Node", "Main")
+            },
+            [pscustomobject]@{
+                id = "curl-google-connection"
+                metadata = [pscustomobject]@{ host = "www.google.com"; network = "tcp"; sourcePort = 45555 }
                 chains = @("Fixture Node", "Main")
             }
         )
@@ -447,12 +452,13 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
 
     if ($onWindows) {
         $controllerReadyPath = Join-Path $sandbox "route-controller-ready"
+        $fakeCurlArgsPath = Join-Path $sandbox "fake-curl-args.txt"
         $portProbe = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
         $portProbe.Start()
         $routeControllerPort = ([System.Net.IPEndPoint]$portProbe.LocalEndpoint).Port
         $portProbe.Stop()
-        $routeControllerJob = Start-Job -ArgumentList @($routeControllerPort, $controllerReadyPath) -ScriptBlock {
-            param([int]$Port, [string]$ReadyPath)
+        $routeControllerJob = Start-Job -ArgumentList @($routeControllerPort, $controllerReadyPath, $fakeCurlArgsPath) -ScriptBlock {
+            param([int]$Port, [string]$ReadyPath, [string]$CurlArgsPath)
             $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
             $listener.Start()
             [System.IO.File]::WriteAllText($ReadyPath, "ready")
@@ -494,9 +500,14 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
                                 $hosts = @("www.google.com", "openai.com", "www.anthropic.com", "claude.ai")
                                 $groups = @("Proxy", "AI", "AI", "AI")
                                 $nodes = @("Main Node", "AI Node", "AI Node", "AI Node")
+                                $curlArguments = Get-Content -LiteralPath $CurlArgsPath -Raw
+                                if ($curlArguments -notmatch '--local-port\s+(\d+)') {
+                                    throw "fake curl did not receive a source port"
+                                }
+                                $sourcePort = [int]$Matches[1]
                                 $connections = @(@{
                                     id = "route-$routeIndex"
-                                    metadata = @{ host = $hosts[$routeIndex] }
+                                    metadata = @{ host = $hosts[$routeIndex]; network = "tcp"; sourcePort = $sourcePort }
                                     chains = @($nodes[$routeIndex], $groups[$routeIndex])
                                 })
                             }
@@ -522,8 +533,25 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
         }
         $fakeCurlDirectory = Join-Path $sandbox "fake-curl"
         New-Item -ItemType Directory -Path $fakeCurlDirectory -Force | Out-Null
-        Copy-Item -LiteralPath (Join-Path (Join-Path $env:SystemRoot "System32") "where.exe") -Destination (Join-Path $fakeCurlDirectory "curl.exe")
+        $fakeCurlPath = Join-Path $fakeCurlDirectory "curl.exe"
+        $fakeCurlSource = @'
+using System;
+using System.IO;
+using System.Threading;
+public static class FakeCurl {
+    public static int Main(string[] args) {
+        File.WriteAllText(
+            Environment.GetEnvironmentVariable("CLASH_PATCH_TEST_CURL_ARGS_PATH"),
+            String.Join(" ", args)
+        );
+        Thread.Sleep(10000);
+        return 0;
+    }
+}
+'@
+        Add-Type -TypeDefinition $fakeCurlSource -Language CSharp -OutputAssembly $fakeCurlPath -OutputType ConsoleApplication
         $previousPath = $env:PATH
+        $previousCurlArgsPath = $env:CLASH_PATCH_TEST_CURL_ARGS_PATH
         try {
             $readyDeadline = [DateTime]::UtcNow.AddSeconds(10)
             while (-not (Test-Path -LiteralPath $controllerReadyPath) -and [DateTime]::UtcNow -lt $readyDeadline) {
@@ -531,6 +559,7 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
             }
             Assert-True (Test-Path -LiteralPath $controllerReadyPath) "route success controller did not start: $(Receive-Job $routeControllerJob -Keep | Out-String)"
             $env:PATH = $fakeCurlDirectory + [System.IO.Path]::PathSeparator + $previousPath
+            $env:CLASH_PATCH_TEST_CURL_ARGS_PATH = $fakeCurlArgsPath
             $routeSuccess = Invoke-TestPowerShell $routeVerifier @(
                 "-ControllerUrl", "http://127.0.0.1:$routeControllerPort",
                 "-Secret", "fixture-secret",
@@ -543,6 +572,7 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
             Assert-True (@($routeSuccessResult.checks | Where-Object { -not [bool]$_.ok }).Count -eq 0) "route verifier reported a failed check on its success path"
         } finally {
             $env:PATH = $previousPath
+            $env:CLASH_PATCH_TEST_CURL_ARGS_PATH = $previousCurlArgsPath
             if ($null -ne $routeControllerJob) {
                 Stop-Job $routeControllerJob -ErrorAction SilentlyContinue
                 Remove-Job $routeControllerJob -Force -ErrorAction SilentlyContinue
@@ -799,8 +829,10 @@ items:
         Main = [pscustomobject]@{ type = "Selector"; now = "Taiwan" }
         AI = [pscustomobject]@{ type = "Selector"; now = "Japan" }
         Google = [pscustomobject]@{ type = "Selector"; now = "Singapore" }
+        Gaming = [pscustomobject]@{ type = "Selector"; now = "GameNode" }
     }
     Assert-True (Test-RouteChains $routeChains @("Singapore", "Google") "Main" "Taiwan" "AI" $true) "Windows route verifier rejected a user Google proxy group"
+    Assert-True (-not (Test-RouteChains $routeChains @("GameNode", "Gaming") "Main" "Taiwan" "AI" $true)) "Windows route verifier accepted an unrelated selector for Google traffic"
     Assert-True (-not (Test-RouteChains $routeChains @("Japan", "AI", "Google") "Main" "Taiwan" "AI" $true)) "Windows route verifier accepted the AI group for ordinary Google traffic"
     Assert-True (Test-RouteChains $routeChains @("Japan", "AI") "AI" "Japan" "AI" $false) "Windows route verifier rejected the required AI group"
 

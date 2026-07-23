@@ -104,6 +104,7 @@ module ClashPatch
       print_subscription_auto_update_state: false,
       disable_subscription_auto_update: false,
       enable_subscription_auto_update: false,
+      restore_owned_subscription_auto_update: false,
       snapshot_initial: false,
       list_backups: false,
       compare_backup: nil,
@@ -126,6 +127,7 @@ module ClashPatch
       opts.on("--print-subscription-auto-update-state", "输出订阅自动更新状态") { options[:print_subscription_auto_update_state] = true }
       opts.on("--disable-subscription-auto-update", "关闭订阅自动更新并回读确认") { options[:disable_subscription_auto_update] = true }
       opts.on("--enable-subscription-auto-update", "恢复订阅自动更新并回读确认") { options[:enable_subscription_auto_update] = true }
+      opts.on("--restore-owned-subscription-auto-update", "只恢复本工具关闭的订阅自动更新") { options[:restore_owned_subscription_auto_update] = true }
       opts.on("--snapshot-initial", "为当前存储位置创建一次初始快照") { options[:snapshot_initial] = true }
       opts.on("--list-backups", "按时间倒序列出可用备份") { options[:list_backups] = true }
       opts.on("--compare-backup ID", "比较指定备份与当前配置") { |value| options[:compare_backup] = value }
@@ -219,6 +221,28 @@ module ClashPatch
         return emit_cli_result(
           operation: "enable_subscription_auto_update", exit_code: 1, status: "failed",
           code: "auto_update_restore_failed", summary_zh: "无法恢复订阅自动更新。"
+        ) if options[:json]
+        warn error.message
+        return 1
+      end
+    end
+
+    if options[:restore_owned_subscription_auto_update]
+      begin
+        result = restore_owned_subscription_auto_update(backup_root: options[:backup_root])
+        changed = result.fetch(:status) == :restored
+        return emit_cli_result(
+          operation: "restore_owned_subscription_auto_update", exit_code: 0,
+          status: changed ? "ok" : "no_change", code: result.fetch(:status).to_s,
+          summary_zh: changed ? "已恢复本工具关闭的订阅自动更新。" : "订阅自动更新无需恢复。",
+          changes: changed ? ["subscription_auto_update"] : []
+        ) if options[:json]
+        puts result.fetch(:status)
+        return 0
+      rescue InvalidConfigError, SystemCallError, IOError => error
+        return emit_cli_result(
+          operation: "restore_owned_subscription_auto_update", exit_code: 1, status: "failed",
+          code: "auto_update_restore_failed", summary_zh: "无法安全恢复订阅自动更新。"
         ) if options[:json]
         warn error.message
         return 1

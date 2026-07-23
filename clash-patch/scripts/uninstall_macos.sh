@@ -15,6 +15,8 @@ LEGACY_PATCHER="$HOME/Library/Application Support/ClashProfilePatcher/patch_prof
 DEFAULTS_DOMAIN="com.metacubex.ClashX.meta"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 RESULT_CONTRACT_SOURCE="$SCRIPT_DIR/macos/result_contract.rb"
+PATCHER_SOURCE="$SCRIPT_DIR/macos/patch_profiles.rb"
+AUTO_UPDATE_OWNERSHIP_PATH="$BACKUP_DIR/clashx-meta-kAutoUpdateEnable.state.json"
 JSON_OUTPUT=0
 
 for argument do
@@ -110,6 +112,32 @@ fi
 remove_owned_agent "$CURRENT_PLIST" "$CURRENT_LABEL" "$CURRENT_PATCHER"
 remove_owned_agent "$LEGACY_PLIST" "$LEGACY_LABEL" "$LEGACY_PATCHER"
 
+AUTO_UPDATE_RESTORED=0
+if [ -e "$AUTO_UPDATE_OWNERSHIP_PATH" ] || [ -L "$AUTO_UPDATE_OWNERSHIP_PATH" ]; then
+  if [ ! -f "$PATCHER_SOURCE" ]; then
+    say "安装包不完整，无法安全恢复订阅自动更新；未删除用途档位。"
+    finish 6 failed incomplete_package "安装包不完整，无法安全恢复订阅自动更新。"
+  fi
+  if ! auto_update_restore=$(/usr/bin/ruby "$PATCHER_SOURCE" \
+    --backup-dir "$BACKUP_DIR" --restore-owned-subscription-auto-update 2>/dev/null); then
+    say "无法恢复本工具关闭的订阅自动更新；未删除用途档位和所有权状态。"
+    finish 1 failed auto_update_restore_failed "无法恢复本工具关闭的订阅自动更新；未删除用途档位。"
+  fi
+  case "$auto_update_restore" in
+    restored|already_restored)
+      if [ -e "$AUTO_UPDATE_OWNERSHIP_PATH" ] || [ -L "$AUTO_UPDATE_OWNERSHIP_PATH" ]; then
+        say "订阅自动更新虽已处理，但所有权状态未能清除；未删除用途档位。"
+        finish 1 partial auto_update_state_cleanup_failed "订阅自动更新已处理，但所有权状态未能清除。"
+      fi
+      AUTO_UPDATE_RESTORED=1
+      ;;
+    *)
+      say "订阅自动更新恢复结果异常；未删除用途档位和所有权状态。"
+      finish 1 failed auto_update_restore_failed "订阅自动更新恢复结果异常；未删除用途档位。"
+      ;;
+  esac
+fi
+
 # 只有状态明确记录了安装前值时才恢复。无状态旧版的更早值无法推断。
 TUN_RESTORED=0
 if [ -f "$STATE_PATH" ]; then
@@ -156,5 +184,8 @@ if [ "$TUN_RESTORED" -eq 1 ]; then
   say "安装程序写入的 TUN 启动偏好已恢复。订阅里的 DNS、WebRTC 和 AI 设置不会自动撤销。"
 else
   say "旧版安装前的 TUN 偏好无法确认，因此保留当前值。订阅里的 DNS、WebRTC 和 AI 设置不会自动撤销。"
+fi
+if [ "$AUTO_UPDATE_RESTORED" -eq 1 ]; then
+  say "本工具关闭的订阅自动更新已经恢复并回读确认。"
 fi
 finish 0 ok uninstall_completed "Clash Patch 卸载处理完成；备份未删除。"

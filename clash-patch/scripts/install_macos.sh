@@ -37,9 +37,10 @@ finish() {
   finish_profile=${6:-$USAGE_PROFILE}
   if [ "$finish_exit" -ne 0 ] && [ "$AUTO_UPDATE_CHANGED" -eq 1 ]; then
     AUTO_UPDATE_CHANGED=0
-    restore_result=$(/usr/bin/ruby "$PATCHER_SOURCE" --enable-subscription-auto-update 2>&1 || true)
+    restore_result=$(/usr/bin/ruby "$PATCHER_SOURCE" \
+      --backup-dir "$BACKUP_DIR" --restore-owned-subscription-auto-update 2>&1 || true)
     case "$restore_result" in
-      enabled|already_enabled) ;;
+      restored|already_restored) ;;
       *)
         finish_status=partial
         finish_code=auto_update_restore_failed

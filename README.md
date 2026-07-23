@@ -190,7 +190,7 @@ bash clash-patch/scripts/install_macos.sh --profile N
 公开入口和参数保持兼容，内部实现按配置转换、备份与事务、Mihomo 校验、订阅识别、安全更新、运行状态和命令行输出拆开。
 
 - 安装程序单次运行，只处理当前使用的本地目录（`~/.config/clash.meta`）或当前 iCloud 容器；只枚举客户端实际使用的顶层 `.yaml`/`.yml`，排除旧 iCloud 容器、缓存、备份、日志和临时文件。`config.yaml` 是 ClashX Meta 的默认基础配置，不会被删除；当前选择其他订阅时安静跳过它。
-- 三个档位的安装程序都检查 Mihomo，并把共同国内域名直连基线写入当前存储位置中的全部订阅。普通安装也先生成并校验整批候选；任一份失败时整批不写。档位 1、2 不增加 TUN、IPv6、WebRTC 或 AI 分组设置，也不改自动更新。档位 3 额外把 ClashX Meta 的 `kAutoUpdateEnable` 设为 `0`，回读确认后才继续；后续步骤失败时恢复并再次回读原自动更新状态，恢复本身失败会明确报告为部分完成。
+- 三个档位的安装程序都检查 Mihomo，并把共同国内域名直连基线写入当前存储位置中的全部订阅。普通安装也先生成并校验整批候选；任一份失败时整批不写。档位 1、2 不增加 TUN、IPv6、WebRTC 或 AI 分组设置，也不改自动更新。档位 3 额外把 ClashX Meta 的 `kAutoUpdateEnable` 设为 `0`，回读确认后才继续，并记录仅用于撤销这次改动的所有权状态；后续步骤失败或安全卸载时恢复并再次回读原状态。原本已经关闭、用户后来已经恢复或没有所有权记录时不会擅自改写。
 - 每份顶层 YAML 都经过 YAML 1.2 读取、二次转换和 Mihomo 校验，最长等待 30 秒。第一次运行保存初始快照；以后每次写入前都创建带日期时间的版本化备份（独占创建，目录权限 `700`、文件权限 `600`），保存在 `~/Library/Application Support/ClashPatch/backups`。
 - 写入有并发保护：文件加独占锁，校验或写入期间订阅被客户端刷新会重新读取并重试，连续变化则跳过该份并标记稍后重试；符号链接订阅写入真实目标，不用重命名替换符号链接本身。
 - 当前订阅写入后通过本地控制器自动刷新（`PUT /configs?force=true`），依次清除旧 Fake-IP 与 DNS 缓存，再检查 TUN 仍启用、原有代理组选择没有变化、国内和境外 DNS 查询成功、外网可连接；任一步失败都在当前进程内恢复修改前的内容，候选已被内核采用时再次加载原配置。不调用 AppleScript，不切换 TUN、订阅、代理组或节点。
@@ -223,7 +223,7 @@ bash clash-patch/scripts/install_macos.sh --profile N
 
 ## 第三档验证
 
-先检查实时分流：macOS 使用 `scripts/macos/verify_routes.rb`，Windows 使用 `scripts/windows/verify_routes.ps1`。两个脚本都通过 Mihomo 的 `/proxies` 与 `/connections` 实时记录验证：Google 应经过主代理组，或订阅明确提供且当前选择有效代理节点的非 AI 专用组，不能经过 `DIRECT` 或 AI 分组；OpenAI、Anthropic 和 Claude 应经过 AI 分组当前节点。国内网站的大陆 CDN、HTTPS 耗时与 `DIRECT` 连接在随后步骤中单独核对。只看配置文件或网页出口 IP 不足以证明分流正确。然后测试：
+先检查实时分流：macOS 使用 `scripts/macos/verify_routes.rb`，Windows 使用 `scripts/windows/verify_routes.ps1`。两个脚本都让各自启动的 curl 绑定独立源端口，只接受 `/connections` 中同一源端口、TCP、目标域名和新连接 ID 同时匹配的记录，避免把浏览器或后台程序的并发流量误算成测试结果。Google 应经过主代理组，或订阅明确提供且当前选择有效代理节点的非 AI 专用组，不能经过 `DIRECT` 或 AI 分组；OpenAI、Anthropic 和 Claude 应经过 AI 分组当前节点。国内网站的大陆 CDN、HTTPS 耗时与 `DIRECT` 连接在随后步骤中单独核对。只看配置文件或网页出口 IP 不足以证明分流正确。然后测试：
 
 1. [IPInfo WebRTC 检测](https://ipinfo.cv/webrtc-check)
 2. [DNS 泄漏检测](https://ip.net.coffee/dns/)：点击“深度测试”
@@ -243,7 +243,7 @@ bash clash-patch/scripts/uninstall_macos.sh
 
 卸载不要求关闭客户端，也不会删除备份。安全卸载成功后会清除已保存的用途档位，因此可以按“先卸载、再安装”的流程从档位 3 改为档位 1 或 2；卸载失败时保留原档位，避免绕过未完成的恢复。
 
-- macOS：移除安装文件和能确认所有权的旧版监听；能确认安装前状态时恢复 TUN 启动偏好，无法确认时保留当前值并明确说明。订阅里的 DNS、WebRTC 和 AI 设置不会自动撤销，卸载输出会如实说明。
+- macOS：先按所有权状态恢复并回读本工具关闭的订阅自动更新；恢复失败时保留用途档位和所有权状态，不继续假装降档完成。随后移除安装文件和能确认所有权的旧版监听；能确认安装前状态时恢复 TUN 启动偏好，无法确认时保留当前值并明确说明。订阅里的 DNS、WebRTC 和 AI 设置不会自动撤销，卸载输出会如实说明。
 - Windows：移除 `Script.js` 中的补丁块并恢复你原有的 `main`；客户端未运行时，按安装状态文件把 `config.yaml`、`verge.yaml` 逐字节恢复到安装前状态——检测到安装后有新改动时保留当前文件不覆盖，并保留状态文件供你手动处理；客户端正在运行时只移除补丁块，应用设置保持不动。
 
 ## 隐私
