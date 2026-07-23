@@ -82,11 +82,13 @@ function Enter-AppHomeMutationLock([string]$AppHome) {
 
         $script:ClashPatchMutationRoot = $canonical
         $script:ClashPatchTransactionJournalPath = Join-Path $canonical ".clash-patch-transaction.json"
+        $recoveredTransaction = Test-Path -LiteralPath $script:ClashPatchTransactionJournalPath -PathType Leaf
         Repair-InterruptedFileTransaction
         return [pscustomobject]@{
             Root = $canonical
             RootHandle = $rootHandle
             LockStream = $lockStream
+            RecoveredTransaction = $recoveredTransaction
         }
     } catch {
         if ($null -ne $lockStream) { $lockStream.Dispose() }

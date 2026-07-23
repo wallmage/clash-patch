@@ -278,6 +278,10 @@ try {
 
     $usageStateExists = [bool]$usageStateSnapshot.Exists
     if ($null -eq $scriptPlan -and $null -eq $state -and -not $autoUpdateStateExists -and -not $usageStateExists) {
+        if ([bool]$mutationLock.RecoveredTransaction) {
+            Write-Info "已恢复被中断的文件事务；没有遗留安装内容。"
+            Complete-UninstallResult 0 "ok" "uninstalled" "Clash 补丁已安全移除。" @("interrupted_transaction")
+        }
         Write-Info "没有发现已安装的自动补丁，无需移除。"
         Complete-UninstallResult 0 "no_change" "not_installed" "没有发现已安装的自动补丁，无需移除。"
     }
