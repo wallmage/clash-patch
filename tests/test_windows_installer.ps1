@@ -4080,6 +4080,7 @@ try {
                     "-Json"
                 ) -RedirectStandardOutput $clientStartStdout `
                     -RedirectStandardError $clientStartStderr -PassThru
+                [void]$clientStartChild.Handle
                 $clientStartReadyDeadline = [DateTime]::UtcNow.AddSeconds(10)
                 while (-not (Test-Path -LiteralPath $clientStartReady -PathType Leaf) -and
                     -not $clientStartChild.HasExited -and
