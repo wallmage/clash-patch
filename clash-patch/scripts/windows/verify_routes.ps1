@@ -57,6 +57,22 @@ function Find-Group([object]$Proxies, [object[]]$Candidates, [string]$Requested,
     throw "无法自动识别$Label；未进行分流验证。"
 }
 
+function Get-LiveMainGroup([object]$Proxies) {
+    $rules = @((Invoke-ControllerJson "/rules").rules)
+    for ($index = $rules.Count - 1; $index -ge 0; $index--) {
+        $rule = $rules[$index]
+        if ($null -eq $rule -or [string]$rule.type -notmatch '^(?i:match)$') { continue }
+        $name = [string]$rule.proxy
+        if ([string]::IsNullOrWhiteSpace($name)) { throw "当前 MATCH 规则没有代理目标。" }
+        $property = $Proxies.PSObject.Properties[$name]
+        if ($null -eq $property -or [string]$property.Value.type -ne "Selector") {
+            throw "当前 MATCH 规则没有指向可选主代理组。"
+        }
+        return $name
+    }
+    throw "当前运行配置没有 MATCH 主代理组；未进行分流验证。"
+}
+
 function Get-ConnectionIds {
     $connections = @((Invoke-ControllerJson "/connections").connections)
     $ids = @{}
@@ -180,7 +196,11 @@ try {
     $proxies = $proxyResponse.proxies
     if ($null -eq $proxies) { throw "本地控制器没有返回代理组。" }
 
-    $main = Find-Group $proxies @($policy.main_group_names) $MainGroup "主代理组"
+    if ([string]::IsNullOrWhiteSpace($MainGroup)) {
+        $main = Get-LiveMainGroup $proxies
+    } else {
+        $main = Find-Group $proxies @() $MainGroup "主代理组"
+    }
     $ai = Find-Group $proxies @($policy.ai_group_names) $AiGroup "AI 分组"
     $mainSelection = [string]$proxies.PSObject.Properties[$main].Value.now
     $aiSelection = [string]$proxies.PSObject.Properties[$ai].Value.now

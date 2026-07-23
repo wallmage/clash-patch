@@ -1151,7 +1151,7 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
             [System.IO.File]::WriteAllText($ReadyPath, "ready")
             $connectionRequest = 0
             try {
-                for ($requestNumber = 0; $requestNumber -lt 9; $requestNumber++) {
+                for ($requestNumber = 0; $requestNumber -lt 10; $requestNumber++) {
                     $client = $listener.AcceptTcpClient()
                     try {
                         $stream = $client.GetStream()
@@ -1174,9 +1174,16 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
                         } elseif ($path -eq "/proxies") {
                             $body = @{
                                 proxies = @{
-                                    Proxy = @{ type = "Selector"; now = "Main Node" }
+                                    Main = @{ type = "Selector"; now = "Main Node" }
                                     AI = @{ type = "Selector"; now = "AI Node" }
                                 }
+                            } | ConvertTo-Json -Depth 6 -Compress
+                        } elseif ($path -eq "/rules") {
+                            $body = @{
+                                rules = @(
+                                    @{ type = "DomainSuffix"; payload = "example.com"; proxy = "DIRECT" },
+                                    @{ type = "Match"; payload = ""; proxy = "Main" }
+                                )
                             } | ConvertTo-Json -Depth 6 -Compress
                         } elseif ($path -eq "/connections") {
                             $connectionRequest += 1
@@ -1185,7 +1192,7 @@ if (-not $passed) { throw "Observe-Route rejected a matching routed connection."
                             } else {
                                 $routeIndex = [int]($connectionRequest / 2) - 1
                                 $hosts = @("www.google.com", "openai.com", "www.anthropic.com", "claude.ai")
-                                $groups = @("Proxy", "AI", "AI", "AI")
+                                $groups = @("Main", "AI", "AI", "AI")
                                 $nodes = @("Main Node", "AI Node", "AI Node", "AI Node")
                                 $curlArguments = Get-Content -LiteralPath $CurlArgsPath -Raw
                                 if ($curlArguments -notmatch '--local-port\s+(\d+)') {

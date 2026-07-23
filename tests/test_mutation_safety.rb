@@ -84,6 +84,23 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_live_match_main_group_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/verify_routes.ps1",
+        '$main = Get-LiveMainGroup $proxies',
+        '$main = Find-Group $proxies @($policy.main_group_names) $MainGroup "主代理组"'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_windows_route_verifier_uses_live_match_rule_for_main_group"
+      )
+    end
+  end
+
   def test_safe_update_path_identity_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

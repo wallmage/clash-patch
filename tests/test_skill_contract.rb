@@ -468,6 +468,15 @@ class SkillContractTest < Minitest::Test
     assert_includes windows_verifier, 'type -eq "Selector"'
   end
 
+  def test_windows_route_verifier_uses_live_match_rule_for_main_group
+    source = File.read(File.join(SKILL, "scripts/windows/verify_routes.ps1"))
+
+    assert_includes source, "function Get-LiveMainGroup"
+    assert_includes source, 'Invoke-ControllerJson "/rules"'
+    assert_includes source, '$rule.proxy'
+    assert_includes source, '$main = Get-LiveMainGroup $proxies'
+  end
+
   def test_diagnostics_separates_clues_from_conclusions
     policy = File.read(File.join(SKILL, "references/patch-policy.md"))
 
