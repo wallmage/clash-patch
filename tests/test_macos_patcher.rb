@@ -443,6 +443,106 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_production_probe_next_safe_update_recovers_runtime_killed_after_reload
+    require_production_probe!
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "active.yaml")
+      backup_root = File.join(directory, "backups")
+      runtime_marker = File.join(directory, "runtime-marker")
+      gate_seen = File.join(directory, "reload-gated")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old-active"))
+      File.binwrite(profile, original)
+      File.write(runtime_marker, "old-active")
+      target = {
+        name: "active", path: profile, url: "https://fixture.invalid/active"
+      }
+      ready_reader, ready_writer = IO.pipe
+      gate_reader, gate_writer = IO.pipe
+      child_id = nil
+      requester = lambda do |_socket, method, endpoint, body = nil|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          [200, JSON.generate("proxies" => {
+            "Main" => { "type" => "Selector", "now" => "Taiwan" }
+          })]
+        when ["PUT", "/configs?force=true"]
+          path = JSON.parse(body).fetch("path")
+          marker = ClashPatch.load_yaml(File.read(path)).fetch("subscription-marker")
+          File.write(runtime_marker, marker)
+          if marker == "new-active" && !File.exist?(gate_seen)
+            File.write(gate_seen, "1")
+            ready_writer.write(".")
+            ready_writer.flush
+            gate_reader.read(1)
+          end
+          [204, ""]
+        when ["POST", "/cache/fakeip/flush"], ["POST", "/cache/dns/flush"]
+          [204, ""]
+        else
+          if method == "GET" && endpoint.start_with?("/dns/query?")
+            [200, JSON.generate("Status" => 0, "Answer" => [{ "data" => "203.0.113.1" }])]
+          else
+            [404, ""]
+          end
+        end
+      end
+
+      begin
+        child_id = fork do
+          ready_reader.close
+          gate_writer.close
+          ClashPatch.stub(:controller_socket, "socket") do
+            ClashPatch.stub(:controller_request, requester) do
+              ClashPatch.stub(:default_connectivity_healthy?, true) do
+                ClashPatch.safe_update_all(
+                  targets: [target], policy: @policy, backup_root: backup_root,
+                  usage_profile: 1, selected_name: "active",
+                  fetcher: ->(_item) {
+                    YAML.dump(base_config.merge("subscription-marker" => "new-active"))
+                  },
+                  validator: ->(_path) { true }
+                )
+              end
+            end
+          end
+          exit! 0
+        end
+        ready_writer.close
+        gate_reader.close
+        assert IO.select([ready_reader], nil, nil, 10), "child never loaded the candidate profile"
+        ready_reader.read(1)
+        Process.kill("KILL", child_id)
+        _waited_id, status = Process.wait2(child_id)
+        child_id = nil
+        assert_equal 9, status.termsig
+        assert_equal "new-active", File.read(runtime_marker)
+
+        result = ClashPatch.stub(:controller_socket, "socket") do
+          ClashPatch.stub(:controller_request, requester) do
+            ClashPatch.stub(:default_connectivity_healthy?, true) do
+              ClashPatch.safe_update_all(
+                targets: [target], policy: @policy, backup_root: backup_root,
+                usage_profile: 1, selected_name: "active",
+                fetcher: ->(_item) { raise IOError, "injected preflight failure" },
+                validator: ->(_path) { true }
+              )
+            end
+          end
+        end
+
+        assert_equal :aborted, result.fetch(:status)
+        assert_equal :download_or_validation_failed, result.fetch(:reason)
+        assert_equal original.b, File.binread(profile)
+        assert_equal "old-active", File.read(runtime_marker)
+      ensure
+        gate_writer.write(".") rescue nil
+        Process.kill("KILL", child_id) rescue nil
+        Process.waitpid(child_id) rescue nil
+        [ready_reader, ready_writer, gate_reader, gate_writer].each { |io| io.close rescue nil }
+      end
+    end
+  end
+
   def test_production_probe_mihomo_does_not_survive_a_killed_validator
     require_production_probe!
     Dir.mktmpdir do |directory|
@@ -2160,6 +2260,44 @@ class MacosPatcherTest < Minitest::Test
     end
 
     assert_includes body, "proxy-groups"
+  end
+
+  def test_recovered_safe_update_runtime_failure_is_reported_before_downloading
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "active.yaml")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old"))
+      candidate = YAML.dump(base_config.merge("subscription-marker" => "new"))
+      File.binwrite(path, original)
+      target = { name: "active", path: path, url: "https://subscriptions.invalid/active" }
+      ClashPatch.prepare_profile_transaction(
+        [{ path: path, original: original, candidate: candidate }], backup_root
+      )
+      File.binwrite(path, candidate)
+
+      result = ClashPatch.stub(:reload_recovered_safe_update_runtime, false) do
+        ClashPatch.safe_update_all(
+          targets: [target], policy: @policy, backup_root: backup_root, usage_profile: 1,
+          fetcher: ->(_item) { flunk "runtime recovery must finish before downloading" },
+          validator: ->(_path) { true }, selected_name: "active"
+        )
+      end
+
+      assert_equal :runtime_restore_pending, result.fetch(:status)
+      assert_equal :transaction_runtime_restore_failed, result.fetch(:reason)
+      assert_equal original.b, File.binread(path)
+    end
+  end
+
+  def test_recovered_safe_update_runtime_handles_controller_errors
+    target = { name: "active", path: "/tmp/active.yaml" }
+    failure = -> { raise IOError, "controller unavailable" }
+
+    restored = ClashPatch.stub(:controller_socket, failure) do
+      ClashPatch.reload_recovered_safe_update_runtime([target], 1, "active")
+    end
+
+    refute restored
   end
 
   def test_safe_update_all_is_transactional_and_reapplies_profile_three_patch

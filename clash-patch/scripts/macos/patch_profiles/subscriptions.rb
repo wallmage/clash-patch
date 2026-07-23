@@ -475,6 +475,31 @@ module ClashPatch
     activate_updated_profile(result, require_tun: usage_profile >= 2)
   end
 
+  def reload_recovered_safe_update_runtime(targets, usage_profile, selected_name)
+    active = targets.find { |target| active_profile?(target.fetch(:path), selected_name) }
+    return true unless active
+
+    socket = controller_socket
+    return false unless socket
+
+    requester = ->(method, endpoint, body) { controller_request(socket, method, endpoint, body) }
+    selections = runtime_selections(requester)
+    return false unless selections
+
+    expected_tun = usage_profile >= 2 ? :enabled : :ignore
+    code, _body = requester.call(
+      "PUT", "/configs?force=true", JSON.generate("path" => File.expand_path(active.fetch(:path)))
+    )
+    return false unless code == 204
+
+    runtime_health_healthy?(
+      requester, selections: selections, expected_tun: expected_tun,
+      connectivity_checker: method(:default_connectivity_healthy?)
+    )
+  rescue StandardError
+    false
+  end
+
   def safe_update_all(targets:, policy:, backup_root:, usage_profile:, fetcher: method(:fetch_remote_subscription),
                       validator: method(:validate_with_mihomo), activation: nil, selected_name: nil)
     operation_lock = nil
@@ -483,7 +508,16 @@ module ClashPatch
     roots = targets.map { |target| File.dirname(File.expand_path(target.fetch(:path))) }.uniq
     if Dir.exist?(backup_root)
       operation_lock = profile_operation_lock(backup_root)
+      pending_runtime_restore = File.exist?(profile_transaction_path(backup_root)) ||
+                                File.symlink?(profile_transaction_path(backup_root))
       recover_profile_transaction(backup_root, roots: roots)
+      if pending_runtime_restore &&
+         !reload_recovered_safe_update_runtime(targets, usage_profile, selected_name)
+        return {
+          status: :runtime_restore_pending, failed_profile: "",
+          reason: :transaction_runtime_restore_failed
+        }
+      end
     end
 
     items = targets.map do |target|

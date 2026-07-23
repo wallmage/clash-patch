@@ -371,6 +371,30 @@ class SkillContractTest < Minitest::Test
     end
   end
 
+  def test_adguard_fake_ip_reuse_uses_a_hostname_preserving_outbound_proxy
+    readme = File.read(File.join(ROOT, "README.md"))
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+
+    [readme, skill, policy, design].each do |document|
+      assert_includes document, "Fake-IP 被重新分配"
+      assert_includes document, "AdGuard 出站代理"
+      assert_includes document, "127.0.0.1"
+      assert_includes document, "Mihomo HTTP 代理端口"
+      assert_includes document, "按域名"
+      assert_includes document, "已有的非 Clash 出站代理"
+      assert_includes document, "恢复 AdGuard 原状态"
+    end
+
+    assert_includes policy, "同一个 Fake-IP"
+    assert_includes policy, "目标域名"
+    assert_includes policy, "只通过 AdGuard 界面"
+    assert_includes policy, "端口正在由当前 Mihomo 监听"
+    assert_includes policy, "不得固定假设为 `7890`"
+    assert_includes policy, "不得全局关闭 HTTPS 过滤"
+  end
+
   def test_saved_profile_bounds_diagnostics_repairs_and_regression_checks
     readme = File.read(File.join(ROOT, "README.md"))
     skill = File.read(File.join(SKILL, "SKILL.md"))
@@ -656,6 +680,37 @@ class SkillContractTest < Minitest::Test
     assert_includes policy, "原始症状"
     assert_includes policy, "发生了什么"
     assert_includes policy, "为什么会这样"
+  end
+
+  def test_diagnostics_drives_through_repair_and_iteration
+    readme = File.read(File.join(ROOT, "README.md"))
+    skill = File.read(File.join(SKILL, "SKILL.md"))
+    policy = File.read(File.join(SKILL, "references/patch-policy.md"))
+    design = File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+
+    [readme, skill, policy, design].each do |document|
+      assert_includes document, "解决原始问题是 Diagnostics 的结束目标"
+      assert_includes document, "只读检查是第一阶段，不是交付结果"
+      assert_includes document, "诊断结论不是完成"
+      assert_includes document, "修复、复测、继续迭代"
+      assert_includes document, "状态说明不能代替行动"
+    end
+
+    [skill, policy].each do |document|
+      assert_includes document, "不请求用户确认诊断方案"
+      assert_includes document, "修复失败后恢复"
+      assert_includes document, "继续取证"
+      assert_includes document, "一次失败不是停止条件"
+      assert_includes document, "工具明确要求的操作时确认"
+      assert_includes document, "完成全部不需要确认的准备"
+      assert_includes document, "用户授权后直接继续"
+      assert_includes document, "不得把“请回复继续”当成常规收尾"
+    end
+
+    assert_includes policy, "解释和建议不算修复"
+    assert_includes policy, "只有问题已经解决或遇到真实阻塞"
+    assert_includes policy, "诊断重置后继续"
+    assert_includes policy, "同一原始动作"
   end
 
   def test_diagnostics_does_not_hide_a_full_patch_behind_a_targeted_repair
@@ -1303,6 +1358,7 @@ class SkillContractTest < Minitest::Test
       test_production_probe_mihomo_does_not_survive_a_killed_validator
       test_production_probe_next_run_recovers_batch_killed_after_first_commit
       test_production_probe_next_safe_update_recovers_batch_killed_after_first_swap
+      test_production_probe_next_safe_update_recovers_runtime_killed_after_reload
       test_production_probe_normal_batch_rejects_duplicate_file_aliases
       test_production_probe_normal_batch_restores_a_commit_when_bookkeeping_raises
       test_production_probe_safe_update_restores_a_swap_when_bookkeeping_raises
