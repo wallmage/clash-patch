@@ -480,7 +480,7 @@ try {
     if ($onWindows) {
         $mutatingCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nif not `"%CLASH_PATCH_MUTATE_TARGET%`"==`"`" (`r`n  >`"%CLASH_PATCH_MUTATE_TARGET%`" echo friend_concurrent: true`r`n)`r`nexit /b 0`r`n"
         [System.IO.File]::WriteAllText($mutatingCore, $mutatingCoreText, [System.Text.Encoding]::ASCII)
-        $identityMutatingCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nif not `"%CLASH_PATCH_MUTATE_TARGET%`"==`"`" (`r`n  copy /b `"%CLASH_PATCH_MUTATE_TARGET%`" `"%CLASH_PATCH_MUTATE_TARGET%.replacement`" >nul`r`n  move /y `"%CLASH_PATCH_MUTATE_TARGET%.replacement`" `"%CLASH_PATCH_MUTATE_TARGET%`" >nul`r`n)`r`nexit /b 0`r`n"
+        $identityMutatingCoreText = "@echo off`r`nif `"%1`"==`"-v`" (`r`n  echo Mihomo Meta v1.19.27 windows amd64`r`n  exit /b 0`r`n)`r`nif not `"%CLASH_PATCH_MUTATE_TARGET%`"==`"`" (`r`n  copy /b `"%CLASH_PATCH_MUTATE_TARGET%`" `"%CLASH_PATCH_MUTATE_TARGET%.replacement`" >nul`r`n  del /f /q `"%CLASH_PATCH_MUTATE_TARGET%`"`r`n  move /y `"%CLASH_PATCH_MUTATE_TARGET%.replacement`" `"%CLASH_PATCH_MUTATE_TARGET%`" >nul`r`n)`r`nexit /b 0`r`n"
         [System.IO.File]::WriteAllText(
             $identityMutatingCore,
             $identityMutatingCoreText,
@@ -2636,7 +2636,8 @@ try {
                 "-NoLogo", "-NoProfile", "-File", $publicRestoreInstaller,
                 "-AppHome", $publicRestoreHome,
                 "-RestoreBackup", (Split-Path -Leaf $publicRestoreBackup),
-                "-ExpectedCurrentSha256", $publicRestoreExpectedHash
+                "-ExpectedCurrentSha256", $publicRestoreExpectedHash,
+                "-MihomoPath", $fakeCore
             ) -PassThru
             try {
                 $publicRestoreDeadline = [DateTime]::UtcNow.AddSeconds(10)
