@@ -8,7 +8,8 @@
     [ValidateSet(5, 7)]
     [int]$ExpectedPSMajor,
     [string[]]$RealMihomoPaths = @(),
-    [switch]$RealMihomoOnly
+    [switch]$RealMihomoOnly,
+    [string]$CompletionReceiptPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -3455,6 +3456,19 @@ friend payload
 } finally {
     $env:CLASH_PATCH_USAGE_PROFILE = $previousUsageProfile
     if (Test-Path -LiteralPath $sandbox) { Remove-Item -LiteralPath $sandbox -Recurse -Force }
+}
+
+if (-not [string]::IsNullOrWhiteSpace($CompletionReceiptPath)) {
+    $completionReceipt = [ordered]@{
+        Mode = "Full"
+        PSEdition = $ExpectedPSEdition
+        PSMajor = $ExpectedPSMajor
+    } | ConvertTo-Json -Compress
+    [System.IO.File]::WriteAllText(
+        $CompletionReceiptPath,
+        $completionReceipt,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
 }
 
 exit 0

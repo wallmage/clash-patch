@@ -139,7 +139,17 @@ jobs:
           node-version: "22"
       - name: PowerShell 5.1 installer, uninstaller, and route regressions
         shell: powershell
-        run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command powershell.exe).Source -ExpectedPSEdition Desktop -ExpectedPSMajor 5
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP "clash-patch-windows-full-5.json"
+          Remove-Item -LiteralPath $receipt -Force -ErrorAction SilentlyContinue
+          $runtime = (Get-Command powershell.exe).Source
+          & $runtime -NoLogo -NoProfile -File ./tests/test_windows_installer.ps1 -PowerShellPath $runtime -ExpectedPSEdition Desktop -ExpectedPSMajor 5 -CompletionReceiptPath $receipt
+          if ($LASTEXITCODE -ne 0) { throw "Windows full suite failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) { throw "Windows full suite did not produce its completion receipt" }
+          $completed = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json
+          if ($completed.Mode -ne "Full" -or $completed.PSEdition -ne "Desktop" -or [int]$completed.PSMajor -ne 5) {
+            throw "Windows full suite produced an invalid completion receipt"
+          }
 
   windows-installer-powershell-7:
     runs-on: windows-2022
@@ -151,7 +161,17 @@ jobs:
           node-version: "22"
       - name: PowerShell 7 installer, uninstaller, and route regressions
         shell: pwsh
-        run: ./tests/test_windows_installer.ps1 -PowerShellPath (Get-Command pwsh.exe).Source -ExpectedPSEdition Core -ExpectedPSMajor 7
+        run: |
+          $receipt = Join-Path $env:RUNNER_TEMP "clash-patch-windows-full-7.json"
+          Remove-Item -LiteralPath $receipt -Force -ErrorAction SilentlyContinue
+          $runtime = (Get-Command pwsh.exe).Source
+          & $runtime -NoLogo -NoProfile -File ./tests/test_windows_installer.ps1 -PowerShellPath $runtime -ExpectedPSEdition Core -ExpectedPSMajor 7 -CompletionReceiptPath $receipt
+          if ($LASTEXITCODE -ne 0) { throw "Windows full suite failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path -LiteralPath $receipt -PathType Leaf)) { throw "Windows full suite did not produce its completion receipt" }
+          $completed = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json
+          if ($completed.Mode -ne "Full" -or $completed.PSEdition -ne "Core" -or [int]$completed.PSMajor -ne 7) {
+            throw "Windows full suite produced an invalid completion receipt"
+          }
 
   windows-mihomo:
     strategy:

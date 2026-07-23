@@ -522,6 +522,44 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_powershell_5_full_suite_entrypoint_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        ".github/workflows/test.yml",
+        "          $runtime = (Get-Command powershell.exe).Source\n" +
+          "          & $runtime -NoLogo -NoProfile -File ./tests/test_windows_installer.ps1",
+        "          $runtime = (Get-Command powershell.exe).Source\n" +
+          "          Write-Host $runtime -NoLogo -NoProfile -File ./tests/test_windows_installer.ps1"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_windows_full_runtime_jobs_require_completion_receipts"
+      )
+    end
+  end
+
+  def test_windows_powershell_7_full_suite_entrypoint_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        ".github/workflows/test.yml",
+        "          $runtime = (Get-Command pwsh.exe).Source\n" +
+          "          & $runtime -NoLogo -NoProfile -File ./tests/test_windows_installer.ps1",
+        "          $runtime = (Get-Command pwsh.exe).Source\n" +
+          "          Write-Host $runtime -NoLogo -NoProfile -File ./tests/test_windows_installer.ps1"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_windows_full_runtime_jobs_require_completion_receipts"
+      )
+    end
+  end
+
   def test_macos_production_probe_inventory_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

@@ -1152,6 +1152,35 @@ class SkillContractTest < Minitest::Test
            "GitHub rejects expression contexts in steps[*].shell before any job starts"
   end
 
+  def test_windows_full_runtime_jobs_require_completion_receipts
+    workflow = File.read(File.join(ROOT, ".github/workflows/test.yml"))
+    windows_tests = File.binread(File.join(ROOT, "tests/test_windows_installer.ps1")).force_encoding("UTF-8")
+
+    {
+      "windows-installer-powershell-5" => ["powershell.exe", "Desktop", "5"],
+      "windows-installer-powershell-7" => ["pwsh.exe", "Core", "7"]
+    }.each do |job_name, (executable, edition, major)|
+      job = workflow[/^  #{Regexp.escape(job_name)}:\n(?:(?!^  \S).*\n)*/]
+      refute_nil job, "missing Windows full-suite job: #{job_name}"
+      assert_match(
+        /^\s*\$runtime = \(Get-Command #{Regexp.escape(executable)}\)\.Source\n\s*& \$runtime -NoLogo -NoProfile -File \.\/tests\/test_windows_installer\.ps1 -PowerShellPath \$runtime -ExpectedPSEdition #{edition} -ExpectedPSMajor #{major} -CompletionReceiptPath \$receipt$/,
+        job
+      )
+      assert_includes job, 'Remove-Item -LiteralPath $receipt -Force -ErrorAction SilentlyContinue'
+      assert_includes job, 'Test-Path -LiteralPath $receipt -PathType Leaf'
+      assert_includes job, 'Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json'
+      assert_includes job, '$completed.Mode -ne "Full"'
+      assert_includes job, "$completed.PSEdition -ne \"#{edition}\""
+      assert_includes job, "[int]$completed.PSMajor -ne #{major}"
+    end
+
+    assert_includes windows_tests, "[string]$CompletionReceiptPath"
+    assert_includes windows_tests, 'Mode = "Full"'
+    assert_includes windows_tests, "PSEdition = $ExpectedPSEdition"
+    assert_includes windows_tests, "PSMajor = $ExpectedPSMajor"
+    assert_match(/WriteAllText\(\s*\$CompletionReceiptPath,/m, windows_tests)
+  end
+
   def test_ruby_coverage_requires_the_entire_transform_module_at_one_hundred_percent
     source = File.read(File.join(ROOT, "tests/coverage_ruby.rb"))
 
