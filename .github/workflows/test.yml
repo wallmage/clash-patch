@@ -123,11 +123,11 @@ jobs:
       - name: Validate all profiles with minimum Mihomo
         env:
           CLASH_PATCH_REQUIRE_REAL_MIHOMO: "1"
-        run: CLASH_PATCH_TEST_MIHOMO="$MIHOMO_MINIMUM_PATH" ruby tests/test_macos_patcher.rb --name test_generated_profile_passes_installed_mihomo_validation
+        run: CLASH_PATCH_TEST_MIHOMO="$MIHOMO_MINIMUM_PATH" ruby tests/run_macos_mihomo_validation.rb
       - name: Validate all profiles with current Mihomo
         env:
           CLASH_PATCH_REQUIRE_REAL_MIHOMO: "1"
-        run: CLASH_PATCH_TEST_MIHOMO="$MIHOMO_CURRENT_PATH" ruby tests/test_macos_patcher.rb --name test_generated_profile_passes_installed_mihomo_validation
+        run: CLASH_PATCH_TEST_MIHOMO="$MIHOMO_CURRENT_PATH" ruby tests/run_macos_mihomo_validation.rb
 
   windows-installer-powershell-5:
     runs-on: windows-2022

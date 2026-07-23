@@ -1113,7 +1113,7 @@ class SkillContractTest < Minitest::Test
     assert_equal 2, workflow.scan(/CLASH_PATCH_REQUIRE_REAL_MIHOMO: "1"/).length
     assert_includes workflow, 'CLASH_PATCH_TEST_MIHOMO="$MIHOMO_MINIMUM_PATH" ruby'
     assert_includes workflow, 'CLASH_PATCH_TEST_MIHOMO="$MIHOMO_CURRENT_PATH" ruby'
-    assert_equal 2, workflow.scan(/ruby tests\/test_macos_patcher\.rb --name test_generated_profile_passes_installed_mihomo_validation/).length
+    assert_equal 2, workflow.scan(/ruby tests\/run_macos_mihomo_validation\.rb/).length
     macos_tests = File.read(File.join(ROOT, "tests/test_macos_patcher.rb"))
     assert_includes macos_tests, 'ENV["CLASH_PATCH_REQUIRE_REAL_MIHOMO"] == "1"'
     assert_includes macos_tests, 'ENV["CLASH_PATCH_TEST_MIHOMO"]'
@@ -1179,6 +1179,28 @@ class SkillContractTest < Minitest::Test
     assert_includes windows_tests, "PSEdition = $ExpectedPSEdition"
     assert_includes windows_tests, "PSMajor = $ExpectedPSMajor"
     assert_match(/WriteAllText\(\s*\$CompletionReceiptPath,/m, windows_tests)
+  end
+
+  def test_macos_real_mihomo_runner_rejects_zero_or_skipped_cases
+    workflow = File.read(File.join(ROOT, ".github/workflows/test.yml"))
+    patcher_tests = File.read(File.join(ROOT, "tests/test_macos_patcher.rb"))
+    runner_path = File.join(ROOT, "tests/run_macos_mihomo_validation.rb")
+
+    assert File.file?(runner_path), "missing real Mihomo validation runner"
+    runner = File.read(runner_path)
+    assert_equal 1,
+                 patcher_tests.scan(
+                   /^  def test_generated_profile_passes_installed_mihomo_validation$/
+                 ).length
+    assert_equal 2, workflow.scan(/ruby tests\/run_macos_mihomo_validation\.rb/).length
+    refute_includes workflow,
+                    "ruby tests/test_macos_patcher.rb --name test_generated_profile_passes_installed_mihomo_validation"
+    assert_includes runner, '"1 runs"'
+    assert_includes runner, '"0 failures"'
+    assert_includes runner, '"0 errors"'
+    assert_includes runner, '"0 skips"'
+    assert_match(/assertions = .*summary.*match.*to_i/m, runner)
+    assert_includes runner, "assertions.positive?"
   end
 
   def test_ruby_coverage_requires_the_entire_transform_module_at_one_hundred_percent
