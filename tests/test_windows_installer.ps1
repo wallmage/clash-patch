@@ -1668,18 +1668,20 @@ proxies:
     cipher: aes-128-gcm
     password: fixture-secret
 proxy-groups:
-  - name: Main
-    type: select
+  - name: Auto
+    type: url-test
     proxies:
       - Node
+    url: https://example.invalid
+    interval: 300
 rules:
-  - MATCH,Main
+  - MATCH,Auto
 '@
     $secondSafeUpdated = @'
 mode: global
 proxies: [{ name: "Hong Kong #1", type: ss, server: proxy.invalid, port: 443, cipher: aes-128-gcm, password: fixture-secret }]
-proxy-groups: [{ name: "Main #1", type: select, proxies: ["Hong Kong #1"] }]
-rules: ["MATCH,Main #1"]
+proxy-groups: [{ name: "AI", type: select, proxies: ["Hong Kong #1"] }]
+rules: ["MATCH,AI"]
 '@
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), $firstSafeUpdated)
     [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-second.yml"), $secondSafeUpdated)

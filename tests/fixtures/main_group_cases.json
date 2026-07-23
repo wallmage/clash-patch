@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "comment": "Shared macOS/Windows conformance cases. transform_cases lock the reviewed full output with expected_config_sha256, then require both engines to produce the same configuration without mutating the input; expected_main_group null means no valid main group exists.",
+  "comment": "Shared macOS/Windows conformance cases. transform_cases lock the reviewed full output with expected_config_sha256, then require both engines to produce the same configuration without mutating the input; all Mihomo proxy-group types are valid route-group candidates and AI-named or direct-only groups are last resorts.",
   "cases": [
     {
       "name": "match-target-wins",
@@ -52,7 +52,7 @@
       "expected_main_group": "LastResort"
     },
     {
-      "name": "ai-only-group-rejected",
+      "name": "ai-only-group-is-last-resort",
       "config": {
         "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
         "proxy-groups": [
@@ -60,10 +60,10 @@
         ],
         "rules": ["MATCH,AI"]
       },
-      "expected_main_group": null
+      "expected_main_group": "AI"
     },
     {
-      "name": "no-valid-main-group",
+      "name": "ai-group-outranks-direct-only-last-resort",
       "config": {
         "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
         "proxy-groups": [
@@ -72,7 +72,18 @@
         ],
         "rules": ["MATCH,DIRECT"]
       },
-      "expected_main_group": null
+      "expected_main_group": "AI"
+    },
+    {
+      "name": "direct-only-group-is-final-valid-fallback",
+      "config": {
+        "proxies": [{ "name": "台湾家宽 01", "type": "ss", "server": "tw.example" }],
+        "proxy-groups": [
+          { "name": "DirectOnly", "type": "select", "proxies": ["DIRECT"] }
+        ],
+        "rules": ["MATCH,DIRECT"]
+      },
+      "expected_main_group": "DirectOnly"
     },
     {
       "name": "narrow-streaming-rules-do-not-outrank",
@@ -198,7 +209,7 @@
       "expected_main_group": "First"
     },
     {
-      "name": "non-select-match-target-falls-through",
+      "name": "url-test-match-target-wins",
       "config": {
         "proxies": [{ "name": "node", "type": "ss", "server": "node.example" }],
         "proxy-groups": [
@@ -207,7 +218,54 @@
         ],
         "rules": ["MATCH,Auto"]
       },
-      "expected_main_group": "Proxy"
+      "expected_main_group": "Auto"
+    },
+    {
+      "name": "url-test-only-group-is-usable",
+      "config": {
+        "proxies": [{ "name": "node", "type": "ss", "server": "node.example" }],
+        "proxy-groups": [
+          { "name": "Auto", "type": "url-test", "proxies": ["node"], "url": "https://example.invalid" }
+        ],
+        "rules": ["MATCH,Auto"]
+      },
+      "expected_main_group": "Auto"
+    },
+    {
+      "name": "fallback-only-group-is-usable",
+      "config": {
+        "proxies": [{ "name": "node", "type": "ss", "server": "node.example" }],
+        "proxy-groups": [
+          { "name": "Fallback", "type": "fallback", "proxies": ["node"], "url": "https://example.invalid" }
+        ],
+        "rules": ["MATCH,Fallback"]
+      },
+      "expected_main_group": "Fallback"
+    },
+    {
+      "name": "load-balance-only-group-is-usable",
+      "config": {
+        "proxies": [{ "name": "node", "type": "ss", "server": "node.example" }],
+        "proxy-groups": [
+          { "name": "Balanced", "type": "load-balance", "proxies": ["node"], "url": "https://example.invalid", "strategy": "round-robin" }
+        ],
+        "rules": ["MATCH,Balanced"]
+      },
+      "expected_main_group": "Balanced"
+    },
+    {
+      "name": "relay-only-group-is-usable",
+      "config": {
+        "proxies": [
+          { "name": "hop-one", "type": "ss", "server": "one.example" },
+          { "name": "hop-two", "type": "ss", "server": "two.example" }
+        ],
+        "proxy-groups": [
+          { "name": "Relay", "type": "relay", "proxies": ["hop-one", "hop-two"] }
+        ],
+        "rules": ["MATCH,Relay"]
+      },
+      "expected_main_group": "Relay"
     },
     {
       "name": "missing-match-target-falls-through",
@@ -223,6 +281,25 @@
     }
   ],
   "transform_cases": [
+    {
+      "name": "automatic-main-group-receives-full-patch",
+      "expected_config_sha256": "0aaeb2e1f4c26480f10ae857b739390087cf07d5e7cb6a19991c893b76f72665",
+      "input": {
+        "proxies": [{ "name": "node-a", "type": "ss", "server": "node-a.example" }],
+        "proxy-groups": [
+          { "name": "Auto", "type": "url-test", "proxies": ["node-a"], "url": "https://example.invalid", "interval": 300 }
+        ],
+        "rules": ["MATCH,Auto"]
+      },
+      "expected_changed": true,
+      "expected_main_group": "Auto",
+      "expected_ai_group": "🤖 AI · Clash Patch",
+      "expected_status": "updated",
+      "expected_present_strings": [
+        "\"proxy\":\"Auto\"",
+        "NETWORK,UDP,🤖 AI · Clash Patch"
+      ]
+    },
     {
       "name": "reuse-existing-ai-group",
       "expected_config_sha256": "c7de18d54d6e3476166c4246435fdc93a44875d17512ca201b342638c36a8691",
@@ -329,8 +406,8 @@
       ]
     },
     {
-      "name": "no-valid-main-group-stays-unchanged",
-      "expected_config_sha256": "5ac8ffd66a8e932e5674aab3b1d78fd1e444e5aee7c865e5c387849d1befdc13",
+      "name": "ai-only-main-receives-full-patch",
+      "expected_config_sha256": "eb166a20442a79996a2d97d5660b38370eeb4df9c9fedd0b13308bfccab05878",
       "input": {
         "proxies": [{ "name": "node-a", "type": "ss", "server": "node-a.example" }],
         "proxy-groups": [
@@ -339,10 +416,50 @@
         ],
         "rules": ["MATCH,DIRECT"]
       },
-      "expected_changed": false,
-      "expected_main_group": null,
-      "expected_ai_group": null,
-      "expected_status": "no_main_group"
+      "expected_changed": true,
+      "expected_main_group": "AI",
+      "expected_ai_group": "AI",
+      "expected_status": "updated",
+      "expected_present_strings": [
+        "\"proxy\":\"AI\"",
+        "NETWORK,UDP,AI"
+      ]
+    },
+    {
+      "name": "owned-safe-group-remains-when-it-is-the-only-main",
+      "expected_config_sha256": "37c489ce55b7d496a61cdf9f8666ddcf4b879bf68f37343f877f89582157c428",
+      "input": {
+        "proxies": [{ "name": "node-a", "type": "ss", "server": "node-a.example" }],
+        "proxy-groups": [
+          {
+            "name": "🛡 安全代理 · Clash Patch",
+            "type": "select",
+            "proxies": ["node-a"],
+            "include-all": true,
+            "exclude-type": "Direct|Dns|Reject|Pass|Compatible|Rematch",
+            "empty-fallback": "REJECT"
+          }
+        ],
+        "dns": {
+          "nameserver": [
+            "https://94.140.14.140/dns-query#🛡 安全代理 · Clash Patch"
+          ]
+        },
+        "rules": [
+          "NETWORK,UDP,🛡 安全代理 · Clash Patch",
+          "NETWORK,UDP,REJECT",
+          "MATCH,🛡 安全代理 · Clash Patch"
+        ]
+      },
+      "expected_changed": true,
+      "expected_main_group": "🛡 安全代理 · Clash Patch",
+      "expected_ai_group": "🤖 AI · Clash Patch",
+      "expected_status": "updated",
+      "expected_present_strings": [
+        "\"name\":\"🛡 安全代理 · Clash Patch\"",
+        "\"proxy\":\"🛡 安全代理 · Clash Patch\"",
+        "MATCH,🛡 安全代理 · Clash Patch"
+      ]
     },
     {
       "name": "no-ai-sources-stays-unchanged",

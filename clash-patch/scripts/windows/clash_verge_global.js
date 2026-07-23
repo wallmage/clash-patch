@@ -108,6 +108,7 @@ const CLASH_PATCH_AI_GROUP = "🤖 AI · Clash Patch";
 const CLASH_PATCH_SAFE_GROUP = "🛡 安全代理 · Clash Patch";
 const CLASH_PATCH_DIRECT_NAMES = ["DIRECT", "REJECT", "REJECT-DROP", "PASS", "PASS-RULE", "COMPATIBLE", "REMATCH"];
 const CLASH_PATCH_DIRECT_TYPES = ["direct", "dns", "reject", "pass", "compatible", "rematch"];
+const CLASH_PATCH_ROUTE_GROUP_TYPES = ["select", "url-test", "fallback", "load-balance", "relay"];
 const CLASH_PATCH_LEGACY_QUIC_REJECT_RULE = "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT";
 const CLASH_PATCH_USAGE_PROFILE = 3;
 
@@ -128,6 +129,13 @@ function clashPatchSelectableGroups(config) {
   });
 }
 
+function clashPatchRouteGroups(config) {
+  return (config["proxy-groups"] || []).filter(function (group) {
+    return group && typeof group.name === "string" &&
+      CLASH_PATCH_ROUTE_GROUP_TYPES.indexOf(String(group.type).toLowerCase()) !== -1;
+  });
+}
+
 function clashPatchManagedName(name, base) {
   if (typeof name !== "string") return false;
   if (name === base) return true;
@@ -139,10 +147,10 @@ function clashPatchManagedGroupName(name) {
   return clashPatchManagedName(name, CLASH_PATCH_AI_GROUP) || clashPatchManagedName(name, CLASH_PATCH_SAFE_GROUP);
 }
 
-// AI-named groups are never main-group candidates: the managed DNS and UDP
-// rules must not make the AI group target itself.
+// Prefer an independent non-AI group. AI-named and managed groups remain
+// available only as last resorts so a valid subscription is never skipped.
 function clashPatchDetectMain(config) {
-  const groups = clashPatchSelectableGroups(config);
+  const groups = clashPatchRouteGroups(config);
   const candidates = groups.filter(function (group) {
     return !clashPatchAiName(group.name) && !clashPatchManagedGroupName(group.name);
   });
@@ -180,7 +188,13 @@ function clashPatchDetectMain(config) {
     const members = Array.isArray(candidates[i].proxies) ? candidates[i].proxies : [];
     if (members.length && !members.every(clashPatchDirectName)) return candidates[i].name;
   }
-  return null;
+  for (let i = 0; i < groups.length; i += 1) {
+    const uses = Array.isArray(groups[i].use) ? groups[i].use : [];
+    if (uses.length) return groups[i].name;
+    const members = Array.isArray(groups[i].proxies) ? groups[i].proxies : [];
+    if (members.length && !members.every(clashPatchDirectName)) return groups[i].name;
+  }
+  return groups.length ? groups[0].name : null;
 }
 
 function clashPatchAiName(name) {
@@ -725,7 +739,11 @@ function clashPatchApply(config, profileName, usageProfile) {
   patched.tun["strict-route"] = true;
   clashPatchDns(patched, routeGroup, aiGroup, ownedNames.safe, cnProviderName);
   clashPatchRules(patched, aiGroup, routeGroup, ownedNames.ai, ownedNames.safe);
-  clashPatchRemoveOwnedManagedGroups(patched, ownedNames.ai.filter(function (name) { return name !== aiGroup; }).concat(ownedNames.safe));
+  clashPatchRemoveOwnedManagedGroups(
+    patched,
+    ownedNames.ai.filter(function (name) { return name !== aiGroup && name !== routeGroup; })
+      .concat(ownedNames.safe.filter(function (name) { return name !== routeGroup; }))
+  );
   return patched;
 }
 

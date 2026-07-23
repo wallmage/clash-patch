@@ -564,6 +564,12 @@ test('shared full-transform fixtures match the Ruby engine', { skip: !fixturesAv
     const expectedDetectedMain = Object.hasOwn(fixture, 'expected_detected_main_group') ?
       fixture.expected_detected_main_group : fixture.expected_main_group;
     assert.equal(mainGroup, expectedDetectedMain, fixture.name);
+    if (fixture.expected_main_group !== null) {
+      assert.ok(
+        patched['proxy-groups'].some((group) => group && group.name === fixture.expected_main_group),
+        `${fixture.name}: main group was removed`
+      );
+    }
     assert.equal(aiGroup, fixture.expected_ai_group, fixture.name);
     assert.deepEqual(input, snapshot, `${fixture.name}: input mutated`);
     const serialized = JSON.stringify(patched);
@@ -599,17 +605,17 @@ test('keeps a non-select AI group and creates a non-conflicting selector', { ski
   }
 });
 
-test('an AI-only selectable group is never the main group', { skip: !available }, () => {
+test('an AI-only selectable group receives the full patch as a last resort', { skip: !available }, () => {
   const config = {
     proxies: [{ name: '台湾家宽 01', type: 'ss', server: 'tw.example' }],
     'proxy-groups': [{ name: 'AI', type: 'select', proxies: ['台湾家宽 01'] }],
     rules: ['MATCH,AI']
   };
-  const snapshot = JSON.parse(JSON.stringify(config));
-
-  assert.equal(engine.clashPatchDetectMain(config), null);
-  engine.clashPatchTransform(config, 'fixture');
-  assert.deepEqual(config, snapshot);
+  assert.equal(engine.clashPatchDetectMain(config), 'AI');
+  const patched = engine.clashPatchTransform(config, 'fixture');
+  assert.notStrictEqual(patched, config);
+  assert.equal(patched['rule-providers']['clash-patch-cn-domain'].proxy, 'AI');
+  assert.ok(patched.rules.includes('NETWORK,UDP,AI'));
 });
 
 test('patches and preserves a provider-only profile', { skip: !available }, () => {

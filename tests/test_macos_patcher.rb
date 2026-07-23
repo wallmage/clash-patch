@@ -2751,6 +2751,12 @@ class MacosPatcherTest < Minitest::Test
       expected_ai = fixture.fetch("expected_ai_group")
       expected_main.nil? ? assert_nil(result.fetch(:main_group), fixture.fetch("name")) :
         assert_equal(expected_main, result.fetch(:main_group), fixture.fetch("name"))
+      if expected_main
+        group_names = Array(result.fetch(:config)["proxy-groups"]).map do |group|
+          group["name"] if group.is_a?(Hash)
+        end.compact
+        assert_includes group_names, expected_main, "#{fixture.fetch('name')}: main group was removed"
+      end
       expected_ai.nil? ? assert_nil(result.fetch(:ai_group), fixture.fetch("name")) :
         assert_equal(expected_ai, result.fetch(:ai_group), fixture.fetch("name"))
       assert_equal fixture.fetch("expected_status").to_sym, result.fetch(:status), fixture.fetch("name")
@@ -2812,7 +2818,7 @@ class MacosPatcherTest < Minitest::Test
     refute_self_reference(patched)
   end
 
-  def test_ai_only_group_leaves_config_unchanged
+  def test_ai_only_group_receives_the_full_patch_as_a_last_resort
     config = {
       "proxies" => [{ "name" => "台湾家宽 01", "type" => "ss", "server" => "tw.example" }],
       "proxy-groups" => [{ "name" => "AI", "type" => "select", "proxies" => ["台湾家宽 01"] }],
@@ -2820,9 +2826,12 @@ class MacosPatcherTest < Minitest::Test
     }
     result = ClashPatch.patch(config, @policy)
 
-    refute result.fetch(:changed)
-    assert_equal :no_main_group, result.fetch(:status)
-    assert_nil result.fetch(:main_group)
+    assert result.fetch(:changed)
+    assert_equal :updated, result.fetch(:status)
+    assert_equal "AI", result.fetch(:main_group)
+    assert_equal "AI", result.fetch(:ai_group)
+    assert_equal "AI", result.fetch(:config).dig("rule-providers", "clash-patch-cn-domain", "proxy")
+    assert_includes result.fetch(:config).fetch("rules"), "NETWORK,UDP,AI"
   end
 
   def test_provider_only_profile_is_patched_and_preserved

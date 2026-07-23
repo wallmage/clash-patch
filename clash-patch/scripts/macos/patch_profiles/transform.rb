@@ -9,6 +9,7 @@ module ClashPatch
   AUTO_CORE = Object.new.freeze
   DIRECT_TYPES = %w[direct dns reject pass compatible rematch].freeze
   DIRECT_NAMES = %w[DIRECT REJECT REJECT-DROP PASS PASS-RULE COMPATIBLE REMATCH].freeze
+  ROUTE_GROUP_TYPES = %w[select url-test fallback load-balance relay].freeze
   EXCLUDED_SAFE_TYPES = "Direct|Dns|Reject|Pass|Compatible|Rematch".freeze
   LEGACY_QUIC_REJECT_RULE = "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT".freeze
   CN_PROVIDER_SUFFIX = /(?:-[2-9]|-[1-9][0-9]+)?/.freeze
@@ -163,6 +164,13 @@ module ClashPatch
     end
   end
 
+  def route_groups(config)
+    Array(config["proxy-groups"]).select do |group|
+      group.is_a?(Hash) && group["name"].is_a?(String) &&
+        ROUTE_GROUP_TYPES.include?(group["type"].to_s.downcase)
+    end
+  end
+
   def managed_name?(name, base)
     name.is_a?(String) && name.match?(/\A#{Regexp.escape(base)}(?: (?:[2-9]|[1-9][0-9]+))?\z/)
   end
@@ -172,7 +180,8 @@ module ClashPatch
   end
 
   def detect_main_group(config, policy)
-    candidates = selectable_groups(config).reject do |group|
+    groups = route_groups(config)
+    candidates = groups.reject do |group|
       ai_name?(group["name"], policy) || managed_group_name?(group["name"])
     end
     names = candidates.map { |group| group["name"] }
@@ -202,7 +211,13 @@ module ClashPatch
       members = Array(group["proxies"])
       return group["name"] unless members.empty? || members.all? { |member| direct_name?(member) }
     end
-    nil
+    groups.each do |group|
+      return group["name"] unless Array(group["use"]).empty?
+
+      members = Array(group["proxies"])
+      return group["name"] unless members.empty? || members.all? { |member| direct_name?(member) }
+    end
+    groups.first&.fetch("name")
   end
 
   def ai_name?(name, policy)
@@ -691,7 +706,10 @@ module ClashPatch
     TUN_POLICY.each { |key, value| patched["tun"][key] = deep_copy(value) }
     patch_dns(patched, policy, route_group, ai_group, owned_safe_names, cn_provider)
     patch_rules(patched, policy, ai_group, route_group, owned_ai_names, owned_safe_names)
-    remove_owned_managed_groups(patched, (owned_ai_names - [ai_group]) + owned_safe_names)
+    remove_owned_managed_groups(
+      patched,
+      (owned_ai_names - [ai_group, route_group]) + (owned_safe_names - [route_group])
+    )
     normalize_reality_short_ids(patched)
 
     {

@@ -243,6 +243,111 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_ruby_automatic_route_group_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/transform.rb",
+        "    groups = route_groups(config)\n",
+        "    groups = selectable_groups(config)\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_shared_main_group_fixtures"
+      )
+    end
+  end
+
+  def test_windows_automatic_route_group_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/clash_verge_global.js",
+        "  const groups = clashPatchRouteGroups(config);\n",
+        "  const groups = clashPatchSelectableGroups(config);\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        "node", "--test",
+        "--test-name-pattern=shared main-group fixtures match the Ruby engine",
+        "tests/test_windows_patcher.js"
+      )
+    end
+  end
+
+  def test_ruby_last_resort_route_group_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/transform.rb",
+        "    groups.first&.fetch(\"name\")\n",
+        "    nil\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_shared_main_group_fixtures"
+      )
+    end
+  end
+
+  def test_windows_last_resort_route_group_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/clash_verge_global.js",
+        "  return groups.length ? groups[0].name : null;\n",
+        "  return null;\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        "node", "--test",
+        "--test-name-pattern=shared main-group fixtures match the Ruby engine",
+        "tests/test_windows_patcher.js"
+      )
+    end
+  end
+
+  def test_ruby_owned_safe_route_group_removal_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/transform.rb",
+        "(owned_safe_names - [route_group])",
+        "owned_safe_names"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_shared_full_transform_fixtures"
+      )
+    end
+  end
+
+  def test_windows_owned_safe_route_group_removal_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/clash_verge_global.js",
+        ".concat(ownedNames.safe.filter(function (name) { return name !== routeGroup; }))",
+        ".concat(ownedNames.safe)"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        "node", "--test",
+        "--test-name-pattern=shared full-transform fixtures match the Ruby engine",
+        "tests/test_windows_patcher.js"
+      )
+    end
+  end
+
   def test_partial_write_recovery_mutation_is_killed
     with_repo_copy do |root|
       replace_once(
