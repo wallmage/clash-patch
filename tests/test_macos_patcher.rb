@@ -2804,6 +2804,54 @@ class MacosPatcherTest < Minitest::Test
       assert_equal :runtime_restore_pending, result.fetch(:status)
       assert_equal :transaction_runtime_restore_failed, result.fetch(:reason)
       assert_equal original.b, File.binread(path)
+      assert File.file?(ClashPatch.profile_transaction_path(backup_root)),
+             "failed runtime recovery discarded the only retry record"
+    end
+  end
+
+  def test_recovered_safe_update_runtime_reloads_active_config_outside_remote_targets
+    Dir.mktmpdir do |directory|
+      config_path = File.join(directory, "config.yaml")
+      remote_path = File.join(directory, "remote.yaml")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old-config"))
+      candidate = YAML.dump(base_config.merge("subscription-marker" => "new-config"))
+      File.binwrite(config_path, original)
+      File.binwrite(remote_path, YAML.dump(base_config))
+      target = {
+        name: "remote", path: remote_path, url: "https://subscriptions.invalid/remote"
+      }
+      ClashPatch.prepare_profile_transaction(
+        [{ path: config_path, original: original, candidate: candidate }], backup_root
+      )
+      File.binwrite(config_path, candidate)
+      put_paths = []
+      requester = lambda do |_socket, method, endpoint, body|
+        raise "unexpected controller request" unless method == "PUT" && endpoint == "/configs?force=true"
+
+        put_paths << JSON.parse(body).fetch("path")
+        [204, ""]
+      end
+
+      result = ClashPatch.stub(:controller_socket, "socket") do
+        ClashPatch.stub(:controller_request, requester) do
+          ClashPatch.stub(:runtime_selections, {}) do
+            ClashPatch.stub(:runtime_health_healthy?, true) do
+              ClashPatch.safe_update_all(
+                targets: [target], policy: @policy, backup_root: backup_root, usage_profile: 1,
+                fetcher: ->(_item) { raise IOError, "stop after recovery" },
+                validator: ->(_path) { true }, selected_name: "config.yaml"
+              )
+            end
+          end
+        end
+      end
+
+      assert_equal :aborted, result.fetch(:status)
+      assert_equal :download_or_validation_failed, result.fetch(:reason)
+      assert_equal [File.expand_path(config_path)], put_paths
+      assert_equal original.b, File.binread(config_path)
+      refute File.exist?(ClashPatch.profile_transaction_path(backup_root))
     end
   end
 
@@ -2816,6 +2864,69 @@ class MacosPatcherTest < Minitest::Test
     end
 
     refute restored
+  end
+
+  def test_recovered_safe_update_runtime_checks_the_remote_active_profile
+    target = { name: "active", path: "/tmp/active.yaml" }
+    put_paths = []
+    expected_tun = nil
+    requester = lambda do |_socket, method, endpoint, body|
+      raise "unexpected controller request" unless method == "PUT" && endpoint == "/configs?force=true"
+
+      put_paths << JSON.parse(body).fetch("path")
+      [204, ""]
+    end
+
+    no_socket = ClashPatch.stub(:controller_socket, nil) do
+      ClashPatch.reload_recovered_safe_update_runtime([target], 3, "active")
+    end
+    refute no_socket
+
+    restored = ClashPatch.stub(:controller_socket, "socket") do
+      ClashPatch.stub(:controller_request, requester) do
+        ClashPatch.stub(:runtime_selections, {}) do
+          ClashPatch.stub(:runtime_health_healthy?, lambda { |_requester, **options|
+            expected_tun = options.fetch(:expected_tun)
+            true
+          }) do
+            ClashPatch.reload_recovered_safe_update_runtime([target], 3, "active")
+          end
+        end
+      end
+    end
+
+    assert restored
+    assert_equal [File.expand_path(target.fetch(:path))], put_paths
+    assert_equal :enabled, expected_tun
+  end
+
+  def test_safe_update_legacy_recovery_check_stops_if_the_shared_precheck_misses_a_journal
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "active.yaml")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old"))
+      candidate = YAML.dump(base_config.merge("subscription-marker" => "new"))
+      File.binwrite(path, original)
+      target = { name: "active", path: path, url: "https://subscriptions.invalid/active" }
+      ClashPatch.prepare_profile_transaction(
+        [{ path: path, original: original, candidate: candidate }], backup_root
+      )
+      File.binwrite(path, candidate)
+
+      result = ClashPatch.stub(:profile_transaction_pending?, false) do
+        ClashPatch.stub(:reload_recovered_safe_update_runtime, false) do
+          ClashPatch.safe_update_all(
+            targets: [target], policy: @policy, backup_root: backup_root, usage_profile: 1,
+            fetcher: ->(_item) { flunk "legacy runtime recovery must finish before downloading" },
+            validator: ->(_path) { true }, selected_name: "active"
+          )
+        end
+      end
+
+      assert_equal :runtime_restore_pending, result.fetch(:status)
+      assert_equal :transaction_runtime_restore_failed, result.fetch(:reason)
+      assert_equal original.b, File.binread(path)
+    end
   end
 
   def test_safe_update_all_is_transactional_and_reapplies_profile_three_patch
@@ -3115,6 +3226,8 @@ class MacosPatcherTest < Minitest::Test
       assert_equal :runtime_restore_pending, result.fetch(:status)
       assert_equal :reload_failed_restore_pending, result.fetch(:runtime_status)
       assert_equal original.b, File.binread(profile)
+      assert File.file?(ClashPatch.profile_transaction_path(File.join(directory, "backups"))),
+             "runtime-pending rollback discarded the only retry record"
     end
   end
 

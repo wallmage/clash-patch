@@ -363,6 +363,54 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_safe_update_pending_runtime_resume_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        "      if profile_transaction_pending?(backup_root)\n" \
+          "        selected = selected_name.nil? ? selected_profile_name : selected_name\n" \
+          "        active_root = active_profile_root(roots, selected)\n" \
+          "        work_items = profile_work_items(roots, selected, active_root)\n" \
+          "        recovery = resume_profile_transaction(\n" \
+          "          backup_root, roots: roots, work_items: work_items, reload_runtime: true,\n" \
+          "          require_tun: usage_profile >= 2\n" \
+          "        )\n" \
+          "        if recovery == :runtime_restore_pending\n" \
+          "          return {\n" \
+          "            status: :runtime_restore_pending, failed_profile: \"\",\n" \
+          "            reason: :transaction_runtime_restore_failed\n" \
+          "          }\n" \
+          "        end\n" \
+          "      end\n",
+        ""
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_recovered_safe_update_runtime_reloads_active_config_outside_remote_targets"
+      )
+    end
+  end
+
+  def test_safe_update_runtime_pending_retention_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        "        items, transaction, backup_root, roots, keep_transaction: runtime_restore_pending\n",
+        "        items, transaction, backup_root, roots, keep_transaction: false\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_safe_update_reports_when_files_are_restored_but_runtime_is_not"
+      )
+    end
+  end
+
   def test_safe_update_final_restore_check_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

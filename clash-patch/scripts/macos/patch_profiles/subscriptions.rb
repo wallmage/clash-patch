@@ -443,20 +443,20 @@ module ClashPatch
     failures
   end
 
-  def finish_safe_update_rollback(items, transaction, backup_root, roots)
+  def finish_safe_update_rollback(items, transaction, backup_root, roots, keep_transaction: false)
     failures = rollback_safe_update_items(items)
     return failures unless failures.empty?
 
     candidate_remains = items.any? { |item| safe_update_item_candidate_or_unknown?(item) }
     if items.none? { |item| item[:committed_identity] } && !candidate_remains
-      remove_profile_transaction(transaction)
+      remove_profile_transaction(transaction) unless keep_transaction
       return []
     end
     all_restored = items.all? { |item| safe_update_item_restored?(item) }
     if all_restored
-      remove_profile_transaction(transaction)
+      remove_profile_transaction(transaction) unless keep_transaction
     else
-      recover_profile_transaction(backup_root, roots: roots)
+      recover_profile_transaction(backup_root, roots: roots, keep_transaction: keep_transaction)
     end
     []
   rescue StandardError
@@ -508,6 +508,21 @@ module ClashPatch
     roots = targets.map { |target| File.dirname(File.expand_path(target.fetch(:path))) }.uniq
     if Dir.exist?(backup_root)
       operation_lock = profile_operation_lock(backup_root)
+      if profile_transaction_pending?(backup_root)
+        selected = selected_name.nil? ? selected_profile_name : selected_name
+        active_root = active_profile_root(roots, selected)
+        work_items = profile_work_items(roots, selected, active_root)
+        recovery = resume_profile_transaction(
+          backup_root, roots: roots, work_items: work_items, reload_runtime: true,
+          require_tun: usage_profile >= 2
+        )
+        if recovery == :runtime_restore_pending
+          return {
+            status: :runtime_restore_pending, failed_profile: "",
+            reason: :transaction_runtime_restore_failed
+          }
+        end
+      end
       pending_runtime_restore = File.exist?(profile_transaction_path(backup_root)) ||
                                 File.symlink?(profile_transaction_path(backup_root))
       recover_profile_transaction(backup_root, roots: roots)
@@ -636,11 +651,16 @@ module ClashPatch
                 (activation_result.is_a?(Hash) && activation_result[:reloaded] == true)
     runtime_status = activation_result[:status] if activation_result.is_a?(Hash)
     unless activated
-      failures = finish_safe_update_rollback(items, transaction, backup_root, roots)
+      runtime_restore_pending = %i[
+        reload_failed_restore_pending reload_failed_rollback_conflict
+      ].include?(runtime_status)
+      failures = finish_safe_update_rollback(
+        items, transaction, backup_root, roots, keep_transaction: runtime_restore_pending
+      )
       unless failures.empty?
         return { status: :rollback_failed, failed_profile: "", reason: :activation_failed }
       end
-      if %i[reload_failed_restore_pending reload_failed_rollback_conflict].include?(runtime_status)
+      if runtime_restore_pending
         return {
           status: :runtime_restore_pending, failed_profile: "", reason: :activation_failed,
           runtime_status: runtime_status
