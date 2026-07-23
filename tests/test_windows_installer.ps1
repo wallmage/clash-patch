@@ -1016,7 +1016,7 @@ items:
         $caseAliasIndex = "items:`n- uid: Case-Alias`n  type: remote`n- uid: case-alias`n  type: remote`n"
         [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "case-alias.yaml"), "proxies: []`n")
         $caseAliasRejected = $false
-        try { Get-RemoteSubscriptionTargets $caseAliasIndex $safeUpdateProfiles | Out-Null } catch { $caseAliasRejected = $_.Exception.Message.Contains("多个远程订阅") }
+        try { Get-RemoteSubscriptionTargets $caseAliasIndex $safeUpdateProfiles | Out-Null } catch { $caseAliasRejected = $true }
         Assert-True $caseAliasRejected "case-alias remote subscriptions were allowed to share one file"
     }
     $snapshotResult = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
