@@ -1060,6 +1060,22 @@ class SkillContractTest < Minitest::Test
     assert_includes installer, "uninstall_recovery_failed"
   end
 
+  def test_windows_failed_safe_update_rollback_deletes_manifest_in_the_same_transaction
+    installer = File.read(File.join(SKILL, "scripts/install_windows.ps1"))
+    safe_update = File.read(
+      File.join(SKILL, "scripts/windows/install_windows/safe_update.ps1")
+    )
+
+    assert_includes safe_update, "Invoke-VerifiedWriteDeleteTransaction"
+    assert_includes safe_update, "ManifestPath"
+    assert_includes safe_update, "ManifestSnapshot"
+    restore_call = installer.lines.find { |line| line.include?("$restoreResult = Restore-SafeUpdateFiles") }
+    refute_nil restore_call
+    assert_includes restore_call, "$safeUpdateStatePath"
+    assert_includes restore_call, "$manifestSnapshot"
+    assert_equal 1, installer.scan("Remove-VerifiedOwnedFile $safeUpdateStatePath").length
+  end
+
   def test_installers_preflight_and_uninstallers_restore_owned_settings
     mac_install = File.read(File.join(SKILL, "scripts/install_macos.sh"))
     mac_uninstall = File.read(File.join(SKILL, "scripts/uninstall_macos.sh"))
@@ -1464,6 +1480,7 @@ class SkillContractTest < Minitest::Test
       "public restore strong-kill atomicity",
       "public restore same-byte identity replacement",
       "release archive public install",
+      "safe-update rollback manifest strong-kill recovery",
       "short-path backup identity alias",
       "strict transaction journal byte schema",
       "strict UTF-8 safe-update validation",
@@ -1489,6 +1506,7 @@ class SkillContractTest < Minitest::Test
       CLASH_PATCH_TEST_PUBLIC_CRASH_READY
       CLASH_PATCH_TEST_RECOVERY_CRASH_READY
       CLASH_PATCH_TEST_RESTORE_CRASH_READY
+      CLASH_PATCH_TEST_SAFE_UPDATE_ROLLBACK_CRASH_READY
       CLASH_PATCH_TEST_UNINSTALL_CRASH_READY
     ].sort
 

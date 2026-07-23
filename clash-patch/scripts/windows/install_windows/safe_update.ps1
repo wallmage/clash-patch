@@ -172,7 +172,12 @@ function Get-SafeUpdateRecoveryItems([object]$Manifest, [string]$Directory, [str
     return @($items)
 }
 
-function Restore-SafeUpdateFiles([object[]]$RecoveryItems, [hashtable]$ObservedHashes) {
+function Restore-SafeUpdateFiles(
+    [object[]]$RecoveryItems,
+    [hashtable]$ObservedHashes,
+    [string]$ManifestPath,
+    [object]$ManifestSnapshot
+) {
     $failures = @()
     $conflicts = @()
     $targets = @()
@@ -206,7 +211,18 @@ function Restore-SafeUpdateFiles([object[]]$RecoveryItems, [hashtable]$ObservedH
     }
     if ($failures.Count -eq 0 -and $conflicts.Count -eq 0) {
         try {
-            Invoke-VerifiedFileTransaction $targets
+            if ([string]::IsNullOrWhiteSpace($ManifestPath) -or
+                $null -eq $ManifestSnapshot -or
+                -not [bool]$ManifestSnapshot.Exists) {
+                throw "安全更新准备记录快照无效。"
+            }
+            $manifestTarget = [pscustomobject]@{
+                Path = $ManifestPath
+                Existed = $true
+                OriginalBytes = $ManifestSnapshot.Bytes
+                OriginalIdentity = $ManifestSnapshot.Identity
+            }
+            Invoke-VerifiedWriteDeleteTransaction $targets @($manifestTarget)
         } catch {
             $failures = @($RecoveryItems | ForEach-Object { $_.File })
         }

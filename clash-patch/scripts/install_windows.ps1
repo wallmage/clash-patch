@@ -240,12 +240,11 @@ if ($VerifySafeUpdate) {
             foreach ($guard in $versionGuards) { $guard.Dispose() }
         }
     } catch {
-        $restoreResult = Restore-SafeUpdateFiles $recoveryItems $observedCurrentHashes
+        $restoreResult = Restore-SafeUpdateFiles $recoveryItems $observedCurrentHashes $safeUpdateStatePath $manifestSnapshot
         if ($restoreResult.Conflicts.Count -gt 0) {
             throw "更新验收失败；检测到订阅同时发生变化，未覆盖新内容：$($restoreResult.Conflicts -join '、')。安全更新记录已保留。"
         }
         if ($restoreResult.Failures.Count -gt 0) { throw "更新验收失败，且部分订阅未能恢复：$($restoreResult.Failures -join '、')。安全更新记录已保留。" }
-        Remove-VerifiedOwnedFile $safeUpdateStatePath $manifestSnapshot.Bytes $manifestSnapshot.Identity
         throw "更新验收失败，全部订阅文件已恢复到更新前版本。"
     }
     foreach ($entry in $validated) {

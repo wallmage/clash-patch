@@ -1713,6 +1713,143 @@ rules: ["MATCH,AI"]
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $safeUpdateCase "clash-patch-safe-update.json"))) "accepted safe update left a stale manifest"
 
     if ($onWindows) {
+        Invoke-DeferredProbe "safe-update rollback manifest strong-kill recovery" {
+            $rollbackCrashPackageParent = Join-Path $sandbox "safe-update-rollback-crash-package"
+            New-Item -ItemType Directory -Path $rollbackCrashPackageParent -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $root "clash-patch") -Destination $rollbackCrashPackageParent -Recurse
+            $rollbackCrashPackage = Join-Path $rollbackCrashPackageParent "clash-patch"
+            $rollbackCrashInstaller = Join-Path (
+                Join-Path $rollbackCrashPackage "scripts"
+            ) "install_windows.ps1"
+            $rollbackCrashInstallerText = [System.IO.File]::ReadAllText($rollbackCrashInstaller)
+            $rollbackCrashNeedle = '        $restoreResult = Restore-SafeUpdateFiles'
+            $rollbackCrashOffset = $rollbackCrashInstallerText.IndexOf($rollbackCrashNeedle)
+            Assert-True (
+                $rollbackCrashOffset -ge 0 -and
+                $rollbackCrashInstallerText.LastIndexOf($rollbackCrashNeedle) -eq $rollbackCrashOffset
+            ) "safe-update rollback crash fixture could not find one rollback completion boundary"
+            $rollbackCrashLineEnd = $rollbackCrashInstallerText.IndexOf("`n", $rollbackCrashOffset)
+            Assert-True ($rollbackCrashLineEnd -gt $rollbackCrashOffset) "safe-update rollback call was not one complete line"
+            $rollbackCrashHook = @'
+        if (-not [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_SAFE_UPDATE_ROLLBACK_CRASH_READY)) {
+            [System.IO.File]::WriteAllText($env:CLASH_PATCH_TEST_SAFE_UPDATE_ROLLBACK_CRASH_READY, "ready")
+            Start-Sleep -Seconds 30
+        }
+'@
+            $rollbackCrashInstallerText = $rollbackCrashInstallerText.Insert(
+                $rollbackCrashLineEnd + 1,
+                $rollbackCrashHook
+            )
+            [System.IO.File]::WriteAllText(
+                $rollbackCrashInstaller,
+                $rollbackCrashInstallerText,
+                (New-Object System.Text.UTF8Encoding($true))
+            )
+
+            $rollbackCrashHome = Join-Path $sandbox "safe-update-rollback-crash-home"
+            $rollbackCrashProfiles = Join-Path $rollbackCrashHome "profiles"
+            New-Item -ItemType Directory -Path $rollbackCrashProfiles -Force | Out-Null
+            [System.IO.File]::WriteAllText(
+                (Join-Path $rollbackCrashHome "config.yaml"),
+                "mode: rule`nipv6: true`ntun: null`n"
+            )
+            [System.IO.File]::WriteAllText(
+                (Join-Path $rollbackCrashHome "verge.yaml"),
+                "enable_tun_mode: false`n"
+            )
+            [System.IO.File]::WriteAllText(
+                (Join-Path $rollbackCrashHome "profiles.yaml"),
+                "items:`n- uid: R-rollback-crash`n  type: remote`n  option:`n    allow_auto_update: true`n"
+            )
+            $rollbackCrashTarget = Join-Path $rollbackCrashProfiles "R-rollback-crash.yaml"
+            $rollbackCrashOriginal = @'
+mode: rule
+proxies:
+  - name: Node
+    type: ss
+    server: proxy.invalid
+    port: 443
+    cipher: aes-128-gcm
+    password: fixture-secret
+proxy-groups:
+  - name: Main
+    type: select
+    proxies:
+      - Node
+rules:
+  - MATCH,Main
+'@
+            [System.IO.File]::WriteAllText($rollbackCrashTarget, $rollbackCrashOriginal)
+            $rollbackCrashInstall = Invoke-TestPowerShell $rollbackCrashInstaller @(
+                "-AppHome", $rollbackCrashHome,
+                "-UsageProfile", "1",
+                "-MihomoPath", $fakeCore,
+                "-Json"
+            )
+            Assert-JsonResult $rollbackCrashInstall "install" 0 | Out-Null
+            $rollbackCrashSnapshot = Invoke-TestPowerShell $rollbackCrashInstaller @(
+                "-AppHome", $rollbackCrashHome,
+                "-SnapshotProfiles",
+                "-Json"
+            )
+            Assert-JsonResult $rollbackCrashSnapshot "install" 0 | Out-Null
+            [System.IO.File]::WriteAllText(
+                $rollbackCrashTarget,
+                "mode: rule`nproxies: []`nproxy-groups: []`nrules: []`n"
+            )
+
+            $rollbackCrashReady = Join-Path $sandbox "safe-update-rollback-crash.ready"
+            $env:CLASH_PATCH_TEST_SAFE_UPDATE_ROLLBACK_CRASH_READY = $rollbackCrashReady
+            $rollbackCrashChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
+                "-NoLogo", "-NoProfile", "-File", $rollbackCrashInstaller,
+                "-AppHome", $rollbackCrashHome,
+                "-VerifySafeUpdate",
+                "-MihomoPath", $fakeCore,
+                "-Json"
+            ) -PassThru
+            try {
+                $rollbackCrashDeadline = [DateTime]::UtcNow.AddSeconds(10)
+                while (-not (Test-Path -LiteralPath $rollbackCrashReady -PathType Leaf) -and
+                    -not $rollbackCrashChild.HasExited -and [DateTime]::UtcNow -lt $rollbackCrashDeadline) {
+                    Start-Sleep -Milliseconds 25
+                }
+                Assert-True (
+                    Test-Path -LiteralPath $rollbackCrashReady -PathType Leaf
+                ) "safe-update verification did not reach the completed rollback boundary"
+                Stop-Process -Id $rollbackCrashChild.Id -Force
+                $rollbackCrashChild.WaitForExit()
+            } finally {
+                $env:CLASH_PATCH_TEST_SAFE_UPDATE_ROLLBACK_CRASH_READY = $null
+                if (-not $rollbackCrashChild.HasExited) {
+                    Stop-Process -Id $rollbackCrashChild.Id -Force
+                }
+            }
+            Assert-True (
+                (Get-Content -LiteralPath $rollbackCrashTarget -Raw) -eq $rollbackCrashOriginal
+            ) "safe-update rollback crash fixture did not restore the original subscription"
+
+            $rollbackCrashRetry = Invoke-TestPowerShell $rollbackCrashInstaller @(
+                "-AppHome", $rollbackCrashHome,
+                "-VerifySafeUpdate",
+                "-MihomoPath", $fakeCore,
+                "-Json"
+            )
+            $rollbackCrashRetryJson = Assert-JsonResult $rollbackCrashRetry "install" 1
+            Assert-True (
+                $rollbackCrashRetryJson.code -ne "safe_update_verified"
+            ) "a failed and rolled-back update was reported as verified after process death"
+            Assert-True (-not (
+                Test-Path -LiteralPath (
+                    Join-Path $rollbackCrashHome "clash-patch-safe-update.json"
+                )
+            )) "completed rollback retained a reusable safe-update manifest"
+            Assert-True (
+                (Get-Content -LiteralPath $rollbackCrashTarget -Raw) -eq $rollbackCrashOriginal
+            ) "retry after rollback process death changed the restored subscription"
+        }
+    }
+
+    if ($onWindows) {
         $concurrentVerifySnapshot = Invoke-TestPowerShell $installer @("-AppHome", $safeUpdateCase, "-SnapshotProfiles")
         Assert-True ($concurrentVerifySnapshot.ExitCode -eq 0) "concurrent verification snapshot failed; $(Get-TestOutputDiagnostic $concurrentVerifySnapshot.Output)"
         [System.IO.File]::WriteAllText((Join-Path $safeUpdateProfiles "R-first.yaml"), $firstSafeUpdated)
@@ -1801,6 +1938,9 @@ rules: ["MATCH,AI"]
         ) "safe update accepted invalid UTF-8 bytes after replacement-character decoding"
     }
 
+    $unitRestoreManifestPath = Join-Path $safeUpdateProfiles "unit-restore-manifest.json"
+    [System.IO.File]::WriteAllText($unitRestoreManifestPath, '{"Version":1}')
+    $unitRestoreManifestSnapshot = Get-OptionalFileSnapshot $unitRestoreManifestPath "测试安全更新准备记录"
     $concurrentTarget = Join-Path $safeUpdateProfiles "concurrent.yaml"
     $concurrentBackup = Join-Path $safeUpdateProfiles "concurrent.backup"
     [System.IO.File]::WriteAllText($concurrentTarget, "observed: true`n")
@@ -1813,9 +1953,11 @@ rules: ["MATCH,AI"]
         BackupPath = $concurrentBackup
         BeforeSha256 = (Get-FileSha256 $concurrentBackup)
     }
-    $concurrentRestore = Restore-SafeUpdateFiles @($concurrentRecovery) $observedHashes
+    $concurrentRestore = Restore-SafeUpdateFiles `
+        @($concurrentRecovery) $observedHashes $unitRestoreManifestPath $unitRestoreManifestSnapshot
     Assert-True ($concurrentRestore.Conflicts.Count -eq 1) "safe update rollback did not detect a concurrent subscription change"
     Assert-True ((Get-Content -LiteralPath $concurrentTarget -Raw) -eq "newer: true`n") "safe update rollback overwrote a concurrent subscription change"
+    Assert-True (Test-Path -LiteralPath $unitRestoreManifestPath -PathType Leaf) "safe update conflict consumed its recovery manifest"
 
     $batchFirstTarget = Join-Path $safeUpdateProfiles "batch-first.yaml"
     $batchFirstBackup = Join-Path $safeUpdateProfiles "batch-first.backup"
@@ -1843,10 +1985,12 @@ rules: ["MATCH,AI"]
         $batchFirstTarget = Get-FileSha256 $batchFirstTarget
         $batchSecondTarget = Get-BytesSha256 ([System.Text.Encoding]::UTF8.GetBytes("second-observed: true`n"))
     }
-    $batchRestore = Restore-SafeUpdateFiles $batchRecoveryItems $batchObservedHashes
+    $batchRestore = Restore-SafeUpdateFiles `
+        $batchRecoveryItems $batchObservedHashes $unitRestoreManifestPath $unitRestoreManifestSnapshot
     Assert-True ($batchRestore.Conflicts.Count -eq 1) "safe update rollback missed a conflict in the second item"
     Assert-True ((Get-Content -LiteralPath $batchFirstTarget -Raw) -eq "first-updated: true`n") "safe update rollback partially restored the first item before finding a later conflict"
     Assert-True ((Get-Content -LiteralPath $batchSecondTarget -Raw) -eq "second-concurrent: true`n") "safe update rollback changed the conflicting second item"
+    Assert-True (Test-Path -LiteralPath $unitRestoreManifestPath -PathType Leaf) "batch rollback conflict consumed its recovery manifest"
 
     $badBackupTarget = Join-Path $safeUpdateProfiles "bad-backup-target.yaml"
     $badBackupPath = Join-Path $safeUpdateProfiles "bad-backup.backup"
@@ -1861,9 +2005,11 @@ rules: ["MATCH,AI"]
         BackupPath = $badBackupPath
         BeforeSha256 = $badBackupExpectedSha
     }
-    $badBackupRestore = Restore-SafeUpdateFiles @($badBackupRecovery) $badBackupObservedHashes
+    $badBackupRestore = Restore-SafeUpdateFiles `
+        @($badBackupRecovery) $badBackupObservedHashes $unitRestoreManifestPath $unitRestoreManifestSnapshot
     Assert-True ($badBackupRestore.Failures.Count -eq 1) "safe update rollback accepted backup bytes that changed after validation"
     Assert-True ((Get-Content -LiteralPath $badBackupTarget -Raw) -eq "still-valid: true`n") "corrupt backup overwrote a still-valid subscription before rejection"
+    Assert-True (Test-Path -LiteralPath $unitRestoreManifestPath -PathType Leaf) "bad backup consumed its recovery manifest"
 
     if ($onWindows) {
         Invoke-DeferredProbe "public restore same-byte identity replacement" {
