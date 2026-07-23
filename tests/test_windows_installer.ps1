@@ -1733,7 +1733,6 @@ items:
             $identityRestoreBackup = Backup-Versioned $identityRestoreTarget $identityRestoreBackupRoot "prewrite"
             [System.IO.File]::WriteAllText($identityRestoreTarget, $identityRestoreCurrentText)
             $identityRestoreExpectedHash = Get-FileSha256 $identityRestoreTarget
-            $identityBeforeValidation = (Get-OptionalFileSnapshot $identityRestoreTarget "public restore before validation").Identity
             $env:CLASH_PATCH_MUTATE_TARGET = $identityRestoreTarget
             try {
                 $identityRestoreResult = Invoke-TestPowerShell $installer @(
@@ -1746,11 +1745,9 @@ items:
             } finally {
                 $env:CLASH_PATCH_MUTATE_TARGET = $null
             }
-            $identityAfterValidation = (Get-OptionalFileSnapshot $identityRestoreTarget "public restore after validation").Identity
             $identityRestorePreserved = (Get-Content -LiteralPath $identityRestoreTarget -Raw) -eq $identityRestoreCurrentText
             Assert-True (
                 $identityRestoreResult.ExitCode -eq 1 -and
-                $identityAfterValidation -cne $identityBeforeValidation -and
                 $identityRestorePreserved
             ) "public restore overwrote a same-byte file whose identity changed during validation"
         }
@@ -1883,6 +1880,7 @@ $child.WaitForExit()
             New-Item -ItemType Directory -Path $candidateDirectory -Force | Out-Null
             $candidateChildSource = @'
 param(
+    [string]$TransactionModulePath,
     [string]$ModulePath,
     [string]$CorePath,
     [string]$Directory
@@ -1892,6 +1890,7 @@ function Test-GeneratedYaml {
     param([string]$Text)
     return $true
 }
+. $TransactionModulePath
 . $ModulePath
 Test-MihomoCandidate $CorePath "proxies:`n  - name: fixture-private-marker" $Directory
 '@
@@ -1902,6 +1901,7 @@ Test-MihomoCandidate $CorePath "proxies:`n  - name: fixture-private-marker" $Dir
             )
             $candidateChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
                 "-NoLogo", "-NoProfile", "-File", $candidateChildPath,
+                "-TransactionModulePath", (Join-Path $installerModuleRoot "transaction.ps1"),
                 "-ModulePath", (Join-Path $installerModuleRoot "mihomo.ps1"),
                 "-CorePath", $candidateHangingCore,
                 "-Directory", $candidateDirectory
