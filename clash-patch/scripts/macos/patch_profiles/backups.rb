@@ -190,8 +190,11 @@ module ClashPatch
   end
 
   def restore_backup(backup_id, directories:, backup_root:, expected_current_sha256:, validator:)
+    operation_lock = nil
     return { status: :restore_conflict } unless expected_current_sha256.to_s.match?(/\A[0-9a-f]{64}\z/i)
 
+    operation_lock = profile_operation_lock(backup_root)
+    recover_profile_transaction(backup_root, roots: directories)
     backup_path = resolve_backup_id(backup_id, backup_root)
     target = find_backup_target(backup_id, directories)
     write_path = File.realpath(target)
@@ -237,6 +240,8 @@ module ClashPatch
     { status: :invalid_backup }
   rescue SystemCallError, IOError
     { status: :io_error }
+  ensure
+    operation_lock&.close
   end
 
 end

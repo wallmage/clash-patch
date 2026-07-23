@@ -1366,6 +1366,34 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_restore_backup_recovers_an_interrupted_batch_before_writing
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config.merge("subscription-marker" => "original"))
+      candidate = YAML.dump(base_config.merge("subscription-marker" => "candidate"))
+      older = YAML.dump(base_config.merge("subscription-marker" => "older-backup"))
+      File.binwrite(profile, original)
+      backup = ClashPatch.create_versioned_backup(
+        profile, backup_root, content: older, reason: "prewrite"
+      )
+      ClashPatch.prepare_profile_transaction(
+        [{ path: profile, original: original, candidate: candidate }], backup_root
+      )
+      File.binwrite(profile, candidate)
+
+      result = ClashPatch.restore_backup(
+        File.basename(backup), directories: [directory], backup_root: backup_root,
+        expected_current_sha256: Digest::SHA256.hexdigest(candidate.b),
+        validator: ->(_candidate) { true }
+      )
+
+      assert_equal :restore_conflict, result.fetch(:status)
+      assert_equal original.b, File.binread(profile)
+      refute File.exist?(ClashPatch.profile_transaction_path(backup_root))
+    end
+  end
+
   def test_restore_backup_rejects_a_retargeted_profile_symlink
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
@@ -1562,19 +1590,22 @@ class MacosPatcherTest < Minitest::Test
   end
 
   def test_restore_backup_classifies_invalid_and_io_failures
-    ClashPatch.stub(:resolve_backup_id, ->(*_args) { raise ClashPatch::InvalidConfigError }) do
-      result = ClashPatch.restore_backup(
-        "bad.backup", directories: [], backup_root: Dir.tmpdir,
-        expected_current_sha256: "0" * 64, validator: ->(_path) { true }
-      )
-      assert_equal :invalid_backup, result.fetch(:status)
-    end
-    ClashPatch.stub(:resolve_backup_id, ->(*_args) { raise IOError }) do
-      result = ClashPatch.restore_backup(
-        "bad.backup", directories: [], backup_root: Dir.tmpdir,
-        expected_current_sha256: "0" * 64, validator: ->(_path) { true }
-      )
-      assert_equal :io_error, result.fetch(:status)
+    Dir.mktmpdir do |directory|
+      backup_root = File.join(directory, "backups")
+      ClashPatch.stub(:resolve_backup_id, ->(*_args) { raise ClashPatch::InvalidConfigError }) do
+        result = ClashPatch.restore_backup(
+          "bad.backup", directories: [], backup_root: backup_root,
+          expected_current_sha256: "0" * 64, validator: ->(_path) { true }
+        )
+        assert_equal :invalid_backup, result.fetch(:status)
+      end
+      ClashPatch.stub(:resolve_backup_id, ->(*_args) { raise IOError }) do
+        result = ClashPatch.restore_backup(
+          "bad.backup", directories: [], backup_root: backup_root,
+          expected_current_sha256: "0" * 64, validator: ->(_path) { true }
+        )
+        assert_equal :io_error, result.fetch(:status)
+      end
     end
   end
 

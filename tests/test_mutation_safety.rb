@@ -118,6 +118,23 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_restore_backup_transaction_recovery_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/backups.rb",
+        "    recover_profile_transaction(backup_root, roots: directories)\n",
+        "    true\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_restore_backup_recovers_an_interrupted_batch_before_writing"
+      )
+    end
+  end
+
   def test_safe_update_precommit_journal_cleanup_mutation_is_killed
     with_repo_copy do |root|
       replace_once(
