@@ -1013,6 +1013,31 @@ test('Windows route verifier accepts an explicit non-AI Google proxy group', () 
   assert.match(source, /Observe-Route "OpenAI"[^\r\n]+\$false/);
 });
 
+test('PowerShell scripts never assign to read-only automatic variables', () => {
+  const scriptsRoot = path.join(root, 'clash-patch/scripts');
+  const pending = [scriptsRoot];
+  const powershellFiles = [];
+  while (pending.length > 0) {
+    const directory = pending.pop();
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory()) pending.push(entryPath);
+      if (entry.isFile() && entry.name.endsWith('.ps1')) powershellFiles.push(entryPath);
+    }
+  }
+
+  const readonlyName = '(?:(?:global|script|local|private):)?(?:Host|PID|HOME|PSHOME|PSEdition|PSVersionTable|ShellId)';
+  const assignment = new RegExp(
+    `(?:\\$${readonlyName}\\b|\\$\\{${readonlyName}\\})\\s*(?:=|\\+=|-=|\\*=|\\/=|%=|\\+\\+|--)`,
+    'i'
+  );
+  for (const file of powershellFiles) {
+    fs.readFileSync(file, 'utf8').split(/\r?\n/).forEach((line, index) => {
+      assert.doesNotMatch(line, assignment, `${path.relative(root, file)}:${index + 1}`);
+    });
+  }
+});
+
 function baseConfig() {
   return {
     proxies: [

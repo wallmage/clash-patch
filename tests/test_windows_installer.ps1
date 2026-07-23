@@ -201,6 +201,46 @@ try {
     $jsonRouteFailureResult = Assert-JsonResult $jsonRouteFailure "verify_routes" 1
     Assert-True ($jsonRouteFailureResult.code -eq "verification_failed") "route verifier did not structure its parameter failure"
 
+    $routeHarnessPath = Join-Path $sandbox "verify-route-observer.ps1"
+    $routeFunctionSources = $routeAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -in @("Test-RouteChains", "Observe-Route")
+    }, $true) | ForEach-Object { $_.Extent.Text }
+    $routeHarnessMocks = @'
+$ErrorActionPreference = "Stop"
+$ObservationSeconds = 1
+$Json = $true
+$script:ClashPatchChecks = New-Object System.Collections.ArrayList
+function Get-ConnectionIds { return @{} }
+function Start-TestTraffic([string]$Url) {
+    $process = [pscustomobject]@{ HasExited = $true }
+    $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value {}
+    return $process
+}
+function Start-Sleep { }
+function Invoke-ControllerJson([string]$Endpoint) {
+    return [pscustomobject]@{
+        connections = @(
+            [pscustomobject]@{
+                id = "new-google-connection"
+                metadata = [pscustomobject]@{ host = "www.google.com" }
+                chains = @("Fixture Node", "Main")
+            }
+        )
+    }
+}
+$proxies = [pscustomobject]@{
+    Main = [pscustomobject]@{ type = "Selector"; now = "Fixture Node" }
+}
+$passed = Observe-Route "Google" "https://www.google.com/" "google" "Main" "Fixture Node" $proxies "AI" $true
+if (-not $passed) { throw "Observe-Route rejected a matching routed connection." }
+'@
+    $routeHarness = (@($routeFunctionSources) + $routeHarnessMocks) -join "`r`n"
+    [System.IO.File]::WriteAllText($routeHarnessPath, $routeHarness, (New-Object System.Text.UTF8Encoding($true)))
+    $routeObservation = Invoke-TestPowerShell $routeHarnessPath @()
+    Assert-True ($routeObservation.ExitCode -eq 0) "Observe-Route crashed on a matching connection: $($routeObservation.Output)"
+
     $brokenPackageRoot = Join-Path $sandbox "broken-package"
     New-Item -ItemType Directory -Path $brokenPackageRoot -Force | Out-Null
     $brokenInstaller = Join-Path $brokenPackageRoot "install_windows.ps1"

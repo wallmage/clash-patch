@@ -126,8 +126,8 @@ function Observe-Route(
             $connections = @((Invoke-ControllerJson "/connections").connections)
             foreach ($connection in $connections) {
                 if ($null -eq $connection -or $known.ContainsKey([string]$connection.id)) { continue }
-                $host = [string]$connection.metadata.host
-                if ($host -notmatch $HostPattern) { continue }
+                $connectionHost = [string]$connection.metadata.host
+                if ($connectionHost -notmatch $HostPattern) { continue }
                 $chains = @($connection.chains | ForEach-Object { [string]$_ })
                 $passed = Test-RouteChains $Proxies $chains $ExpectedGroup $ExpectedSelection $AiGroup $AllowExplicitProxyGroup
                 [void]$script:ClashPatchChecks.Add([ordered]@{ name = $Label.ToLowerInvariant(); ok = $passed; status = $(if ($passed) { "passed" } else { "failed" }) })
