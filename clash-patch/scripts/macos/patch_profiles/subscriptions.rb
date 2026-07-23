@@ -405,10 +405,30 @@ module ClashPatch
     false
   end
 
+  def safe_update_item_restored?(item)
+    return false unless File.realpath(item.fetch(:path)) == item.fetch(:write_path)
+
+    File.binread(item.fetch(:write_path)) == item.fetch(:original)
+  rescue StandardError
+    false
+  end
+
+  def safe_update_item_candidate_or_unknown?(item)
+    return false unless item[:candidate_identity]
+    return true unless File.realpath(item.fetch(:path)) == item.fetch(:write_path)
+
+    stat = File.stat(item.fetch(:write_path))
+    [stat.dev, stat.ino] == item.fetch(:candidate_identity) &&
+      File.binread(item.fetch(:write_path)) == item.fetch(:candidate)
+  rescue StandardError
+    true
+  end
+
   def rollback_safe_update_items(items)
     failures = []
     items.each do |item|
       next unless item[:committed_identity]
+      next if safe_update_item_restored?(item)
 
       restored = replace_profile_bytes(
         item.fetch(:path), item.fetch(:original),
@@ -416,7 +436,7 @@ module ClashPatch
         expected_identity: item.fetch(:committed_identity),
         expected_path: item.fetch(:write_path)
       )
-      failures << item.fetch(:name) unless restored
+      failures << item.fetch(:name) unless restored || safe_update_item_restored?(item)
     rescue StandardError
       failures << item.fetch(:name)
     end
@@ -427,15 +447,16 @@ module ClashPatch
     failures = rollback_safe_update_items(items)
     return failures unless failures.empty?
 
-    candidate_remains = items.any? do |item|
-      File.binread(File.realpath(item.fetch(:path))) == item.fetch(:candidate)
-    rescue StandardError
-      true
-    end
-    if candidate_remains
-      recover_profile_transaction(backup_root, roots: roots)
-    else
+    candidate_remains = items.any? { |item| safe_update_item_candidate_or_unknown?(item) }
+    if items.none? { |item| item[:committed_identity] } && !candidate_remains
       remove_profile_transaction(transaction)
+      return []
+    end
+    all_restored = items.all? { |item| safe_update_item_restored?(item) }
+    if all_restored
+      remove_profile_transaction(transaction)
+    else
+      recover_profile_transaction(backup_root, roots: roots)
     end
     []
   rescue StandardError
@@ -516,6 +537,8 @@ module ClashPatch
         temporary = Tempfile.new([".clash-patch-update-swap-", ".tmp"], File.dirname(item.fetch(:write_path)))
         temporary.binmode
         write_locked_profile(temporary, item.fetch(:candidate))
+        candidate = temporary.stat
+        item[:candidate_identity] = [candidate.dev, candidate.ino]
         temporary_files << temporary
         item[:temporary] = temporary
       end

@@ -189,6 +189,117 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_safe_update_completed_file_restore_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        "  def safe_update_item_restored?(item)\n",
+        "  def safe_update_item_restored?(item)\n    return false\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_safe_update_does_not_treat_runtime_file_restore_as_a_second_rollback_failure"
+      )
+    end
+  end
+
+  def test_safe_update_final_restore_check_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        "    all_restored = items.all? { |item| safe_update_item_restored?(item) }\n",
+        "    all_restored = true\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_safe_update_keeps_the_transaction_when_a_restored_file_is_refreshed_before_cleanup"
+      )
+    end
+  end
+
+  def test_safe_update_uncommitted_transaction_cleanup_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        "    if items.none? { |item| item[:committed_identity] } && !candidate_remains\n",
+        "    if false\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_safe_update_all_preserves_an_atomic_refresh_during_backup"
+      )
+    end
+  end
+
+  def test_safe_update_unrecorded_candidate_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        "    candidate_remains = items.any? { |item| safe_update_item_candidate_or_unknown?(item) }\n",
+        "    candidate_remains = false\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        { "CLASH_PATCH_RUN_PRODUCTION_PROBES" => "1" },
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_production_probe_safe_update_restores_a_swap_when_bookkeeping_raises"
+      )
+    end
+  end
+
+  def test_safe_update_unrecorded_candidate_identity_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        "    [stat.dev, stat.ino] == item.fetch(:candidate_identity) &&\n",
+        "    true &&\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_safe_update_preserves_an_equal_candidate_external_refresh_before_swap"
+      )
+    end
+  end
+
+  def test_safe_update_unreadable_candidate_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        "      File.binread(item.fetch(:write_path)) == item.fetch(:candidate)\n" \
+          "  rescue StandardError\n" \
+          "    true\n" \
+          "  end\n\n" \
+          "  def rollback_safe_update_items",
+        "      File.binread(item.fetch(:write_path)) == item.fetch(:candidate)\n" \
+          "  rescue StandardError\n" \
+          "    false\n" \
+          "  end\n\n" \
+          "  def rollback_safe_update_items"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_safe_update_rollback_reports_unreadable_candidate_recovery_failure"
+      )
+    end
+  end
+
   def test_windows_safe_update_proxy_group_check_removal_is_killed
     with_repo_copy do |root|
       replace_once(
