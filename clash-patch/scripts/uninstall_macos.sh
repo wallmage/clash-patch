@@ -16,9 +16,12 @@ DEFAULTS_DOMAIN="com.metacubex.ClashX.meta"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 RESULT_CONTRACT_SOURCE="$SCRIPT_DIR/macos/result_contract.rb"
 PATCHER_SOURCE="$SCRIPT_DIR/macos/patch_profiles.rb"
+OPERATION_LOCK_SOURCE="$SCRIPT_DIR/macos/operation_lock.rb"
 AUTO_UPDATE_OWNERSHIP_PATH="$BACKUP_DIR/clashx-meta-kAutoUpdateEnable.state.json"
+OPERATION_LOCK_PATH="$BACKUP_DIR/.clash-patch-wrapper.lock"
 JSON_OUTPUT=0
 UNINSTALL_STAGING="$INSTALL_DIR/.clash-patch-uninstall-staging"
+OPERATION_LOCK_REQUIRED=1
 
 unexpected_uninstall_exit() {
   unexpected_status=$1
@@ -38,6 +41,9 @@ trap 'exit 143' TERM
 
 for argument do
   [ "$argument" = "--json" ] && JSON_OUTPUT=1
+  case "$argument" in
+    -h|--help) OPERATION_LOCK_REQUIRED=0 ;;
+  esac
 done
 
 finish() {
@@ -67,6 +73,43 @@ usage() {
   [ "$JSON_OUTPUT" -eq 0 ] || return 0
   /usr/bin/printf '%s\n' "用法：uninstall_macos.sh [--json]"
 }
+
+if [ "$OPERATION_LOCK_REQUIRED" -eq 1 ] &&
+   [ "${CLASH_PATCH_INTERNAL_OPERATION_LOCK_HELD:-0}" != "1" ]; then
+  if [ "$(uname -s)" != "Darwin" ]; then
+    say "当前系统不是 macOS。"
+    finish 2 unsupported unsupported_platform "当前系统不是 macOS。"
+  fi
+  lock_user_id=$(/usr/bin/id -u)
+  if [ "$lock_user_id" -eq 0 ]; then
+    say "请不要使用 sudo 或 root 运行卸载程序；请用当前登录用户直接运行。"
+    finish 2 invalid_request root_not_allowed "请用当前登录用户直接运行。"
+  fi
+  if [ ! -x /usr/bin/ruby ]; then
+    say "这台 Mac 没有系统 Ruby，无法安全卸载。"
+    finish 3 unsupported ruby_missing "这台 Mac 没有系统 Ruby，无法安全卸载。"
+  fi
+  if [ ! -f "$OPERATION_LOCK_SOURCE" ]; then
+    say "安装包不完整：缺少操作锁程序。"
+    finish 6 failed incomplete_package "安装包不完整。"
+  fi
+  set +e
+  /usr/bin/ruby "$OPERATION_LOCK_SOURCE" "$OPERATION_LOCK_PATH" /bin/sh "$0" "$@"
+  operation_lock_status=$?
+  set -e
+  case "$operation_lock_status" in
+    75)
+      finish 1 failed operation_in_progress "另一个 Clash Patch 操作正在进行，请稍后重试。"
+      ;;
+    76)
+      finish 1 failed operation_lock_failed "无法建立 Clash Patch 操作锁；未执行任何修改。"
+      ;;
+    *)
+      trap - EXIT HUP INT TERM
+      exit "$operation_lock_status"
+      ;;
+  esac
+fi
 
 while [ "$#" -gt 0 ]; do
   case "$1" in

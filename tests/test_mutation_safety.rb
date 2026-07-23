@@ -1157,6 +1157,49 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_macos_wrapper_operation_lock_mutations_are_killed
+    %w[
+      clash-patch/scripts/install_macos.sh
+      clash-patch/scripts/uninstall_macos.sh
+    ].each do |relative_path|
+      with_repo_copy do |root|
+        replace_once(
+          root,
+          relative_path,
+          'if [ "$OPERATION_LOCK_REQUIRED" -eq 1 ] &&',
+          'if [ "$OPERATION_LOCK_REQUIRED" -eq 0 ] &&'
+        )
+
+        assert_mutation_is_killed(
+          root,
+          "/usr/bin/env", "CLASH_PATCH_RUN_PRODUCTION_PROBES=1",
+          RbConfig.ruby, "tests/test_macos_wrappers.rb",
+          "--name",
+          "test_production_probe_shared_wrapper_lock_prevents_uninstall_from_deleting_a_concurrent_install"
+        )
+      end
+    end
+  end
+
+  def test_macos_install_pending_uninstall_recovery_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_macos.sh",
+        "recover_interrupted_uninstall\n\nif [ -z \"\$USAGE_PROFILE\" ]",
+        ": # mutant: skip pending uninstall recovery\n\nif [ -z \"\$USAGE_PROFILE\" ]"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        "/usr/bin/env", "CLASH_PATCH_RUN_PRODUCTION_PROBES=1",
+        RbConfig.ruby, "tests/test_macos_wrappers.rb",
+        "--name",
+        "test_production_probe_install_recovers_a_killed_ready_uninstall_before_changing_profile"
+      )
+    end
+  end
+
   def test_macos_uninstall_atomic_restore_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

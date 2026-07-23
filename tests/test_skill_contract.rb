@@ -23,6 +23,7 @@ class SkillContractTest < Minitest::Test
     clash-patch/scripts/uninstall_macos.sh
     clash-patch/scripts/uninstall_windows.ps1
     clash-patch/scripts/uninstall_windows.cmd
+    clash-patch/scripts/macos/operation_lock.rb
     clash-patch/scripts/macos/patch_profiles.rb
     clash-patch/scripts/macos/patch_profiles/transform.rb
     clash-patch/scripts/macos/patch_profiles/backups.rb
@@ -1036,6 +1037,29 @@ class SkillContractTest < Minitest::Test
     refute_match(/\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7F]/, source)
   end
 
+  def test_macos_mutating_wrappers_share_one_cross_process_operation_lock
+    helper = File.read(File.join(SKILL, "scripts/macos/operation_lock.rb"))
+    installer = File.read(File.join(SKILL, "scripts/install_macos.sh"))
+    uninstaller = File.read(File.join(SKILL, "scripts/uninstall_macos.sh"))
+
+    assert_includes helper, "File::LOCK_EX | File::LOCK_NB"
+    assert_includes helper, "LOCK_TIMEOUT_SECONDS = 5"
+    assert_includes helper, "handle.close_on_exec = false"
+    [installer, uninstaller].each do |source|
+      assert_includes source, 'OPERATION_LOCK_PATH="$BACKUP_DIR/.clash-patch-wrapper.lock"'
+      assert_includes source, "CLASH_PATCH_INTERNAL_OPERATION_LOCK_HELD"
+      assert_includes source, '"$OPERATION_LOCK_SOURCE" "$OPERATION_LOCK_PATH" /bin/sh "$0" "$@"'
+      assert_includes source, "operation_in_progress"
+    end
+    recovery = installer.index("\nrecover_interrupted_uninstall\n")
+    profile_read = installer.index('if [ -z "$USAGE_PROFILE" ]')
+    refute_nil recovery
+    refute_nil profile_read
+    assert_operator recovery, :<, profile_read
+    assert_includes installer, 'recovery_json=$(/bin/sh "$UNINSTALLER_SOURCE" --json'
+    assert_includes installer, "uninstall_recovery_failed"
+  end
+
   def test_installers_preflight_and_uninstallers_restore_owned_settings
     mac_install = File.read(File.join(SKILL, "scripts/install_macos.sh"))
     mac_uninstall = File.read(File.join(SKILL, "scripts/uninstall_macos.sh"))
@@ -1419,6 +1443,8 @@ class SkillContractTest < Minitest::Test
       test_production_probe_safe_update_restores_a_swap_when_bookkeeping_raises
     ].sort
     expected_wrappers = %w[
+      test_production_probe_install_recovers_a_killed_ready_uninstall_before_changing_profile
+      test_production_probe_shared_wrapper_lock_prevents_uninstall_from_deleting_a_concurrent_install
       test_production_probe_uninstall_preserves_a_file_replaced_after_staging
     ]
     expected_windows = [

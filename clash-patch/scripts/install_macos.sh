@@ -16,6 +16,10 @@ LEGACY_PATCHER="$HOME/Library/Application Support/ClashProfilePatcher/patch_prof
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PATCHER_SOURCE="$SCRIPT_DIR/macos/patch_profiles.rb"
 RESULT_CONTRACT_SOURCE="$SCRIPT_DIR/macos/result_contract.rb"
+OPERATION_LOCK_SOURCE="$SCRIPT_DIR/macos/operation_lock.rb"
+OPERATION_LOCK_PATH="$BACKUP_DIR/.clash-patch-wrapper.lock"
+UNINSTALLER_SOURCE="$SCRIPT_DIR/uninstall_macos.sh"
+UNINSTALL_STAGING="$INSTALL_DIR/.clash-patch-uninstall-staging"
 POLICY_SOURCE="$SCRIPT_DIR/../references/policy.json"
 USAGE_PROFILE=""
 PROFILE_SOURCE=""
@@ -27,6 +31,7 @@ AUTO_UPDATE_CHANGED=0
 PENDING_TEMPORARY=""
 PREVIOUS_PROFILE=""
 PROFILE_STATE_CHANGED=0
+OPERATION_LOCK_REQUIRED=1
 
 unexpected_exit() {
   unexpected_status=$1
@@ -72,6 +77,10 @@ trap 'exit 143' TERM
 
 for argument do
   [ "$argument" = "--json" ] && JSON_OUTPUT=1
+  [ "$argument" = "--safe-update" ] && OPERATION="safe_update"
+  case "$argument" in
+    --show-profile|-h|--help) OPERATION_LOCK_REQUIRED=0 ;;
+  esac
 done
 
 finish() {
@@ -153,6 +162,46 @@ usage() {
   /usr/bin/printf '%s\n' "用法：install_macos.sh [--profile 1|2|3] [--show-profile] [--safe-update]"
 }
 
+recover_interrupted_uninstall() {
+  if [ ! -e "$UNINSTALL_STAGING" ] && [ ! -L "$UNINSTALL_STAGING" ]; then
+    return 0
+  fi
+  if [ ! -d "$UNINSTALL_STAGING" ] || [ -L "$UNINSTALL_STAGING" ]; then
+    finish 1 failed uninstall_recovery_failed "未完成的安全卸载状态不安全；未继续安装。" uninstall_recovery
+  fi
+  if [ ! -f "$UNINSTALLER_SOURCE" ] || [ -L "$UNINSTALLER_SOURCE" ]; then
+    finish 6 failed uninstall_recovery_failed "安装包不完整，无法恢复未完成的安全卸载。" uninstall_recovery
+  fi
+
+  set +e
+  recovery_json=$(/bin/sh "$UNINSTALLER_SOURCE" --json 2>/dev/null)
+  recovery_status=$?
+  set -e
+  if [ "$recovery_status" -ne 0 ]; then
+    finish 1 failed uninstall_recovery_failed "未完成的安全卸载无法恢复；未继续安装。" uninstall_recovery
+  fi
+  recovery_receipt=$(/usr/bin/printf '%s' "$recovery_json" | /usr/bin/ruby -rjson -e '
+    value = JSON.parse(STDIN.read)
+    abort unless value.is_a?(Hash) &&
+      value["schema"] == "clash-patch.result" &&
+      value["version"] == 1 &&
+      value["command"] == "uninstall" &&
+      value["operation"] == "uninstall" &&
+      value["ok"] == true &&
+      value["status"] == "ok" &&
+      value["code"] == "uninstall_completed" &&
+      value["exit_code"] == 0
+    print "uninstall_completed"
+  ' 2>/dev/null || true)
+  if [ "$recovery_receipt" != "uninstall_completed" ]; then
+    finish 1 failed uninstall_recovery_failed "未完成的安全卸载返回了无法验证的结果；未继续安装。" uninstall_recovery
+  fi
+  if [ -e "$UNINSTALL_STAGING" ] || [ -L "$UNINSTALL_STAGING" ]; then
+    finish 1 failed uninstall_recovery_failed "未完成的安全卸载状态仍然存在；未继续安装。" uninstall_recovery
+  fi
+  say "已先完成上次中断的安全卸载。"
+}
+
 read_saved_profile() {
   [ -f "$USAGE_STATE_PATH" ] && [ ! -L "$USAGE_STATE_PATH" ] || return 1
   saved_version=$(/usr/bin/plutil -extract Version raw "$USAGE_STATE_PATH" 2>/dev/null || true)
@@ -229,6 +278,43 @@ commit_profile_selection() {
   say "已保存用途档位 ${USAGE_PROFILE}。"
 }
 
+if [ "$OPERATION_LOCK_REQUIRED" -eq 1 ] &&
+   [ "${CLASH_PATCH_INTERNAL_OPERATION_LOCK_HELD:-0}" != "1" ]; then
+  if [ "$(uname -s)" != "Darwin" ]; then
+    say "当前系统不是 macOS。Windows 请使用 Clash Verge Rev 的 Windows 安装程序。"
+    finish 2 unsupported unsupported_platform "当前系统不是 macOS。" install
+  fi
+  lock_user_id=$(/usr/bin/id -u)
+  if [ "$lock_user_id" -eq 0 ]; then
+    say "请不要使用 sudo 或 root；请用当前登录用户直接运行。"
+    finish 2 invalid_request root_not_allowed "请用当前登录用户直接运行。" install
+  fi
+  if [ ! -x /usr/bin/ruby ]; then
+    say "这台 Mac 没有系统 Ruby，无法运行补丁。"
+    finish 3 unsupported ruby_missing "这台 Mac 没有系统 Ruby，无法运行补丁。" install
+  fi
+  if [ ! -f "$OPERATION_LOCK_SOURCE" ]; then
+    say "安装包不完整：缺少操作锁程序。"
+    finish 6 failed incomplete_package "安装包不完整。" install
+  fi
+  set +e
+  /usr/bin/ruby "$OPERATION_LOCK_SOURCE" "$OPERATION_LOCK_PATH" /bin/sh "$0" "$@"
+  operation_lock_status=$?
+  set -e
+  case "$operation_lock_status" in
+    75)
+      finish 1 failed operation_in_progress "另一个 Clash Patch 操作正在进行，请稍后重试。" "$OPERATION"
+      ;;
+    76)
+      finish 1 failed operation_lock_failed "无法建立 Clash Patch 操作锁；未执行任何修改。" "$OPERATION"
+      ;;
+    *)
+      trap - EXIT HUP INT TERM
+      exit "$operation_lock_status"
+      ;;
+  esac
+fi
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --profile)
@@ -284,6 +370,8 @@ if [ "$SHOW_PROFILE" -eq 1 ]; then
   [ -n "$saved_profile" ] && /usr/bin/printf '%s\n' "$saved_profile" || /usr/bin/printf '%s\n' "unset"
   exit 0
 fi
+
+recover_interrupted_uninstall
 
 if [ -z "$USAGE_PROFILE" ] && [ -n "${CLASH_PATCH_USAGE_PROFILE:-}" ]; then
   USAGE_PROFILE=$CLASH_PATCH_USAGE_PROFILE

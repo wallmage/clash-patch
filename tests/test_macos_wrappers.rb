@@ -8,6 +8,7 @@ ROOT = File.expand_path("..", __dir__) unless defined?(ROOT)
 INSTALLER = File.join(ROOT, "clash-patch/scripts/install_macos.sh")
 UNINSTALLER = File.join(ROOT, "clash-patch/scripts/uninstall_macos.sh")
 RESULT_CONTRACT = File.join(ROOT, "clash-patch/scripts/macos/result_contract.rb")
+OPERATION_LOCK = File.join(ROOT, "clash-patch/scripts/macos/operation_lock.rb")
 
 class MacosWrapperTest < Minitest::Test
   REQUIRED_RESULT_FIELDS = %w[
@@ -62,6 +63,7 @@ class MacosWrapperTest < Minitest::Test
       FileUtils.mkdir_p(File.join(package, "references"))
       FileUtils.cp(INSTALLER, File.join(scripts, "install_macos.sh"))
       FileUtils.cp(RESULT_CONTRACT, File.join(scripts, "macos", "result_contract.rb")) if File.file?(RESULT_CONTRACT)
+      FileUtils.cp(OPERATION_LOCK, File.join(scripts, "macos", "operation_lock.rb")) if File.file?(OPERATION_LOCK)
       File.write(
         File.join(scripts, "macos", "patch_profiles.rb"),
         "puts 'missing' if ARGV.include?('--print-core-status')\n"
@@ -78,6 +80,7 @@ class MacosWrapperTest < Minitest::Test
       FileUtils.mkdir_p(File.join(package, "references"))
       FileUtils.cp(INSTALLER, File.join(scripts, "install_macos.sh"))
       FileUtils.cp(RESULT_CONTRACT, File.join(scripts, "macos", "result_contract.rb"))
+      FileUtils.cp(OPERATION_LOCK, File.join(scripts, "macos", "operation_lock.rb"))
       File.write(
         File.join(scripts, "macos", "patch_profiles.rb"),
         patcher_source || "if ARGV.include?('--print-core-status'); puts 'supported'; end\nexit 0\n"
@@ -93,6 +96,7 @@ class MacosWrapperTest < Minitest::Test
       FileUtils.mkdir_p(File.join(scripts, "macos"))
       FileUtils.cp(UNINSTALLER, File.join(scripts, "uninstall_macos.sh"))
       FileUtils.cp(RESULT_CONTRACT, File.join(scripts, "macos", "result_contract.rb"))
+      FileUtils.cp(OPERATION_LOCK, File.join(scripts, "macos", "operation_lock.rb"))
       File.write(File.join(scripts, "macos", "patch_profiles.rb"), patcher_source)
       yield File.join(scripts, "uninstall_macos.sh")
     end
@@ -205,6 +209,222 @@ class MacosWrapperTest < Minitest::Test
         violations << "enabled automatic updates while profile 3 remained" unless File.binread(preference) == "disabled"
         violations << "discarded automatic-update ownership" unless File.file?(ownership)
         assert_empty violations, violations.join("; ")
+      end
+    end
+  end
+
+  def test_production_probe_shared_wrapper_lock_prevents_uninstall_from_deleting_a_concurrent_install
+    require_production_probe!
+    patcher = <<~'RUBY'
+      if ARGV.include?("--print-core-status")
+        puts "supported"
+        exit 0
+      end
+      exit 0
+    RUBY
+    with_supported_mihomo_installer(patcher_source: patcher) do |installer|
+      with_uninstaller_package(patcher_source: patcher) do |uninstaller|
+        Dir.mktmpdir do |home|
+          with_supported_app(home) do
+            install_dir = File.join(home, "Library", "Application Support", "ClashPatch")
+            FileUtils.mkdir_p(install_dir)
+            File.binwrite(File.join(install_dir, "patch_profiles.rb"), "owned-patcher")
+            File.binwrite(File.join(install_dir, "policy.json"), "{}")
+            state = File.join(home, "usage-profile.plist")
+            system("/usr/bin/plutil", "-create", "xml1", state)
+            system("/usr/bin/plutil", "-insert", "Version", "-integer", "1", state)
+            system("/usr/bin/plutil", "-insert", "Profile", "-integer", "1", state)
+
+            ready = File.join(home, "uninstall-delete-ready")
+            continue_path = File.join(home, "uninstall-delete-continue")
+            anchor = "  /bin/rm -f \\\n"
+            source = File.binread(uninstaller)
+            assert_equal 1, source.scan(anchor).length
+            instrumented = <<~'SH'
+              /usr/bin/touch "$CLASH_PATCH_TEST_READY"
+              while [ ! -e "$CLASH_PATCH_TEST_CONTINUE" ]; do
+                /bin/sleep 0.01
+              done
+            SH
+            File.binwrite(uninstaller, source.sub(anchor, instrumented + anchor))
+
+            env = {
+              "HOME" => home,
+              "CLASH_PATCH_USAGE_STATE_PATH" => state,
+              "CLASH_PATCH_USAGE_PROFILE" => nil,
+              "CLASH_PATCH_PROFILE_DIR" => nil,
+              "CLASH_PATCH_TEST_READY" => ready,
+              "CLASH_PATCH_TEST_CONTINUE" => continue_path
+            }
+            uninstall_stdout = +""
+            uninstall_stderr = +""
+            uninstall_thread = nil
+            readers = []
+            uninstall_status = nil
+            first_install = nil
+            begin
+              Open3.popen3(env, "/bin/sh", uninstaller, "--json") do |stdin, out, error, thread|
+                uninstall_thread = thread
+                stdin.close
+                readers << Thread.new { uninstall_stdout << out.read }
+                readers << Thread.new { uninstall_stderr << error.read }
+                deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+                until File.exist?(ready)
+                  raise "uninstaller never reached the pre-delete gate" if
+                    Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+                  sleep 0.01
+                end
+
+                first_install = run_script(installer, "--profile", "2", "--json", home: home)
+                File.binwrite(continue_path, "continue")
+                raise "uninstaller did not exit after the pre-delete gate" unless thread.join(10)
+                uninstall_status = thread.value
+              end
+            ensure
+              File.binwrite(continue_path, "continue") rescue nil
+              if uninstall_thread&.alive?
+                Process.kill("KILL", uninstall_thread.pid) rescue nil
+                uninstall_thread.join
+              end
+              readers.each(&:join)
+            end
+
+            first_stdout, first_stderr, first_status, = first_install
+            refute first_status.success?,
+                   "concurrent installer escaped the uninstall operation lock: #{first_stdout}\n#{first_stderr}"
+            first_result = assert_json_result(first_stdout, first_status, command: "install")
+            assert_equal "operation_in_progress", first_result.fetch("code")
+            assert uninstall_status.success?, "#{uninstall_stdout}\n#{uninstall_stderr}"
+
+            second_stdout, second_stderr, second_status, = run_script(
+              installer, "--profile", "2", "--json", home: home
+            )
+            assert second_status.success?, "#{second_stdout}\n#{second_stderr}"
+            saved_profile, saved_error, saved_status = Open3.capture3(
+              "/usr/bin/plutil", "-extract", "Profile", "raw", state
+            )
+            assert saved_status.success?, saved_error
+            assert_equal "2", saved_profile.strip
+          end
+        end
+      end
+    end
+  end
+
+  def test_production_probe_install_recovers_a_killed_ready_uninstall_before_changing_profile
+    require_production_probe!
+    patcher = <<~'RUBY'
+      backup_dir = ARGV[ARGV.index("--backup-dir") + 1] if ARGV.include?("--backup-dir")
+      ownership = File.join(backup_dir, "clashx-meta-kAutoUpdateEnable.state.json") if backup_dir
+      preference = File.join(ENV.fetch("HOME"), "auto-update-state")
+      if ARGV.include?("--print-core-status")
+        puts "supported"
+        exit 0
+      end
+      if ARGV.include?("--disable-subscription-auto-update")
+        File.write(preference, "disabled")
+        File.write(ownership, "{}") unless File.exist?(ownership)
+        puts "already_disabled"
+        exit 0
+      end
+      if ARGV.include?("--restore-owned-subscription-auto-update")
+        File.write(preference, "enabled")
+        File.delete(ownership) if File.exist?(ownership)
+        puts "restored"
+        exit 0
+      end
+      exit 0
+    RUBY
+    with_supported_mihomo_installer(patcher_source: patcher) do |installer|
+      scripts = File.dirname(installer)
+      uninstaller = File.join(scripts, "uninstall_macos.sh")
+      FileUtils.cp(UNINSTALLER, uninstaller)
+      source = File.binread(uninstaller)
+      anchor = "  for removed in \\\n"
+      assert_equal 1, source.scan(anchor).length
+      instrumented = <<~'SH'
+        /usr/bin/touch "$CLASH_PATCH_TEST_READY"
+        while [ ! -e "$CLASH_PATCH_TEST_CONTINUE" ]; do
+          /bin/sleep 60
+        done
+      SH
+      File.binwrite(uninstaller, source.sub(anchor, instrumented + anchor))
+
+      Dir.mktmpdir do |home|
+        with_supported_app(home) do
+          install_dir = File.join(home, "Library", "Application Support", "ClashPatch")
+          backup_dir = File.join(install_dir, "backups")
+          FileUtils.mkdir_p(backup_dir)
+          File.binwrite(File.join(install_dir, "patch_profiles.rb"), "owned-patcher")
+          File.binwrite(File.join(install_dir, "policy.json"), "{}")
+          state = File.join(home, "usage-profile.plist")
+          system("/usr/bin/plutil", "-create", "xml1", state)
+          system("/usr/bin/plutil", "-insert", "Version", "-integer", "1", state)
+          system("/usr/bin/plutil", "-insert", "Profile", "-integer", "3", state)
+          ownership = File.join(backup_dir, "clashx-meta-kAutoUpdateEnable.state.json")
+          preference = File.join(home, "auto-update-state")
+          File.binwrite(ownership, "{}")
+          File.binwrite(preference, "disabled")
+          ready = File.join(home, "uninstall-deleted-ready")
+          continue_path = File.join(home, "uninstall-deleted-continue")
+          env = {
+            "HOME" => home,
+            "CLASH_PATCH_USAGE_STATE_PATH" => state,
+            "CLASH_PATCH_USAGE_PROFILE" => nil,
+            "CLASH_PATCH_PROFILE_DIR" => nil,
+            "CLASH_PATCH_TEST_READY" => ready,
+            "CLASH_PATCH_TEST_CONTINUE" => continue_path
+          }
+          uninstall_thread = nil
+          begin
+            Open3.popen3(
+              env, "/bin/sh", uninstaller, "--json", pgroup: true
+            ) do |stdin, stdout, stderr, thread|
+              uninstall_thread = thread
+              stdin.close
+              deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+              until File.exist?(ready)
+                raise "uninstaller never reached the post-delete gate" if
+                  Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+                sleep 0.01
+              end
+              Process.kill("KILL", -thread.pid)
+              stdout.read
+              stderr.read
+              raise "uninstaller did not stop after the post-delete kill" unless thread.join(10)
+              refute thread.value.success?
+            end
+            File.binwrite(continue_path, "continue")
+          ensure
+            if uninstall_thread&.alive?
+              Process.kill("KILL", -uninstall_thread.pid) rescue nil
+              uninstall_thread.join
+            end
+          end
+
+          staging = File.join(install_dir, ".clash-patch-uninstall-staging")
+          assert File.file?(File.join(staging, "READY"))
+          refute File.exist?(state)
+
+          stdout, stderr, status, = run_script(
+            installer, "--profile", "2", "--json", home: home,
+            extra_env: {
+              "CLASH_PATCH_TEST_READY" => ready,
+              "CLASH_PATCH_TEST_CONTINUE" => continue_path
+            }
+          )
+          assert status.success?, "#{stdout}\n#{stderr}"
+          result = assert_json_result(stdout, status, command: "install")
+          assert_equal "install_completed", result.fetch("code")
+          refute File.exist?(staging), "installer left the interrupted uninstall pending"
+          refute File.exist?(ownership), "installer retained stale automatic-update ownership"
+          assert_equal "enabled", File.binread(preference)
+          saved_profile, saved_error, saved_status = Open3.capture3(
+            "/usr/bin/plutil", "-extract", "Profile", "raw", state
+          )
+          assert saved_status.success?, saved_error
+          assert_equal "2", saved_profile.strip
+        end
       end
     end
   end
@@ -385,6 +605,33 @@ class MacosWrapperTest < Minitest::Test
           assert_empty stderr
           result = assert_json_result(stdout, status, command: "install")
           assert_equal 1, result.fetch("profile")
+        end
+      end
+    end
+  end
+
+  def test_installer_keeps_pending_uninstall_when_recovery_program_is_missing
+    with_supported_mihomo_installer do |installer|
+      Dir.mktmpdir do |home|
+        with_supported_app(home) do
+          staging = File.join(
+            home, "Library", "Application Support", "ClashPatch",
+            ".clash-patch-uninstall-staging"
+          )
+          FileUtils.mkdir_p(staging)
+          File.binwrite(File.join(staging, "READY"), "")
+
+          stdout, stderr, status, state = run_script(
+            installer, "--profile", "2", "--json", home: home
+          )
+
+          assert_equal 6, status.exitstatus
+          assert_empty stderr
+          result = assert_json_result(stdout, status, command: "install")
+          assert_equal "uninstall_recovery", result.fetch("operation")
+          assert_equal "uninstall_recovery_failed", result.fetch("code")
+          assert File.file?(File.join(staging, "READY"))
+          refute File.exist?(state)
         end
       end
     end
@@ -642,7 +889,9 @@ class MacosWrapperTest < Minitest::Test
           process_thread = nil
           child_pid = nil
           begin
-            Open3.popen3(env, "/bin/sh", installer, "--profile", "3") do |stdin, stdout, stderr, thread|
+            Open3.popen3(
+              env, "/bin/sh", installer, "--profile", "3", pgroup: true
+            ) do |stdin, stdout, stderr, thread|
               process_thread = thread
               stdin.close
               deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
@@ -652,8 +901,7 @@ class MacosWrapperTest < Minitest::Test
                 sleep 0.01
               end
               child_pid = Integer(File.read(File.join(home, "patcher-pid")))
-              Process.kill("KILL", thread.pid)
-              Process.kill("KILL", child_pid)
+              Process.kill("KILL", -thread.pid)
               stdout.read
               stderr.read
               raise "installer did not stop after SIGKILL" unless thread.join(10)
@@ -666,8 +914,8 @@ class MacosWrapperTest < Minitest::Test
               nil
             end
             begin
-              Process.kill("KILL", process_thread.pid) if process_thread&.alive?
-            rescue Errno::ESRCH
+              Process.kill("KILL", -process_thread.pid) if process_thread&.alive?
+            rescue Errno::ESRCH, Errno::EPERM
               nil
             end
           end

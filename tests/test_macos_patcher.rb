@@ -12,6 +12,7 @@ ROOT = File.expand_path("..", __dir__)
 PATCHER_PATH = File.join(ROOT, "clash-patch/scripts/macos/patch_profiles.rb")
 ROUTE_VERIFIER_PATH = File.join(ROOT, "clash-patch/scripts/macos/verify_routes.rb")
 RESULT_CONTRACT_PATH = File.join(ROOT, "clash-patch/scripts/macos/result_contract.rb")
+OPERATION_LOCK_PATH = File.join(ROOT, "clash-patch/scripts/macos/operation_lock.rb")
 POLICY_PATH = File.join(ROOT, "clash-patch/references/policy.json")
 MAIN_GROUP_FIXTURES = File.join(ROOT, "tests/fixtures/main_group_cases.json")
 PATCHER_AVAILABLE = File.file?(PATCHER_PATH) && File.file?(POLICY_PATH)
@@ -36,6 +37,7 @@ RUBY
 
 require PATCHER_PATH if PATCHER_AVAILABLE
 require ROUTE_VERIFIER_PATH if File.file?(ROUTE_VERIFIER_PATH)
+require OPERATION_LOCK_PATH if File.file?(OPERATION_LOCK_PATH)
 
 class MacosPatcherTest < Minitest::Test
   def setup
@@ -71,6 +73,78 @@ class MacosPatcherTest < Minitest::Test
     Open3.capture3(
       environment, RbConfig.ruby, "-e", CHILD_COVERAGE_RUNNER, path, *arguments
     )
+  end
+
+  def test_wrapper_operation_lock_serializes_mutations_and_uses_private_permissions
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "backups", ".clash-patch-wrapper.lock")
+      first = ClashPatchOperationLock.acquire(path)
+      begin
+        second = Thread.new do
+          ClashPatchOperationLock.acquire(path, timeout_seconds: 0.1)
+        end.value
+        assert_nil second
+        assert_equal 0o600, File.stat(path).mode & 0o777
+        assert_equal 0o700, File.stat(File.dirname(path)).mode & 0o777
+      ensure
+        first.close
+      end
+    end
+  end
+
+  def test_wrapper_operation_lock_rejects_links_and_reports_run_outcomes
+    Dir.mktmpdir do |directory|
+      real_directory = File.join(directory, "real")
+      linked_directory = File.join(directory, "linked")
+      FileUtils.mkdir_p(real_directory)
+      File.symlink(real_directory, linked_directory)
+      assert_raises(IOError) do
+        ClashPatchOperationLock.acquire(File.join(linked_directory, "lock"))
+      end
+
+      lock_path = File.join(real_directory, "lock")
+      File.write(lock_path, "link-target")
+      linked_lock = File.join(real_directory, "linked-lock")
+      File.symlink(lock_path, linked_lock)
+      assert_raises(IOError) { ClashPatchOperationLock.acquire(linked_lock) }
+
+      assert_equal(
+        ClashPatchOperationLock::BUSY_EXIT,
+        ClashPatchOperationLock.stub(:acquire, nil) do
+          ClashPatchOperationLock.run([lock_path, "/usr/bin/true"])
+        end
+      )
+      assert_equal(
+        ClashPatchOperationLock::FAILED_EXIT,
+        ClashPatchOperationLock.stub(:acquire, ->(_path) { raise IOError, "injected" }) do
+          ClashPatchOperationLock.run([lock_path, "/usr/bin/true"])
+        end
+      )
+      assert_equal(
+        ClashPatchOperationLock::FAILED_EXIT,
+        ClashPatchOperationLock.run([])
+      )
+    end
+  end
+
+  def test_wrapper_operation_lock_executes_with_an_inherited_descriptor
+    Dir.mktmpdir do |directory|
+      lock_path = File.join(directory, "lock")
+      executed = nil
+      original_marker = ENV[ClashPatchOperationLock::HELD_ENV]
+      begin
+        ClashPatchOperationLock.stub(:exec, ->(*command) { executed = command }) do
+          assert_equal 0, ClashPatchOperationLock.run([lock_path, "/usr/bin/true", "argument"])
+        end
+        assert_equal ["/usr/bin/true", "argument"], executed
+        assert_equal "1", ENV[ClashPatchOperationLock::HELD_ENV]
+        assert_equal ["example"], ClashPatchOperationLock.stub(:exec, ->(*command) { command }) {
+          ClashPatchOperationLock.execute(["example"])
+        }
+      ensure
+        ENV[ClashPatchOperationLock::HELD_ENV] = original_marker
+      end
+    end
   end
 
   def test_production_probe_normal_batch_restores_a_commit_when_bookkeeping_raises
