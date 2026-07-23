@@ -166,8 +166,17 @@ function Backup-Versioned(
     }
     $key = Get-PathKey $Path
     $basename = Split-Path -Leaf $Path
-    $stamp = (Get-Date).ToString("yyyy-MM-dd_HH-mm-ss.fffffffzzz").Replace(":", "")
-    $destination = Join-Path $BackupRoot ("$stamp--$Reason--$key--$basename.backup")
+    $stampTime = Get-Date
+    $destination = $null
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+        $stamp = $stampTime.AddTicks($attempt).ToString("yyyy-MM-dd_HH-mm-ss.fffffffzzz").Replace(":", "")
+        $candidate = Join-Path $BackupRoot ("$stamp--$Reason--$key--$basename.backup")
+        if (-not (Test-Path -LiteralPath $candidate)) {
+            $destination = $candidate
+            break
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($destination)) { throw "无法生成唯一的备份编号。" }
     $sourceStream = $null
     $backupStream = $null
     $created = $false
