@@ -111,6 +111,7 @@ module ClashPatch
       restore_backup: nil,
       expected_current_sha256: nil,
       safe_update_all: false,
+      recover_profile_transaction: false,
       usage_profile: nil,
       json: json_mode,
       help: false
@@ -134,6 +135,7 @@ module ClashPatch
       opts.on("--restore-backup ID", "恢复指定备份") { |value| options[:restore_backup] = value }
       opts.on("--expected-current-sha256 SHA256", "恢复前要求当前配置哈希匹配") { |value| options[:expected_current_sha256] = value }
       opts.on("--safe-update-all", "安全更新当前存储位置中的全部远程订阅") { options[:safe_update_all] = true }
+      opts.on("--recover-profile-transaction", "恢复未完成的配置事务及当前运行配置") { options[:recover_profile_transaction] = true }
       opts.on("--usage-profile N", Integer, "补丁与安全更新采用的用途档位") { |value| options[:usage_profile] = value }
       opts.on("--json", "输出 JSON v1 结果") { options[:json] = true }
       opts.on("-h", "--help", "显示帮助") do
@@ -278,6 +280,30 @@ module ClashPatch
         changes: snapshots.empty? ? [] : ["initial_snapshot"]
       ) if options[:json]
       snapshots.each { |path| puts File.basename(path) }
+      return 0
+    end
+
+    if options[:recover_profile_transaction]
+      result = recover_pending_profile_transaction(
+        options[:backup_root], directories: directories
+      )
+      if result == :runtime_restore_pending
+        return emit_cli_result(
+          operation: "recover_profile_transaction", exit_code: 1, status: "partial",
+          code: "profile_transaction_runtime_pending",
+          summary_zh: "配置文件已恢复，但当前运行配置未能恢复。"
+        ) if options[:json]
+        warn "配置文件已恢复，但当前运行配置未能恢复。"
+        return 1
+      end
+      return emit_cli_result(
+        operation: "recover_profile_transaction", exit_code: 0,
+        status: result == :recovered ? "ok" : "no_change",
+        code: result == :recovered ? "profile_transaction_recovered" : "no_pending_transaction",
+        summary_zh: result == :recovered ? "未完成的配置事务已恢复。" : "没有未完成的配置事务。",
+        changes: result == :recovered ? ["profiles", "runtime_config"] : []
+      ) if options[:json]
+      puts result
       return 0
     end
 

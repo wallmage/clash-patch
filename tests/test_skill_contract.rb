@@ -1060,6 +1060,36 @@ class SkillContractTest < Minitest::Test
     assert_includes installer, "uninstall_recovery_failed"
   end
 
+  def test_macos_uninstall_recovers_pending_profile_transactions_before_writing
+    uninstaller = File.read(File.join(SKILL, "scripts/uninstall_macos.sh"))
+    patcher = mac_patcher_source
+    recovery = uninstaller.index("\nrecover_pending_profile_transaction\n")
+    uninstall_recovery = uninstaller.index("\nrestore_uncommitted_uninstall\n", recovery)
+    first_removal = uninstaller.index("\nremove_owned_agent ", recovery)
+
+    refute_nil recovery
+    refute_nil uninstall_recovery
+    refute_nil first_removal
+    assert_operator recovery, :<, uninstall_recovery
+    assert_operator recovery, :<, first_removal
+    assert_includes uninstaller, "--recover-profile-transaction"
+    assert_includes uninstaller, "profile_transaction_recovery_failed"
+    assert_includes patcher, "--recover-profile-transaction"
+
+    documents = [
+      File.read(File.join(ROOT, "README.md")),
+      File.read(File.join(SKILL, "SKILL.md")),
+      File.read(File.join(SKILL, "references/patch-policy.md")),
+      File.read(File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md"))
+    ]
+    documents.each do |document|
+      assert_includes document, "macOS 安全卸载"
+      assert_includes document, "发现未完成的配置事务"
+      assert_includes document, "恢复订阅自动更新之前"
+      assert_includes document, "自动更新所有权"
+    end
+  end
+
   def test_windows_failed_safe_update_rollback_deletes_manifest_in_the_same_transaction
     installer = File.read(File.join(SKILL, "scripts/install_windows.ps1"))
     safe_update = File.read(
@@ -1475,6 +1505,7 @@ class SkillContractTest < Minitest::Test
       test_production_probe_install_recovers_a_killed_ready_uninstall_before_changing_profile
       test_production_probe_shared_wrapper_lock_prevents_uninstall_from_deleting_a_concurrent_install
       test_production_probe_uninstall_preserves_a_file_replaced_after_staging
+      test_production_probe_uninstall_recovers_a_killed_profile_transaction_before_enabling_updates
     ]
     expected_windows = [
       "Mihomo candidate privacy and cleanup after caller death",

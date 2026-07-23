@@ -429,6 +429,178 @@ class MacosWrapperTest < Minitest::Test
     end
   end
 
+  def test_production_probe_uninstall_recovers_a_killed_profile_transaction_before_enabling_updates
+    require_production_probe!
+    patcher = <<~'RUBY'
+      require "fileutils"
+
+      backup_dir = ARGV[ARGV.index("--backup-dir") + 1] if ARGV.include?("--backup-dir")
+      profile_dir = ARGV[ARGV.index("--profile-dir") + 1] if ARGV.include?("--profile-dir")
+      profile = File.join(profile_dir, "friend.yaml") if profile_dir
+      transaction = File.join(backup_dir, ".clash-patch-profile-transaction.json") if backup_dir
+      ownership = File.join(backup_dir, "clashx-meta-kAutoUpdateEnable.state.json") if backup_dir
+      preference = File.join(ENV.fetch("HOME"), "auto-update-state")
+      runtime = File.join(ENV.fetch("HOME"), "runtime-profile")
+      original = File.join(ENV.fetch("HOME"), "original-profile")
+
+      if ARGV.include?("--print-core-status")
+        puts "supported"
+        exit 0
+      end
+      exit 0 if ARGV.include?("--snapshot-initial")
+      if ARGV.include?("--disable-subscription-auto-update")
+        FileUtils.mkdir_p(backup_dir)
+        File.binwrite(ownership, "{}") unless File.exist?(ownership)
+        File.binwrite(preference, "disabled")
+        puts "disabled"
+        exit 0
+      end
+      if ARGV.include?("--recover-profile-transaction")
+        File.binwrite(profile, File.binread(original))
+        File.binwrite(runtime, "original")
+        File.delete(transaction)
+        puts "recovered"
+        exit 0
+      end
+      if ARGV.include?("--restore-owned-subscription-auto-update")
+        File.binwrite(preference, "enabled")
+        File.delete(ownership) if File.exist?(ownership)
+        puts "restored"
+        exit 0
+      end
+
+      File.binwrite(transaction, "pending")
+      File.binwrite(profile, "candidate")
+      File.binwrite(runtime, "candidate")
+      File.binwrite(ENV.fetch("CLASH_PATCH_TEST_READY"), "ready")
+      sleep 60
+    RUBY
+    with_supported_mihomo_installer(patcher_source: patcher) do |installer|
+      scripts = File.dirname(installer)
+      uninstaller = File.join(scripts, "uninstall_macos.sh")
+      FileUtils.cp(UNINSTALLER, uninstaller)
+
+      Dir.mktmpdir do |home|
+        with_supported_app(home) do
+          profile_dir = File.join(home, "profiles")
+          FileUtils.mkdir_p(profile_dir)
+          profile = File.join(profile_dir, "friend.yaml")
+          File.binwrite(profile, "original")
+          File.binwrite(File.join(home, "original-profile"), "original")
+          File.binwrite(File.join(home, "runtime-profile"), "original")
+          File.binwrite(File.join(home, "auto-update-state"), "enabled")
+          ready = File.join(home, "profile-transaction-ready")
+          state = File.join(home, "usage-profile.plist")
+          env = {
+            "HOME" => home,
+            "CLASH_PATCH_USAGE_STATE_PATH" => state,
+            "CLASH_PATCH_USAGE_PROFILE" => nil,
+            "CLASH_PATCH_PROFILE_DIR" => profile_dir,
+            "CLASH_PATCH_TEST_READY" => ready
+          }
+          process_thread = nil
+          readers = []
+          begin
+            Open3.popen3(
+              env, "/bin/sh", installer, "--profile", "3", "--json", pgroup: true
+            ) do |stdin, stdout, stderr, thread|
+              process_thread = thread
+              stdin.close
+              readers << Thread.new { stdout.read rescue nil }
+              readers << Thread.new { stderr.read rescue nil }
+              deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+              until File.exist?(ready)
+                raise "installer never reached the profile transaction gate" if
+                  Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+                sleep 0.01
+              end
+              Process.kill("KILL", -thread.pid)
+              raise "installer did not stop after profile transaction kill" unless thread.join(10)
+              refute thread.value.success?
+            end
+          ensure
+            Process.kill("KILL", -process_thread.pid) rescue nil
+            process_thread&.join
+            readers.each(&:join)
+          end
+
+          backup_dir = File.join(home, "Library", "Application Support", "ClashPatch", "backups")
+          transaction = File.join(backup_dir, ".clash-patch-profile-transaction.json")
+          ownership = File.join(backup_dir, "clashx-meta-kAutoUpdateEnable.state.json")
+          preference = File.join(home, "auto-update-state")
+          runtime = File.join(home, "runtime-profile")
+          assert File.file?(transaction)
+          assert_equal "candidate", File.binread(profile)
+          assert_equal "candidate", File.binread(runtime)
+          assert_equal "disabled", File.binread(preference)
+          assert File.file?(ownership)
+
+          stdout, stderr, status, = run_script(
+            uninstaller, "--json", home: home,
+            extra_env: { "CLASH_PATCH_PROFILE_DIR" => profile_dir }
+          )
+
+          assert status.success?, "#{stdout}\n#{stderr}"
+          result = assert_json_result(stdout, status, command: "uninstall")
+          assert_equal "uninstall_completed", result.fetch("code")
+          assert_equal "original", File.binread(profile)
+          assert_equal "original", File.binread(runtime)
+          refute File.exist?(transaction)
+          assert_equal "enabled", File.binread(preference)
+          refute File.exist?(ownership)
+          refute File.exist?(state)
+        end
+      end
+    end
+  end
+
+  def test_uninstaller_preserves_everything_when_profile_transaction_recovery_fails
+    patcher = <<~'RUBY'
+      if ARGV.include?("--recover-profile-transaction")
+        exit 1
+      end
+      if ARGV.include?("--restore-owned-subscription-auto-update")
+        File.binwrite(File.join(ENV.fetch("HOME"), "unexpected-auto-update-restore"), "called")
+        puts "restored"
+        exit 0
+      end
+      exit 1
+    RUBY
+    with_uninstaller_package(patcher_source: patcher) do |uninstaller|
+      Dir.mktmpdir do |home|
+        install_dir = File.join(home, "Library", "Application Support", "ClashPatch")
+        backup_dir = File.join(install_dir, "backups")
+        profile_dir = File.join(home, "profiles")
+        FileUtils.mkdir_p(backup_dir)
+        FileUtils.mkdir_p(profile_dir)
+        protected_files = {
+          File.join(install_dir, "patch_profiles.rb") => "owned-patcher",
+          File.join(install_dir, "policy.json") => "{}",
+          File.join(home, "usage-profile.plist") => "owned-usage-state",
+          File.join(backup_dir, "clashx-meta-kAutoUpdateEnable.state.json") => "{}",
+          File.join(backup_dir, ".clash-patch-profile-transaction.json") => "pending",
+          File.join(profile_dir, "friend.yaml") => "candidate",
+          File.join(home, "auto-update-state") => "disabled"
+        }
+        protected_files.each { |path, bytes| File.binwrite(path, bytes) }
+
+        stdout, stderr, status, = run_script(
+          uninstaller, "--json", home: home,
+          extra_env: { "CLASH_PATCH_PROFILE_DIR" => profile_dir }
+        )
+
+        refute status.success?, "#{stdout}\n#{stderr}"
+        result = assert_json_result(stdout, status, command: "uninstall")
+        assert_equal "profile_transaction_recovery_failed", result.fetch("code")
+        protected_files.each do |path, bytes|
+          assert_equal bytes, File.binread(path), "uninstaller changed #{File.basename(path)}"
+        end
+        refute File.exist?(File.join(home, "unexpected-auto-update-restore"))
+        refute File.exist?(File.join(install_dir, ".clash-patch-uninstall-staging"))
+      end
+    end
+  end
+
   def test_uninstaller_resumes_after_kill_during_file_restore
     patcher = <<~'RUBY'
       backup_dir = ARGV[ARGV.index("--backup-dir") + 1] if ARGV.include?("--backup-dir")

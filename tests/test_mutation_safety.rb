@@ -1236,6 +1236,25 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_macos_uninstall_pending_profile_recovery_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/uninstall_macos.sh",
+        "recover_pending_profile_transaction\nrestore_uncommitted_uninstall",
+        ": # mutant: skip pending profile recovery\nrestore_uncommitted_uninstall"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        "/usr/bin/env", "CLASH_PATCH_RUN_PRODUCTION_PROBES=1",
+        RbConfig.ruby, "tests/test_macos_wrappers.rb",
+        "--name",
+        "test_production_probe_uninstall_recovers_a_killed_profile_transaction_before_enabling_updates"
+      )
+    end
+  end
+
   def test_macos_uninstall_atomic_restore_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

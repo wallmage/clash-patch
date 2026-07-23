@@ -286,6 +286,21 @@ module ClashPatch
     :recovered
   end
 
+  def recover_pending_profile_transaction(backup_root, directories:, selected_name: nil)
+    operation_lock = profile_operation_lock(backup_root)
+    return :none unless profile_transaction_pending?(backup_root)
+
+    selected = selected_name.nil? ? selected_profile_name : selected_name
+    active_root = active_profile_root(directories, selected)
+    work_items = profile_work_items(directories, selected, active_root)
+    resume_profile_transaction(
+      backup_root, roots: directories, work_items: work_items, reload_runtime: true,
+      require_tun: :preserve
+    )
+  ensure
+    operation_lock&.close
+  end
+
   def patch_path_once(path, policy, dry_run:, backup_root:, validator:, usage_profile: 3,
                       capture_transaction: false, expected_original: nil)
     write_path = File.realpath(path)

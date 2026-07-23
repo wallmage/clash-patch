@@ -4,6 +4,7 @@ set -f
 
 INSTALL_DIR="$HOME/Library/Application Support/ClashPatch"
 BACKUP_DIR="$INSTALL_DIR/backups"
+CUSTOM_PROFILE_DIR="${CLASH_PATCH_PROFILE_DIR:-}"
 STATE_PATH="$INSTALL_DIR/install-state.plist"
 USAGE_STATE_PATH="${CLASH_PATCH_USAGE_STATE_PATH:-$INSTALL_DIR/usage-profile.plist}"
 CURRENT_LABEL="com.clashpatch.profiles"
@@ -21,6 +22,7 @@ AUTO_UPDATE_OWNERSHIP_PATH="$BACKUP_DIR/clashx-meta-kAutoUpdateEnable.state.json
 OPERATION_LOCK_PATH="$BACKUP_DIR/.clash-patch-wrapper.lock"
 JSON_OUTPUT=0
 UNINSTALL_STAGING="$INSTALL_DIR/.clash-patch-uninstall-staging"
+PROFILE_TRANSACTION_PATH="$BACKUP_DIR/.clash-patch-profile-transaction.json"
 OPERATION_LOCK_REQUIRED=1
 
 unexpected_uninstall_exit() {
@@ -194,6 +196,37 @@ restore_uncommitted_uninstall() {
   /bin/rm -rf "$UNINSTALL_STAGING"
 }
 
+recover_pending_profile_transaction() {
+  if [ ! -e "$PROFILE_TRANSACTION_PATH" ] && [ ! -L "$PROFILE_TRANSACTION_PATH" ]; then
+    return 0
+  fi
+  [ -f "$PATCHER_SOURCE" ] && [ ! -L "$PATCHER_SOURCE" ] ||
+    finish 6 failed incomplete_package "安装包不完整，无法恢复未完成的配置事务。"
+
+  set +e
+  if [ -n "$CUSTOM_PROFILE_DIR" ]; then
+    profile_recovery=$(/usr/bin/ruby "$PATCHER_SOURCE" \
+      --profile-dir "$CUSTOM_PROFILE_DIR" --backup-dir "$BACKUP_DIR" \
+      --recover-profile-transaction 2>/dev/null)
+  else
+    profile_recovery=$(/usr/bin/ruby "$PATCHER_SOURCE" \
+      --backup-dir "$BACKUP_DIR" --recover-profile-transaction 2>/dev/null)
+  fi
+  profile_recovery_status=$?
+  set -e
+  if [ "$profile_recovery_status" -ne 0 ]; then
+    finish 1 failed profile_transaction_recovery_failed "未完成的配置事务无法恢复；未继续卸载。"
+  fi
+  case "$profile_recovery" in
+    recovered|none) ;;
+    *) finish 1 failed profile_transaction_recovery_failed "配置事务恢复结果异常；未继续卸载。" ;;
+  esac
+  if [ -e "$PROFILE_TRANSACTION_PATH" ] || [ -L "$PROFILE_TRANSACTION_PATH" ]; then
+    finish 1 failed profile_transaction_recovery_failed "配置事务恢复记录仍然存在；未继续卸载。"
+  fi
+  say "已先恢复上次中断的配置事务和当前运行配置。"
+}
+
 restore_slot() {
   slot=$1
   destination=$2
@@ -314,6 +347,7 @@ if [ "$USER_ID" -eq 0 ]; then
   finish 2 invalid_request root_not_allowed "请用当前登录用户直接运行。"
 fi
 
+recover_pending_profile_transaction
 restore_uncommitted_uninstall
 
 remove_owned_agent "$CURRENT_PLIST" "$CURRENT_LABEL" "$CURRENT_PATCHER"

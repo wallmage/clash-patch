@@ -5422,6 +5422,41 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_pending_profile_transaction_recovery_restores_the_running_profile
+    Dir.mktmpdir do |directory|
+      backup_root = File.join(directory, "backups")
+      profile = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config.merge("subscription-marker" => "original"))
+      candidate = YAML.dump(base_config.merge("subscription-marker" => "candidate"))
+      File.binwrite(profile, original)
+      ClashPatch.prepare_profile_transaction(
+        [{ path: profile, original: original, candidate: candidate }], backup_root
+      )
+      File.binwrite(profile, candidate)
+      runtime_reloaded = false
+
+      ClashPatch.stub(:selected_profile_name, "friend") do
+        ClashPatch.stub(:active_profile_root, directory) do
+          reload = lambda do |work_items, require_tun:, **_arguments|
+            runtime_reloaded = true
+            assert_equal :preserve, require_tun
+            assert_equal [profile], work_items.select { |item| item.fetch(:active) }.map { |item| item.fetch(:path) }
+            true
+          end
+          ClashPatch.stub(:reload_recovered_profile_runtime, reload) do
+            assert_equal :recovered, ClashPatch.recover_pending_profile_transaction(
+              backup_root, directories: [directory]
+            )
+          end
+        end
+      end
+
+      assert runtime_reloaded
+      assert_equal original.b, File.binread(profile)
+      refute File.exist?(ClashPatch.profile_transaction_path(backup_root))
+    end
+  end
+
   def test_profile_transaction_recovery_normalizes_invalid_base64
     Dir.mktmpdir do |directory|
       root = File.join(directory, "backups")
@@ -5811,7 +5846,74 @@ class MacosPatcherTest < Minitest::Test
     output, error = capture_io { assert_equal 0, ClashPatch.cli(["--help"]) }
 
     assert_includes output, "--safe-update-all"
+    assert_includes output, "--recover-profile-transaction"
     assert_empty error
+  end
+
+  def test_cli_recovers_a_pending_profile_transaction_for_uninstall
+    Dir.mktmpdir do |directory|
+      backup_root = File.join(directory, "backups")
+      calls = []
+      recovery = lambda do |root, directories:|
+        calls << [root, directories]
+        :recovered
+      end
+      ClashPatch.stub(:recover_pending_profile_transaction, recovery) do
+        output, error = capture_io do
+          assert_equal 0, ClashPatch.cli([
+            "--profile-dir", directory, "--backup-dir", backup_root,
+            "--recover-profile-transaction"
+          ])
+        end
+        assert_empty error
+        assert_equal "recovered\n", output
+      end
+      assert_equal [[backup_root, [directory]]], calls
+
+      ClashPatch.stub(:recover_pending_profile_transaction, :recovered) do
+        output, error = capture_io do
+          assert_equal 0, ClashPatch.cli([
+            "--json", "--profile-dir", directory, "--backup-dir", backup_root,
+            "--recover-profile-transaction"
+          ])
+        end
+        assert_empty error
+        result = JSON.parse(output)
+        assert_equal "profile_transaction_recovered", result.fetch("code")
+        assert_equal ["profiles", "runtime_config"], result.fetch("changes")
+      end
+      ClashPatch.stub(:recover_pending_profile_transaction, :none) do
+        output, error = capture_io do
+          assert_equal 0, ClashPatch.cli([
+            "--json", "--profile-dir", directory, "--backup-dir", backup_root,
+            "--recover-profile-transaction"
+          ])
+        end
+        assert_empty error
+        result = JSON.parse(output)
+        assert_equal "no_change", result.fetch("status")
+        assert_empty result.fetch("changes")
+      end
+      ClashPatch.stub(:recover_pending_profile_transaction, :runtime_restore_pending) do
+        _output, error = capture_io do
+          assert_equal 1, ClashPatch.cli([
+            "--profile-dir", directory, "--backup-dir", backup_root,
+            "--recover-profile-transaction"
+          ])
+        end
+        assert_includes error, "运行配置"
+      end
+      ClashPatch.stub(:recover_pending_profile_transaction, :runtime_restore_pending) do
+        output, error = capture_io do
+          assert_equal 1, ClashPatch.cli([
+            "--json", "--profile-dir", directory, "--backup-dir", backup_root,
+            "--recover-profile-transaction"
+          ])
+        end
+        assert_empty error
+        assert_equal "profile_transaction_runtime_pending", JSON.parse(output).fetch("code")
+      end
+    end
   end
 
   def test_cli_reports_missing_profile_directories
