@@ -1386,6 +1386,17 @@ class SkillContractTest < Minitest::Test
     assert_includes plan, '@{ Operation = "write"; Action = $action; Snapshot = $snapshot }'
   end
 
+  def test_windows_managed_script_suffix_cannot_rebind_main
+    source = File.binread(
+      File.join(SKILL, "scripts/windows/install_windows/script_js.ps1")
+    ).force_encoding("UTF-8")
+
+    assert_includes source, "function Assert-JavaScriptDoesNotBindMain"
+    assert_includes source, 'Assert-JavaScriptDoesNotBindMain $suffix'
+    assert_includes source, '(?:function|class|var|let|const)'
+    assert_includes source, '(?<![A-Za-z0-9_$.])main\s*='
+  end
+
   def test_macos_production_probe_runner_executes_all_cases_and_propagates_any_failure
     runner = File.join(ROOT, "tests/run_macos_production_probes.rb")
     assert File.file?(runner), "macOS production probes need one behaviorally testable CI runner"

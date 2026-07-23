@@ -3391,6 +3391,23 @@ try {
     [System.IO.File]::WriteAllText($composedPath, $composedWithSuffix)
     Invoke-Installer $composeCase
     Assert-True ((Get-Content -LiteralPath $composedPath -Raw).Contains("const friendAfterPatch = true;")) "reinstall discarded code after the managed block"
+    $safeComposedBytes = [System.IO.File]::ReadAllBytes($composedPath)
+    [System.IO.File]::AppendAllText(
+        $composedPath,
+        "function main(config) { config.suffixMain = true; return config; }`r`n"
+    )
+    $reboundBytes = [System.IO.File]::ReadAllBytes($composedPath)
+    $reboundResult = Invoke-TestPowerShell $installer @(
+        "-AppHome", $composeCase,
+        "-UsageProfile", "3",
+        "-MihomoPath", $fakeCore
+    )
+    Assert-True ($reboundResult.ExitCode -eq 1) "reinstall accepted a main binding after the managed block"
+    Assert-True (
+        [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($composedPath)) -ceq
+            [Convert]::ToBase64String($reboundBytes)
+    ) "rejected suffix main changed Script.js"
+    [System.IO.File]::WriteAllBytes($composedPath, $safeComposedBytes)
     if ($onWindows) {
         $generatedScriptHarness = Join-Path $sandbox "run-generated-script.js"
         $generatedScriptHarnessSource = @'

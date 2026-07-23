@@ -1076,7 +1076,7 @@ test('Windows installer is split into side-effect-free modules with stable funct
     ],
     'script_js.ps1': [
       'Get-JavaScriptAnalysis', 'Rename-JavaScriptMain', 'Assert-JavaScriptReservedIdentifiers',
-      'Assert-JavaScriptCanCompose', 'Build-GlobalScript'
+      'Assert-JavaScriptDoesNotBindMain', 'Assert-JavaScriptCanCompose', 'Build-GlobalScript'
     ],
     'safe_update.ps1': ['Get-BackupTarget', 'Test-RestoreCandidate', 'Get-SafeUpdateRecoveryItems', 'Restore-SafeUpdateFiles']
   };

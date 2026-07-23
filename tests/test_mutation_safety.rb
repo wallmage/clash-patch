@@ -710,6 +710,23 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_windows_suffix_main_guard_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/windows/install_windows/script_js.ps1",
+        "                Assert-JavaScriptDoesNotBindMain $suffix\n",
+        "                Assert-JavaScriptReservedIdentifiers $suffix\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_skill_contract.rb",
+        "--name", "test_windows_managed_script_suffix_cannot_rebind_main"
+      )
+    end
+  end
+
   def test_windows_public_uninstall_kill_probe_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

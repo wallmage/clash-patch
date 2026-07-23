@@ -85,6 +85,15 @@ function Assert-JavaScriptReservedIdentifiers([string]$Text) {
     }
 }
 
+function Assert-JavaScriptDoesNotBindMain([string]$Text) {
+    $code = (Get-JavaScriptAnalysis $Text).Code
+    $declaration = '(?m)(?:^|[;{}])\s*(?:async\s+)?(?:function|class|var|let|const)\s+main\b'
+    $assignment = '(?<![A-Za-z0-9_$.])main\s*='
+    if ([regex]::IsMatch($code, $declaration) -or [regex]::IsMatch($code, $assignment)) {
+        throw "受管块之后不能重新定义 main；原脚本没有被修改。"
+    }
+}
+
 function Assert-JavaScriptCanCompose([string]$Text) {
     $analysis = Get-JavaScriptAnalysis $Text
     if ([regex]::IsMatch($analysis.Code, '(?m)^\s*async\s+function\s+main\s*\(')) {
@@ -138,7 +147,10 @@ function Build-GlobalScript(
                 Assert-JavaScriptCanCompose $restoredPrefix
                 $prefix = Rename-JavaScriptMain $restoredPrefix "main" "clashPatchPreviousMain"
             }
-            if (-not [string]::IsNullOrWhiteSpace($suffix)) { Assert-JavaScriptReservedIdentifiers $suffix }
+            if (-not [string]::IsNullOrWhiteSpace($suffix)) {
+                Assert-JavaScriptReservedIdentifiers $suffix
+                Assert-JavaScriptDoesNotBindMain $suffix
+            }
         } elseif (-not [string]::IsNullOrWhiteSpace($current)) {
             Assert-JavaScriptCanCompose $current
             $prefix = (Rename-JavaScriptMain $current "main" "clashPatchPreviousMain").TrimEnd()
