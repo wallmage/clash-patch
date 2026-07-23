@@ -2486,7 +2486,6 @@ try {
             "verge.yaml",
             "profiles.yaml",
             "profiles\Script.js",
-            "clash-patch-install-state.json",
             "clash-patch-usage-profile.json"
         ) | ForEach-Object { Join-Path $publicUninstallCrashHome $_ }
         $publicUninstallSnapshots = @{}
