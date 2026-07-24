@@ -1110,6 +1110,90 @@ class MacosWrapperTest < Minitest::Test
     end
   end
 
+  def test_signal_after_profile_commit_preserves_outer_profile_state
+    patcher = <<~'RUBY'
+      home = ENV.fetch("HOME")
+      File.open(File.join(home, "patcher-calls.log"), "a") { |file| file.puts(ARGV.join(" ")) }
+      if ARGV.include?("--print-core-status")
+        puts "supported"
+        exit 0
+      end
+      if ARGV.include?("--disable-subscription-auto-update")
+        File.write(File.join(home, "auto-update-owned"), "disabled")
+        puts "disabled"
+        exit 0
+      end
+      if ARGV.include?("--restore-owned-subscription-auto-update")
+        File.delete(File.join(home, "auto-update-owned")) if File.exist?(File.join(home, "auto-update-owned"))
+        puts "restored"
+        exit 0
+      end
+      exit 0 if ARGV.include?("--snapshot-initial")
+      profile_index = ARGV.index("--usage-profile")
+      profile = ARGV.fetch(profile_index + 1)
+      operation = ARGV.include?("--safe-update-all") ? "safe-update" : "install"
+      File.write(File.join(home, "#{operation}-committed"), profile)
+      if ENV["CLASH_PATCH_TEST_SIGNAL_SCOPE"] == "group"
+        Process.kill("TERM", -Process.getpgrp)
+      else
+        Process.kill("TERM", Process.ppid)
+      end
+      exit 0
+    RUBY
+    with_supported_mihomo_installer(patcher_source: patcher) do |installer|
+      %w[install safe-update].each do |operation|
+        %w[parent group].each do |signal_scope|
+          [false, true].each do |json|
+            Dir.mktmpdir do |home|
+              with_supported_app(home) do
+                state = File.join(home, "usage-profile.plist")
+                system("/usr/bin/plutil", "-create", "xml1", state)
+                system("/usr/bin/plutil", "-insert", "Version", "-integer", "1", state)
+                system("/usr/bin/plutil", "-insert", "Profile", "-integer", "1", state)
+                arguments = ["--profile", "3"]
+                arguments.unshift("--safe-update") if operation == "safe-update"
+                arguments << "--json" if json
+                env = {
+                  "HOME" => home,
+                  "CLASH_PATCH_USAGE_STATE_PATH" => state,
+                  "CLASH_PATCH_USAGE_PROFILE" => nil,
+                  "CLASH_PATCH_PROFILE_DIR" => nil,
+                  "CLASH_PATCH_TEST_SIGNAL_SCOPE" => signal_scope
+                }
+
+                stdout, _stderr, status = Open3.capture3(
+                  env, "/bin/sh", installer, *arguments, pgroup: true
+                )
+
+                assert_equal 143, status.exitstatus
+                if json
+                  result = assert_json_result(stdout, status, command: "install")
+                  assert_equal "partial", result.fetch("status")
+                  expected_code = if signal_scope == "group"
+                                    "operation_interrupted_recovery_intent"
+                                  else
+                                    "operation_committed_interrupted"
+                                  end
+                  assert_equal expected_code, result.fetch("code")
+                end
+                assert_equal "3", File.read(File.join(home, "#{operation}-committed"))
+                assert File.exist?(File.join(home, "auto-update-owned"))
+                saved_profile, error, read_status = Open3.capture3(
+                  "/usr/bin/plutil", "-extract", "Profile", "raw", state
+                )
+                assert read_status.success?, error
+                assert_equal "3", saved_profile.strip
+                calls = File.read(File.join(home, "patcher-calls.log")).lines.map(&:strip)
+                assert calls.any? { |call| call.include?("--disable-subscription-auto-update") }
+                refute calls.any? { |call| call.include?("--restore-owned-subscription-auto-update") }
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
   def test_profile_three_restores_auto_update_when_a_later_step_fails
     patcher = <<~RUBY
       File.open(File.join(ENV.fetch("HOME"), "patcher-calls.log"), "a") { |file| file.puts(ARGV.join(" ")) }

@@ -1060,6 +1060,45 @@ class SkillContractTest < Minitest::Test
     assert_includes installer, "uninstall_recovery_failed"
   end
 
+  def test_macos_profile_operation_signal_handoff_preserves_committed_state
+    installer = File.read(File.join(SKILL, "scripts/install_macos.sh"))
+    wrappers = File.read(File.join(ROOT, "tests/test_macos_wrappers.rb"))
+
+    assert_includes installer, "run_committing_profile_operation()"
+    assert_includes installer, "preserve_profile_operation_state()"
+    assert_includes installer, "record_profile_operation_signal 143"
+    assert_includes installer, "commit_profile_selection"
+    assert_includes installer, "AUTO_UPDATE_CHANGED=0"
+    assert_includes installer, "PROFILE_OPERATION_COMMITTED=1"
+    assert_includes installer, "operation_committed_interrupted"
+    assert_includes installer, "PROFILE_OPERATION_RECOVERY_INTENT=1"
+    assert_includes installer, "operation_interrupted_recovery_intent"
+    assert_includes installer,
+                    "trap ':' HUP INT TERM\n" \
+                    "  set +e\n" \
+                    '  /usr/bin/ruby "$OPERATION_LOCK_SOURCE"'
+    assert_includes wrappers,
+                    "test_signal_after_profile_commit_preserves_outer_profile_state"
+    assert_includes wrappers, 'Process.kill("TERM", Process.ppid)'
+    assert_includes wrappers, 'Process.kill("TERM", -Process.getpgrp)'
+    assert_includes wrappers, '"--restore-owned-subscription-auto-update"'
+
+    documents = [
+      File.read(File.join(ROOT, "README.md")),
+      File.read(File.join(SKILL, "SKILL.md")),
+      File.read(File.join(SKILL, "references/patch-policy.md")),
+      File.read(
+        File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md")
+      ),
+      File.read(File.join(ROOT, "tests/baseline.md"))
+    ]
+    documents.each do |document|
+      assert_includes document, "TERM"
+      assert_includes document, "operation_committed_interrupted"
+      assert_includes document, "operation_interrupted_recovery_intent"
+    end
+  end
+
   def test_macos_uninstall_recovers_pending_profile_transactions_before_writing
     uninstaller = File.read(File.join(SKILL, "scripts/uninstall_macos.sh"))
     patcher = mac_patcher_source

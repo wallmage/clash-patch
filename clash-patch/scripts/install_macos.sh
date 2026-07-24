@@ -31,6 +31,11 @@ AUTO_UPDATE_CHANGED=0
 PENDING_TEMPORARY=""
 PREVIOUS_PROFILE=""
 PROFILE_STATE_CHANGED=0
+PROFILE_OPERATION_COMMITTED=0
+PROFILE_OPERATION_RECOVERY_INTENT=0
+PROFILE_OPERATION_SIGNAL=0
+PROFILE_OPERATION_CHILD_FINISHED=0
+PROFILE_OPERATION_CHILD_STATUS=0
 OPERATION_LOCK_REQUIRED=1
 
 unexpected_exit() {
@@ -50,7 +55,17 @@ unexpected_exit() {
   fi
   if [ "$JSON_OUTPUT" -eq 1 ]; then
     if [ -x /usr/bin/ruby ] && [ -f "$RESULT_CONTRACT_SOURCE" ]; then
-      if [ "$profile_restore_failed" -eq 1 ]; then
+      if [ "$PROFILE_OPERATION_COMMITTED" -eq 1 ]; then
+        /usr/bin/ruby "$RESULT_CONTRACT_SOURCE" \
+          --command install --operation "$OPERATION" --ok false --status partial \
+          --code operation_committed_interrupted --exit-code "$unexpected_status" \
+          --summary "配置已经提交；返回成功结果前收到中断，保存档位和自动更新状态保持不变。"
+      elif [ "$PROFILE_OPERATION_RECOVERY_INTENT" -eq 1 ]; then
+        /usr/bin/ruby "$RESULT_CONTRACT_SOURCE" \
+          --command install --operation "$OPERATION" --ok false --status partial \
+          --code operation_interrupted_recovery_intent --exit-code "$unexpected_status" \
+          --summary "最终处理被中断；保存档位和自动更新关闭状态已经保留，下次运行将按该档位继续。"
+      elif [ "$profile_restore_failed" -eq 1 ]; then
         /usr/bin/ruby "$RESULT_CONTRACT_SOURCE" \
           --command install --operation "$OPERATION" --ok false --status partial \
           --code profile_restore_failed --exit-code "$unexpected_status" --summary "安装流程意外中止，且旧用途档位未能恢复。"
@@ -61,7 +76,11 @@ unexpected_exit() {
       fi
     fi
   else
-    if [ "$profile_restore_failed" -eq 1 ]; then
+    if [ "$PROFILE_OPERATION_COMMITTED" -eq 1 ]; then
+      /usr/bin/printf '%s\n' "[Clash 补丁] 配置已经提交；返回成功结果前收到中断，保存档位和自动更新状态保持不变。"
+    elif [ "$PROFILE_OPERATION_RECOVERY_INTENT" -eq 1 ]; then
+      /usr/bin/printf '%s\n' "[Clash 补丁] 最终处理被中断；保存档位和自动更新关闭状态已经保留，下次运行将按该档位继续。"
+    elif [ "$profile_restore_failed" -eq 1 ]; then
       /usr/bin/printf '%s\n' "[Clash 补丁] 安装流程意外中止，且旧用途档位未能恢复。"
     else
       /usr/bin/printf '%s\n' "[Clash 补丁] 安装流程意外中止；已尝试恢复用途档位与订阅自动更新。"
@@ -278,6 +297,77 @@ commit_profile_selection() {
   say "已保存用途档位 ${USAGE_PROFILE}。"
 }
 
+preserve_profile_operation_state() {
+  commit_profile_selection
+  AUTO_UPDATE_CHANGED=0
+}
+
+finish_profile_operation_signal() {
+  trap '' HUP INT TERM
+  preserve_profile_operation_state
+  if [ "$PROFILE_OPERATION_CHILD_STATUS" -eq 0 ]; then
+    PROFILE_OPERATION_COMMITTED=1
+  else
+    PROFILE_OPERATION_RECOVERY_INTENT=1
+  fi
+  exit "$PROFILE_OPERATION_SIGNAL"
+}
+
+record_profile_operation_signal() {
+  received_signal_status=$1
+  [ "$PROFILE_OPERATION_SIGNAL" -ne 0 ] ||
+    PROFILE_OPERATION_SIGNAL=$received_signal_status
+  if [ "$PROFILE_OPERATION_CHILD_FINISHED" -eq 1 ]; then
+    finish_profile_operation_signal
+  fi
+}
+
+run_committing_profile_operation() {
+  child_output_path=""
+  child_json=""
+  if [ "$JSON_OUTPUT" -eq 1 ]; then
+    child_output_path=$(/usr/bin/mktemp "$BACKUP_DIR/.profile-operation-result.XXXXXX")
+    PENDING_TEMPORARY=$child_output_path
+    /bin/chmod 600 "$child_output_path"
+  fi
+
+  PROFILE_OPERATION_SIGNAL=0
+  PROFILE_OPERATION_CHILD_FINISHED=0
+  PROFILE_OPERATION_CHILD_STATUS=0
+  trap 'record_profile_operation_signal 129' HUP
+  trap 'record_profile_operation_signal 130' INT
+  trap 'record_profile_operation_signal 143' TERM
+  if [ "$JSON_OUTPUT" -eq 1 ]; then
+    if /usr/bin/ruby "$PATCHER_SOURCE" "$@" --json >"$child_output_path" 2>/dev/null; then
+      PROFILE_OPERATION_CHILD_STATUS=0
+    else
+      PROFILE_OPERATION_CHILD_STATUS=$?
+    fi
+    child_json=$(/bin/cat "$child_output_path" 2>/dev/null || true)
+    /bin/rm -f "$child_output_path"
+    PENDING_TEMPORARY=""
+  else
+    if /usr/bin/ruby "$PATCHER_SOURCE" "$@"; then
+      PROFILE_OPERATION_CHILD_STATUS=0
+    else
+      PROFILE_OPERATION_CHILD_STATUS=$?
+    fi
+  fi
+
+  PROFILE_OPERATION_CHILD_FINISHED=1
+  if [ "$PROFILE_OPERATION_SIGNAL" -ne 0 ]; then
+    finish_profile_operation_signal
+  fi
+  if [ "$PROFILE_OPERATION_CHILD_STATUS" -eq 0 ]; then
+    preserve_profile_operation_state
+    PROFILE_OPERATION_COMMITTED=1
+  fi
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  return "$PROFILE_OPERATION_CHILD_STATUS"
+}
+
 if [ "$OPERATION_LOCK_REQUIRED" -eq 1 ] &&
    [ "${CLASH_PATCH_INTERNAL_OPERATION_LOCK_HELD:-0}" != "1" ]; then
   if [ "$(uname -s)" != "Darwin" ]; then
@@ -297,10 +387,14 @@ if [ "$OPERATION_LOCK_REQUIRED" -eq 1 ] &&
     say "安装包不完整：缺少操作锁程序。"
     finish 6 failed incomplete_package "安装包不完整。" install
   fi
+  trap ':' HUP INT TERM
   set +e
   /usr/bin/ruby "$OPERATION_LOCK_SOURCE" "$OPERATION_LOCK_PATH" /bin/sh "$0" "$@"
   operation_lock_status=$?
   set -e
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
   case "$operation_lock_status" in
     75)
       finish 1 failed operation_in_progress "另一个 Clash Patch 操作正在进行，请稍后重试。" "$OPERATION"
@@ -516,78 +610,60 @@ fi
 
 if [ "$SAFE_UPDATE" -eq 1 ]; then
   if [ -n "$CUSTOM_PROFILE_DIR" ]; then
-    if [ "$JSON_OUTPUT" -eq 1 ]; then
-      if ! child_json=$(/usr/bin/ruby "$PATCHER_SOURCE" \
+    if ! run_committing_profile_operation \
         --profile-dir "$CUSTOM_PROFILE_DIR" \
         --policy "$POLICY_SOURCE" \
         --backup-dir "$BACKUP_DIR" \
-        --safe-update-all \
-        --usage-profile "$USAGE_PROFILE" --json 2>/dev/null); then
+        --safe-update-all --usage-profile "$USAGE_PROFILE"; then
+      if [ "$JSON_OUTPUT" -eq 1 ]; then
         finish_json_child_failure "$child_json" failed safe_update_failed "安全更新失败。" safe_update
+      else
+        say "安全更新失败。"
+        finish 1 failed safe_update_failed "安全更新失败。" safe_update
       fi
-    else
-      /usr/bin/ruby "$PATCHER_SOURCE" \
-        --profile-dir "$CUSTOM_PROFILE_DIR" \
-        --policy "$POLICY_SOURCE" \
-        --backup-dir "$BACKUP_DIR" \
-        --safe-update-all \
-        --usage-profile "$USAGE_PROFILE" ||
-        { say "安全更新失败。"; finish 1 failed safe_update_failed "安全更新失败。" safe_update; }
     fi
   else
-    if [ "$JSON_OUTPUT" -eq 1 ]; then
-      if ! child_json=$(/usr/bin/ruby "$PATCHER_SOURCE" \
+    if ! run_committing_profile_operation \
         --policy "$POLICY_SOURCE" \
         --backup-dir "$BACKUP_DIR" \
-        --safe-update-all \
-        --usage-profile "$USAGE_PROFILE" --json 2>/dev/null); then
+        --safe-update-all --usage-profile "$USAGE_PROFILE"; then
+      if [ "$JSON_OUTPUT" -eq 1 ]; then
         finish_json_child_failure "$child_json" failed safe_update_failed "安全更新失败。" safe_update
+      else
+        say "安全更新失败。"
+        finish 1 failed safe_update_failed "安全更新失败。" safe_update
       fi
-    else
-      /usr/bin/ruby "$PATCHER_SOURCE" \
-        --policy "$POLICY_SOURCE" \
-        --backup-dir "$BACKUP_DIR" \
-        --safe-update-all \
-        --usage-profile "$USAGE_PROFILE" ||
-        { say "安全更新失败。"; finish 1 failed safe_update_failed "安全更新失败。" safe_update; }
     fi
   fi
-  commit_profile_selection
   say "安全更新已完成：当前存储位置中的全部远程订阅已一起更新。"
   finish 0 ok safe_update_completed "安全更新已完成。" safe_update
 fi
 
 if [ -n "$CUSTOM_PROFILE_DIR" ]; then
-  if [ "$JSON_OUTPUT" -eq 1 ]; then
-    if ! child_json=$(/usr/bin/ruby "$PATCHER_SOURCE" \
+  if ! run_committing_profile_operation \
       --profile-dir "$CUSTOM_PROFILE_DIR" \
       --policy "$POLICY_SOURCE" \
-      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE" --json 2>/dev/null); then
+      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE"; then
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
       finish_json_child_failure "$child_json" failed patch_failed "配置处理失败。" patch_profiles
+    else
+      say "配置处理失败。"
+      finish 1 failed patch_failed "配置处理失败。" patch_profiles
     fi
-  else
-    /usr/bin/ruby "$PATCHER_SOURCE" \
-      --profile-dir "$CUSTOM_PROFILE_DIR" \
-      --policy "$POLICY_SOURCE" \
-      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE" ||
-      { say "配置处理失败。"; finish 1 failed patch_failed "配置处理失败。" patch_profiles; }
   fi
 else
-  if [ "$JSON_OUTPUT" -eq 1 ]; then
-    if ! child_json=$(/usr/bin/ruby "$PATCHER_SOURCE" \
+  if ! run_committing_profile_operation \
       --policy "$POLICY_SOURCE" \
-      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE" --json 2>/dev/null); then
+      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE"; then
+    if [ "$JSON_OUTPUT" -eq 1 ]; then
       finish_json_child_failure "$child_json" failed patch_failed "配置处理失败。" patch_profiles
+    else
+      say "配置处理失败。"
+      finish 1 failed patch_failed "配置处理失败。" patch_profiles
     fi
-  else
-    /usr/bin/ruby "$PATCHER_SOURCE" \
-      --policy "$POLICY_SOURCE" \
-      --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE" ||
-      { say "配置处理失败。"; finish 1 failed patch_failed "配置处理失败。" patch_profiles; }
   fi
 fi
 
-commit_profile_selection
 say "本次为单次运行；当前存储位置中的全部订阅都已使用同一套国内域名直连规则。"
 say "当前订阅需要修改时，会通过本地控制器自动刷新并检查；失败时补丁程序会恢复原配置。"
 say "脚本没有退出、停止或重启 ClashX Meta，也没有切换订阅、代理组或节点。"

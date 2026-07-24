@@ -987,12 +987,14 @@ class MutationSafetyTest < Minitest::Test
       replace_once(
         root,
         "clash-patch/scripts/install_macos.sh",
-        "      --profile-dir \"$CUSTOM_PROFILE_DIR\" \\\n" \
+        "  if ! run_committing_profile_operation \\\n" \
+          "      --profile-dir \"$CUSTOM_PROFILE_DIR\" \\\n" \
           "      --policy \"$POLICY_SOURCE\" \\\n" \
-          "      --backup-dir \"$BACKUP_DIR\" --usage-profile \"$USAGE_PROFILE\" --json 2>/dev/null",
-        "      --profile-dir \"$CUSTOM_PROFILE_DIR\" \\\n" \
+          "      --backup-dir \"$BACKUP_DIR\" --usage-profile \"$USAGE_PROFILE\"; then",
+        "  if ! run_committing_profile_operation \\\n" \
+          "      --profile-dir \"$CUSTOM_PROFILE_DIR\" \\\n" \
           "      --policy \"$POLICY_SOURCE\" \\\n" \
-          "      --backup-dir \"$BACKUP_DIR\" --usage-profile \"$USAGE_PROFILE\" --dry-run --json 2>/dev/null"
+          "      --backup-dir \"$BACKUP_DIR\" --usage-profile \"$USAGE_PROFILE\" --dry-run; then"
       )
 
       assert_mutation_is_killed(
@@ -1033,6 +1035,48 @@ class MutationSafetyTest < Minitest::Test
         root,
         RbConfig.ruby, "tests/test_macos_wrappers.rb",
         "--name", "test_profile_three_restores_auto_update_when_a_later_step_fails"
+      )
+    end
+  end
+
+  def test_macos_profile_operation_signal_handoff_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_macos.sh",
+        "preserve_profile_operation_state() {\n" \
+          "  commit_profile_selection\n" \
+          "  AUTO_UPDATE_CHANGED=0\n" \
+          "}\n",
+        "preserve_profile_operation_state() {\n" \
+          "  :\n" \
+          "}\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_wrappers.rb",
+        "--name", "test_signal_after_profile_commit_preserves_outer_profile_state"
+      )
+    end
+  end
+
+  def test_macos_operation_lock_signal_delegation_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_macos.sh",
+        "  trap ':' HUP INT TERM\n" \
+          "  set +e\n" \
+          "  /usr/bin/ruby \"$OPERATION_LOCK_SOURCE\" \"$OPERATION_LOCK_PATH\" /bin/sh \"$0\" \"$@\"\n",
+        "  set +e\n" \
+          "  /usr/bin/ruby \"$OPERATION_LOCK_SOURCE\" \"$OPERATION_LOCK_PATH\" /bin/sh \"$0\" \"$@\"\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_wrappers.rb",
+        "--name", "test_signal_after_profile_commit_preserves_outer_profile_state"
       )
     end
   end
