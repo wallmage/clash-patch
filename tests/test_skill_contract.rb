@@ -1248,13 +1248,65 @@ class SkillContractTest < Minitest::Test
     assert_includes transaction,
                     "function Test-CurrentConfigRecoveryRequiresStoppedClient("
     assert_includes transaction,
-                    "if ((Test-CurrentConfigRecoveryRequiresStoppedClient $planPaths) -and\n" \
-                    "        (Test-ClashVergeRunning)) {"
+                    "function Test-InterruptedRecoveryCommitCondition("
     assert_includes transaction,
-                    "if ((Test-CurrentConfigRecoveryRequiresStoppedClient $targetPaths) -and\n" \
-                    "        (Test-ClashVergeRunning)) {"
+                    "$recovered = Invoke-InterruptedTransactionRecovery " \
+                    "$plan $preCommitCondition"
+    assert_includes transaction,
+                    "Test-InterruptedRecoveryCommitCondition $preCommitCondition"
     assert_includes transaction,
                     'throw "客户端保持运行；中断的当前配置事务等待恢复。"'
+
+    journal_start = transaction.index("function Invoke-InterruptedTransactionRecovery(")
+    journal_end = transaction.index(
+      "\nfunction Assert-InterruptedTransactionRecovered(",
+      journal_start
+    )
+    refute_nil journal_start
+    refute_nil journal_end
+    journal_body = transaction[journal_start...journal_end]
+    journal_identity = journal_body.index(
+      "[ClashPatch.VerifiedDeleteNative]::GetIdentity($handle)"
+    )
+    journal_condition = journal_body.index(
+      "Test-InterruptedRecoveryCommitCondition $PreCommitCondition"
+    )
+    journal_write = journal_body.index("Write-LockedStreamBytes")
+    journal_delete = journal_body.index(
+      "Set-VerifiedDeleteDisposition $entry.Stream $true",
+      journal_write
+    )
+    refute_nil journal_identity
+    refute_nil journal_condition
+    refute_nil journal_write
+    refute_nil journal_delete
+    assert_operator journal_identity, :<, journal_condition
+    assert_operator journal_condition, :<, journal_write
+    assert_operator journal_condition, :<, journal_delete
+
+    preparation_start = transaction.index("function Repair-InterruptedFilePreparation")
+    preparation_end = transaction.index(
+      "\nfunction Write-FileTransactionJournal(",
+      preparation_start
+    )
+    refute_nil preparation_start
+    refute_nil preparation_end
+    preparation_body = transaction[preparation_start...preparation_end]
+    preparation_identity = preparation_body.index(
+      "[ClashPatch.VerifiedDeleteNative]::GetIdentity($handle)"
+    )
+    preparation_condition = preparation_body.index(
+      "Test-InterruptedRecoveryCommitCondition $preCommitCondition"
+    )
+    preparation_delete = preparation_body.index(
+      "Set-VerifiedDeleteDisposition $entry.Stream $true"
+    )
+    refute_nil preparation_identity
+    refute_nil preparation_condition
+    refute_nil preparation_delete
+    assert_operator preparation_identity, :<, preparation_condition
+    assert_operator preparation_condition, :<, preparation_delete
+
     [installer, uninstaller].each do |entrypoint|
       assert_includes entrypoint, '"transaction_recovery_pending"'
     end
@@ -1266,6 +1318,12 @@ class SkillContractTest < Minitest::Test
                     "running client changed a prepared current-config target"
     assert_includes windows_tests,
                     "running client consumed a current-config preparation record"
+    assert_includes windows_tests,
+                    "interrupted recovery rechecks a newly started client"
+    assert_includes windows_tests,
+                    "newly started client allowed interrupted journal recovery"
+    assert_includes windows_tests,
+                    "newly started client allowed prepared current-config targets"
 
     documents = [
       File.read(File.join(ROOT, "README.md")),
@@ -1279,6 +1337,8 @@ class SkillContractTest < Minitest::Test
     documents.each do |document|
       assert_includes document, "中断的当前配置事务"
       assert_includes document, "transaction_recovery_pending"
+      assert_includes document, "锁定并核对全部恢复目标"
+      assert_includes document, "再次检查"
     end
   end
 
@@ -1831,6 +1891,7 @@ class SkillContractTest < Minitest::Test
       "extended-path AppHome lock alias",
       "installer and uninstaller shared AppHome lock",
       "interrupted new-file transaction preserves later content",
+      "interrupted recovery rechecks a newly started client",
       "interrupted transaction same-byte identity replacement",
       "new-file transaction journal empty original bytes",
       "non-proxy route termini",

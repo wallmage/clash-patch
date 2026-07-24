@@ -618,9 +618,8 @@ class MutationSafetyTest < Minitest::Test
       replace_once(
         root,
         "clash-patch/scripts/windows/install_windows/transaction.ps1",
-        "    if ((Test-CurrentConfigRecoveryRequiresStoppedClient $planPaths) -and\n" \
-          "        (Test-ClashVergeRunning)) {\n",
-        "    if ($false) {\n"
+        "    \$recovered = Invoke-InterruptedTransactionRecovery \$plan \$preCommitCondition\n",
+        "    \$recovered = Invoke-InterruptedTransactionRecovery \$plan \$null\n"
       )
 
       assert_mutation_is_killed(
@@ -637,9 +636,8 @@ class MutationSafetyTest < Minitest::Test
       replace_once(
         root,
         "clash-patch/scripts/windows/install_windows/transaction.ps1",
-        "    if ((Test-CurrentConfigRecoveryRequiresStoppedClient $targetPaths) -and\n" \
-          "        (Test-ClashVergeRunning)) {\n",
-        "    if ($false) {\n"
+        "                Test-InterruptedRecoveryCommitCondition \$preCommitCondition\n",
+        "                \$true\n"
       )
 
       assert_mutation_is_killed(

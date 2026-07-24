@@ -1082,7 +1082,7 @@ test('Windows installer is split into side-effect-free modules with stable funct
       'Initialize-VerifiedFileNative', 'Open-VerifiedDirectoryChain', 'Set-VerifiedDeleteDisposition',
       'Write-FileTransactionPreparation', 'Get-ValidatedFileTransactionPreparation',
       'Remove-FileTransactionPreparation', 'Test-CurrentConfigRecoveryRequiresStoppedClient',
-      'Repair-InterruptedFilePreparation',
+      'Test-InterruptedRecoveryCommitCondition', 'Repair-InterruptedFilePreparation',
       'Write-FileTransactionJournal', 'Remove-FileTransactionJournal',
       'Get-ValidatedFileTransactionJournal', 'Get-InterruptedTransactionRecoveryPlan',
       'Invoke-InterruptedTransactionRecovery', 'Assert-InterruptedTransactionRecovered',

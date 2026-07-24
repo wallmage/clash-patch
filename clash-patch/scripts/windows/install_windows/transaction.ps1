@@ -785,6 +785,15 @@ function Test-CurrentConfigRecoveryRequiresStoppedClient([string[]]$Paths) {
     return $false
 }
 
+function Test-InterruptedRecoveryCommitCondition([scriptblock]$PreCommitCondition) {
+    if ($null -eq $PreCommitCondition) { return $true }
+    $results = @(& $PreCommitCondition)
+    if ($results.Count -ne 1 -or -not ($results[0] -is [bool])) {
+        throw "中断事务恢复提交条件必须只返回一个布尔值。"
+    }
+    return [bool]$results[0]
+}
+
 function Repair-InterruptedFilePreparation {
     $path = [string]$script:ClashPatchTransactionPreparationPath
     if ([string]::IsNullOrWhiteSpace($path)) { return }
@@ -812,33 +821,75 @@ function Repair-InterruptedFilePreparation {
     }
     $targetPaths = @()
     foreach ($target in $targets) { $targetPaths += [string]$target.Path }
-    if ((Test-CurrentConfigRecoveryRequiresStoppedClient $targetPaths) -and
-        (Test-ClashVergeRunning)) {
-        throw "客户端保持运行；中断的当前配置事务等待恢复。"
+    $preCommitCondition = $null
+    if (Test-CurrentConfigRecoveryRequiresStoppedClient $targetPaths) {
+        if (Test-ClashVergeRunning) {
+            throw "客户端保持运行；中断的当前配置事务等待恢复。"
+        }
+        $preCommitCondition = { -not (Test-ClashVergeRunning) }
     }
+    Initialize-VerifiedFileNative
+    $opened = @()
+    $directoryHandles = @()
+    $operationFailure = $null
+    $preCommitRejected = $false
     foreach ($target in $targets) {
         $targetPath = [string]$target.Path
-        $directoryHandles = @(Open-VerifiedDirectoryChain (Split-Path -Parent $targetPath))
         $handle = $null
         $stream = $null
         try {
+            $directoryHandles += @(
+                Open-VerifiedDirectoryChain (Split-Path -Parent $targetPath)
+            )
             $handle = [ClashPatch.VerifiedDeleteNative]::Open($targetPath, $false, $false)
             $stream = New-Object System.IO.FileStream($handle, [System.IO.FileAccess]::Read)
-            if ([ClashPatch.VerifiedDeleteNative]::GetIdentity($handle) -cne $target.Identity -or
+            if ([ClashPatch.VerifiedDeleteNative]::IsReparsePoint($handle) -or
+                [ClashPatch.VerifiedDeleteNative]::GetLinkCount($handle) -ne 1 -or
+                [ClashPatch.VerifiedDeleteNative]::GetIdentity($handle) -cne $target.Identity -or
                 (Get-StreamBytes $stream).Length -ne 0) {
                 throw "中断事务新建目标在恢复前再次发生变化：$targetPath"
             }
-            Set-VerifiedDeleteDisposition $stream $true
-        } finally {
-            if ($null -ne $stream) {
-                $stream.Dispose()
-            } elseif ($null -ne $handle) {
-                $handle.Dispose()
+            $opened += [pscustomobject]@{
+                Target = $target
+                Stream = $stream
             }
-            for ($index = $directoryHandles.Count - 1; $index -ge 0; $index--) {
-                $directoryHandles[$index].Dispose()
-            }
+        } catch {
+            if ($null -ne $stream) { $stream.Dispose() } elseif ($null -ne $handle) { $handle.Dispose() }
+            $operationFailure = $_
+            break
         }
+    }
+    if ($null -eq $operationFailure) {
+        try {
+            $preCommitRejected = -not (
+                Test-InterruptedRecoveryCommitCondition $preCommitCondition
+            )
+            if (-not $preCommitRejected) {
+                foreach ($entry in $opened) {
+                    Set-VerifiedDeleteDisposition $entry.Stream $true
+                }
+            }
+        } catch {
+            $operationFailure = $_
+        }
+    }
+    for ($index = $opened.Count - 1; $index -ge 0; $index--) {
+        try {
+            $opened[$index].Stream.Dispose()
+        } catch {
+            if ($null -eq $operationFailure) { $operationFailure = $_ }
+        }
+    }
+    for ($index = $directoryHandles.Count - 1; $index -ge 0; $index--) {
+        try {
+            $directoryHandles[$index].Dispose()
+        } catch {
+            if ($null -eq $operationFailure) { $operationFailure = $_ }
+        }
+    }
+    if ($null -ne $operationFailure) { throw $operationFailure }
+    if ($preCommitRejected) {
+        throw "客户端保持运行；中断的当前配置事务等待恢复。"
     }
     Remove-FileTransactionPreparation $snapshot.Bytes
 }
@@ -1059,43 +1110,140 @@ function Get-InterruptedTransactionRecoveryPlan([object[]]$Actions) {
     return $plan
 }
 
-function Invoke-InterruptedTransactionRecovery([object[]]$Plan) {
-    foreach ($item in $Plan) {
-        $directoryHandles = @(Open-VerifiedDirectoryChain (Split-Path -Parent $item.Action.Path))
+function Invoke-InterruptedTransactionRecovery(
+    [object[]]$Plan,
+    [scriptblock]$PreCommitCondition = $null
+) {
+    Initialize-VerifiedFileNative
+    $opened = @()
+    $directoryHandles = @()
+    $operationFailure = $null
+    $preCommitRejected = $false
+    $mutationStarted = $false
+    $cleanupFailures = @()
+    foreach ($item in @($Plan | Sort-Object { $_.Action.Path })) {
         $handle = $null
         $stream = $null
+        $create = $item.Operation -eq "create"
         try {
-            if ($item.Operation -eq "create") {
-                $handle = [ClashPatch.VerifiedDeleteNative]::Open($item.Action.Path, $true, $true)
-                $stream = New-Object System.IO.FileStream($handle, [System.IO.FileAccess]::ReadWrite)
-                Write-LockedStreamBytes $stream $item.Action.Original ([byte[]]@())
+            $directoryHandles += @(
+                Open-VerifiedDirectoryChain (Split-Path -Parent $item.Action.Path)
+            )
+            if ($create -and (Test-Path -LiteralPath $item.Action.Path)) {
+                throw "中断事务待重建目标在恢复前出现：$($item.Action.Path)"
+            }
+            $writable = $item.Operation -in @("create", "write")
+            $handle = [ClashPatch.VerifiedDeleteNative]::Open(
+                $item.Action.Path,
+                $writable,
+                $create
+            )
+            $access = if ($writable) {
+                [System.IO.FileAccess]::ReadWrite
             } else {
-                $writable = $item.Operation -eq "write"
-                $handle = [ClashPatch.VerifiedDeleteNative]::Open($item.Action.Path, $writable, $false)
-                $access = if ($writable) { [System.IO.FileAccess]::ReadWrite } else { [System.IO.FileAccess]::Read }
-                $stream = New-Object System.IO.FileStream($handle, $access)
-                $current = Get-StreamBytes $stream
-                if ([ClashPatch.VerifiedDeleteNative]::GetIdentity($handle) -cne $item.Snapshot.Identity -or
-                    (Get-BytesSha256 $current) -ne (Get-BytesSha256 $item.Snapshot.Bytes)) {
-                    throw "中断事务目标在恢复前再次发生变化：$($item.Action.Path)"
+                [System.IO.FileAccess]::Read
+            }
+            $stream = New-Object System.IO.FileStream($handle, $access)
+            if ([ClashPatch.VerifiedDeleteNative]::IsReparsePoint($handle) -or
+                [ClashPatch.VerifiedDeleteNative]::GetLinkCount($handle) -ne 1) {
+                throw "中断事务目标不能是链接：$($item.Action.Path)"
+            }
+            $current = Get-StreamBytes $stream
+            if ($create) {
+                if ($current.Length -ne 0) {
+                    throw "中断事务待重建目标不是空文件：$($item.Action.Path)"
                 }
-                if ($item.Operation -eq "write") {
-                    Write-LockedStreamBytes $stream $item.Action.Original $current
-                } else {
+            } elseif (
+                [ClashPatch.VerifiedDeleteNative]::GetIdentity($handle) -cne
+                    $item.Snapshot.Identity -or
+                (Get-BytesSha256 $current) -ne
+                    (Get-BytesSha256 $item.Snapshot.Bytes)
+            ) {
+                throw "中断事务目标在恢复前再次发生变化：$($item.Action.Path)"
+            }
+            $opened += [pscustomobject]@{
+                Item = $item
+                Stream = $stream
+                Current = $current
+                Created = $create
+            }
+        } catch {
+            $caughtFailure = $_
+            if ($create -and $null -ne $stream) {
+                try {
                     Set-VerifiedDeleteDisposition $stream $true
+                } catch {
+                    $cleanupFailures += "$($item.Action.Path)：删除无效恢复占位文件失败。"
                 }
             }
-        } finally {
-            if ($null -ne $stream) {
-                $stream.Dispose()
-            } elseif ($null -ne $handle) {
-                $handle.Dispose()
+            if ($null -ne $stream) { $stream.Dispose() } elseif ($null -ne $handle) { $handle.Dispose() }
+            $operationFailure = $caughtFailure
+            break
+        }
+    }
+    if ($null -eq $operationFailure) {
+        try {
+            $preCommitRejected = -not (
+                Test-InterruptedRecoveryCommitCondition $PreCommitCondition
+            )
+            if (-not $preCommitRejected) {
+                foreach ($entry in @($opened | Where-Object {
+                    $_.Item.Operation -in @("create", "write")
+                })) {
+                    $mutationStarted = $true
+                    Write-LockedStreamBytes `
+                        $entry.Stream `
+                        $entry.Item.Action.Original `
+                        $entry.Current
+                }
+                foreach ($entry in @($opened | Where-Object {
+                    $_.Item.Operation -in @("create", "write")
+                })) {
+                    if ((Get-BytesSha256 (Get-StreamBytes $entry.Stream)) -ne
+                        (Get-BytesSha256 $entry.Item.Action.Original)) {
+                        throw "中断事务写入后的内容不正确：$($entry.Item.Action.Path)"
+                    }
+                }
+                foreach ($entry in @($opened | Where-Object {
+                    $_.Item.Operation -eq "delete"
+                })) {
+                    $mutationStarted = $true
+                    Set-VerifiedDeleteDisposition $entry.Stream $true
+                }
             }
-            for ($index = $directoryHandles.Count - 1; $index -ge 0; $index--) {
-                $directoryHandles[$index].Dispose()
+        } catch {
+            $operationFailure = $_
+        }
+    }
+    if (($preCommitRejected -or
+        ($null -ne $operationFailure -and -not $mutationStarted))) {
+        foreach ($entry in @($opened | Where-Object { $_.Created })) {
+            try {
+                Set-VerifiedDeleteDisposition $entry.Stream $true
+            } catch {
+                $cleanupFailures += "$($entry.Item.Action.Path)：删除恢复占位文件失败。"
             }
         }
     }
+    for ($index = $opened.Count - 1; $index -ge 0; $index--) {
+        try {
+            $opened[$index].Stream.Dispose()
+        } catch {
+            $cleanupFailures += "$($opened[$index].Item.Action.Path)：关闭恢复文件失败。"
+        }
+    }
+    for ($index = $directoryHandles.Count - 1; $index -ge 0; $index--) {
+        try {
+            $directoryHandles[$index].Dispose()
+        } catch {
+            $cleanupFailures += "关闭恢复目标目录失败。"
+        }
+    }
+    if ($cleanupFailures.Count -gt 0) {
+        throw ("中断事务恢复清理失败：" + ($cleanupFailures -join "；"))
+    }
+    if ($null -ne $operationFailure) { throw $operationFailure }
+    return (-not $preCommitRejected)
 }
 
 function Assert-InterruptedTransactionRecovered([object[]]$Actions) {
@@ -1129,11 +1277,17 @@ function Repair-InterruptedFileTransaction {
     $plan = @(Get-InterruptedTransactionRecoveryPlan $actions)
     $planPaths = @()
     foreach ($item in $plan) { $planPaths += [string]$item.Action.Path }
-    if ((Test-CurrentConfigRecoveryRequiresStoppedClient $planPaths) -and
-        (Test-ClashVergeRunning)) {
+    $preCommitCondition = $null
+    if (Test-CurrentConfigRecoveryRequiresStoppedClient $planPaths) {
+        if (Test-ClashVergeRunning) {
+            throw "客户端保持运行；中断的当前配置事务等待恢复。"
+        }
+        $preCommitCondition = { -not (Test-ClashVergeRunning) }
+    }
+    $recovered = Invoke-InterruptedTransactionRecovery $plan $preCommitCondition
+    if (-not $recovered) {
         throw "客户端保持运行；中断的当前配置事务等待恢复。"
     }
-    Invoke-InterruptedTransactionRecovery $plan
     Assert-InterruptedTransactionRecovered $actions
     Remove-FileTransactionJournal $snapshot.Bytes
 }

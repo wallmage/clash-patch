@@ -3411,6 +3411,273 @@ try {
             )) "recovered install retained the preparation record"
         }
 
+        Invoke-DeferredProbe "interrupted recovery rechecks a newly started client" {
+            $recoveryRacePackageParent = Join-Path $sandbox "recovery-client-race-package"
+            New-Item -ItemType Directory -Path $recoveryRacePackageParent -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $root "clash-patch") -Destination $recoveryRacePackageParent -Recurse
+            $recoveryRacePackage = Join-Path $recoveryRacePackageParent "clash-patch"
+            $recoveryRaceInstaller = Join-Path (
+                Join-Path $recoveryRacePackage "scripts"
+            ) "install_windows.ps1"
+            $recoveryRaceTransaction = Join-Path (
+                Join-Path (Join-Path $recoveryRacePackage "scripts") "windows/install_windows"
+            ) "transaction.ps1"
+            $recoveryRaceText = [System.IO.File]::ReadAllText($recoveryRaceTransaction)
+            $recoveryRacePreparationFunction = $recoveryRaceText.IndexOf(
+                "function Repair-InterruptedFilePreparation"
+            )
+            $recoveryRaceJournalFunction = $recoveryRaceText.IndexOf(
+                "function Repair-InterruptedFileTransaction"
+            )
+            $recoveryRacePreparationNeedle = '    foreach ($target in $targets) {'
+            $recoveryRaceJournalNeedle = 'Invoke-InterruptedTransactionRecovery $plan'
+            $recoveryRacePreparationFirstOffset = $recoveryRaceText.IndexOf(
+                $recoveryRacePreparationNeedle,
+                $recoveryRacePreparationFunction
+            )
+            $recoveryRacePreparationOffset = $recoveryRaceText.IndexOf(
+                $recoveryRacePreparationNeedle,
+                $recoveryRacePreparationFirstOffset +
+                    $recoveryRacePreparationNeedle.Length
+            )
+            $recoveryRaceJournalCallOffset = $recoveryRaceText.IndexOf(
+                $recoveryRaceJournalNeedle,
+                $recoveryRaceJournalFunction
+            )
+            $recoveryRaceJournalLineBreak = if ($recoveryRaceJournalCallOffset -ge 0) {
+                $recoveryRaceText.LastIndexOf(
+                    [char]10,
+                    $recoveryRaceJournalCallOffset
+                )
+            } else {
+                -1
+            }
+            $recoveryRaceJournalOffset = $recoveryRaceJournalLineBreak + 1
+            Assert-True (
+                $recoveryRacePreparationFunction -ge 0 -and
+                $recoveryRaceJournalFunction -ge 0 -and
+                $recoveryRacePreparationFirstOffset -ge 0 -and
+                $recoveryRacePreparationOffset -ge 0 -and
+                $recoveryRaceJournalCallOffset -ge 0 -and
+                $recoveryRaceJournalLineBreak -ge 0
+            ) "recovery client race fixture could not find both recovery commit boundaries"
+            $recoveryRaceHelper = @'
+function Start-ClashPatchRecoveryRaceClient([string]$ExpectedMode) {
+    if ($env:CLASH_PATCH_TEST_RECOVERY_RACE_MODE -cne $ExpectedMode) { return }
+    if ([string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_RECOVERY_RACE_EXECUTABLE) -or
+        [string]::IsNullOrWhiteSpace($env:CLASH_PATCH_TEST_RECOVERY_RACE_PID)) {
+        throw "recovery client race fixture is incomplete"
+    }
+    $injected = Start-Process `
+        -FilePath $env:CLASH_PATCH_TEST_RECOVERY_RACE_EXECUTABLE `
+        -ArgumentList @("-n", "20", "127.0.0.1") -PassThru
+    [void]$injected.Handle
+    [System.IO.File]::WriteAllText(
+        $env:CLASH_PATCH_TEST_RECOVERY_RACE_PID,
+        [string]$injected.Id
+    )
+    $seen = $false
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    while (-not $injected.HasExited -and -not $seen -and [DateTime]::UtcNow -lt $deadline) {
+        $seen = $null -ne (
+            Get-Process -Name "clash-verge" -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        )
+        if (-not $seen) { Start-Sleep -Milliseconds 25 }
+    }
+    if (-not $seen) { throw "injected recovery client was not visible" }
+}
+
+'@
+            $recoveryRaceText = $recoveryRaceText.Insert(
+                $recoveryRacePreparationFunction,
+                $recoveryRaceHelper
+            )
+            $recoveryRacePreparationOffset += $recoveryRaceHelper.Length
+            $recoveryRaceJournalOffset += $recoveryRaceHelper.Length
+            $recoveryRacePreparationHook = '    Start-ClashPatchRecoveryRaceClient "preparation"' + [Environment]::NewLine
+            $recoveryRaceText = $recoveryRaceText.Insert(
+                $recoveryRacePreparationOffset,
+                $recoveryRacePreparationHook
+            )
+            $recoveryRaceJournalOffset += $recoveryRacePreparationHook.Length
+            $recoveryRaceJournalHook = '    Start-ClashPatchRecoveryRaceClient "journal"' + [Environment]::NewLine
+            $recoveryRaceText = $recoveryRaceText.Insert(
+                $recoveryRaceJournalOffset,
+                $recoveryRaceJournalHook
+            )
+            [System.IO.File]::WriteAllText(
+                $recoveryRaceTransaction,
+                $recoveryRaceText,
+                (New-Object System.Text.UTF8Encoding($true))
+            )
+
+            $recoveryRaceClient = Join-Path $sandbox "clash-verge.exe"
+            Copy-Item -LiteralPath (
+                Join-Path (Join-Path $env:SystemRoot "System32") "ping.exe"
+            ) -Destination $recoveryRaceClient
+            $stopRecoveryRaceClient = {
+                param([string]$PidPath)
+                if (-not (Test-Path -LiteralPath $PidPath -PathType Leaf)) { return }
+                $injectedId = 0
+                if ([int]::TryParse(
+                    [System.IO.File]::ReadAllText($PidPath),
+                    [ref]$injectedId
+                )) {
+                    $injectedProcess = Get-Process -Id $injectedId -ErrorAction SilentlyContinue
+                    if ($null -ne $injectedProcess) {
+                        Stop-Process -Id $injectedId -Force
+                        $injectedProcess.WaitForExit()
+                    }
+                }
+            }
+
+            $journalRaceHome = Join-Path $sandbox "recovery-journal-client-race-home"
+            $journalRacePid = Join-Path $sandbox "recovery-journal-client-race.pid"
+            New-Item -ItemType Directory -Path $journalRaceHome -Force | Out-Null
+            $journalRaceTarget = Join-Path $journalRaceHome "config.yaml"
+            $journalRaceMissingTarget = Join-Path $journalRaceHome "verge.yaml"
+            $journalRaceOriginal = [System.Text.Encoding]::UTF8.GetBytes(
+                "mode: rule`nipv6: true`n"
+            )
+            $journalRaceReplacement = [System.Text.Encoding]::UTF8.GetBytes(
+                "mode: global`nipv6: false`n"
+            )
+            $journalRaceMissingOriginal = [System.Text.Encoding]::UTF8.GetBytes(
+                "enable_tun_mode: false`n"
+            )
+            [System.IO.File]::WriteAllBytes($journalRaceTarget, $journalRaceOriginal)
+            $journalRaceIdentity = (Get-OptionalFileSnapshot (
+                $journalRaceTarget
+            ) "recovery race target").Identity
+            [System.IO.File]::WriteAllBytes($journalRaceTarget, $journalRaceReplacement)
+            [System.IO.File]::WriteAllBytes(
+                $journalRaceMissingTarget,
+                $journalRaceMissingOriginal
+            )
+            $journalRaceMissingIdentity = (Get-OptionalFileSnapshot (
+                $journalRaceMissingTarget
+            ) "recovery race missing target").Identity
+            [System.IO.File]::Delete($journalRaceMissingTarget)
+            $journalRacePath = Join-Path $journalRaceHome ".clash-patch-transaction.json"
+            $journalRaceRecord = [ordered]@{
+                Version = 1
+                Actions = @(
+                    [ordered]@{
+                        Action = "write"
+                        Path = "config.yaml"
+                        Existed = $true
+                        Identity = $journalRaceIdentity
+                        OriginalBase64 = [Convert]::ToBase64String($journalRaceOriginal)
+                        ReplacementBase64 = [Convert]::ToBase64String($journalRaceReplacement)
+                    },
+                    [ordered]@{
+                        Action = "delete"
+                        Path = "verge.yaml"
+                        Existed = $true
+                        Identity = $journalRaceMissingIdentity
+                        OriginalBase64 = [Convert]::ToBase64String(
+                            $journalRaceMissingOriginal
+                        )
+                        ReplacementBase64 = ""
+                    }
+                )
+            }
+            [System.IO.File]::WriteAllText(
+                $journalRacePath,
+                ($journalRaceRecord | ConvertTo-Json -Depth 5 -Compress),
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+            $journalRaceRecordBytes = [System.IO.File]::ReadAllBytes($journalRacePath)
+            try {
+                $env:CLASH_PATCH_TEST_RECOVERY_RACE_MODE = "journal"
+                $env:CLASH_PATCH_TEST_RECOVERY_RACE_EXECUTABLE = $recoveryRaceClient
+                $env:CLASH_PATCH_TEST_RECOVERY_RACE_PID = $journalRacePid
+                $journalRaceResult = Invoke-TestPowerShell $recoveryRaceInstaller @(
+                    "-AppHome", $journalRaceHome,
+                    "-ShowUsageProfile",
+                    "-Json"
+                )
+                $journalRaceJson = Assert-JsonResult $journalRaceResult "install" 1
+                Assert-True (
+                    $journalRaceJson.status -eq "partial" -and
+                    $journalRaceJson.code -eq "transaction_recovery_pending"
+                ) "newly started client did not defer interrupted journal recovery"
+                Assert-True (
+                    [Convert]::ToBase64String(
+                        [System.IO.File]::ReadAllBytes($journalRaceTarget)
+                    ) -eq [Convert]::ToBase64String($journalRaceReplacement)
+                ) "newly started client allowed interrupted journal recovery to rewrite config.yaml"
+                Assert-True (-not (
+                    Test-Path -LiteralPath $journalRaceMissingTarget
+                )) "rejected journal recovery retained a newly created placeholder"
+                Assert-True (
+                    [Convert]::ToBase64String(
+                        [System.IO.File]::ReadAllBytes($journalRacePath)
+                    ) -eq [Convert]::ToBase64String($journalRaceRecordBytes)
+                ) "newly started client allowed interrupted journal recovery to consume its record"
+            } finally {
+                & $stopRecoveryRaceClient $journalRacePid
+                $env:CLASH_PATCH_TEST_RECOVERY_RACE_MODE = $null
+                $env:CLASH_PATCH_TEST_RECOVERY_RACE_EXECUTABLE = $null
+                $env:CLASH_PATCH_TEST_RECOVERY_RACE_PID = $null
+            }
+
+            $preparationRaceHome = Join-Path $sandbox "recovery-preparation-client-race-home"
+            $preparationRacePid = Join-Path $sandbox "recovery-preparation-client-race.pid"
+            New-Item -ItemType Directory -Path $preparationRaceHome -Force | Out-Null
+            $preparationRaceConfig = Join-Path $preparationRaceHome "config.yaml"
+            $preparationRaceVerge = Join-Path $preparationRaceHome "verge.yaml"
+            [System.IO.File]::WriteAllBytes($preparationRaceConfig, [byte[]]@())
+            [System.IO.File]::WriteAllBytes($preparationRaceVerge, [byte[]]@())
+            $preparationRacePath = Join-Path (
+                $preparationRaceHome
+            ) ".clash-patch-transaction-preparation.json"
+            $preparationRaceRecord = [ordered]@{
+                Version = 1
+                Paths = @("config.yaml", "verge.yaml")
+            }
+            [System.IO.File]::WriteAllText(
+                $preparationRacePath,
+                ($preparationRaceRecord | ConvertTo-Json -Depth 3 -Compress),
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+            $preparationRaceRecordBytes = [System.IO.File]::ReadAllBytes(
+                $preparationRacePath
+            )
+            try {
+                $env:CLASH_PATCH_TEST_RECOVERY_RACE_MODE = "preparation"
+                $env:CLASH_PATCH_TEST_RECOVERY_RACE_EXECUTABLE = $recoveryRaceClient
+                $env:CLASH_PATCH_TEST_RECOVERY_RACE_PID = $preparationRacePid
+                $preparationRaceResult = Invoke-TestPowerShell $recoveryRaceInstaller @(
+                    "-AppHome", $preparationRaceHome,
+                    "-ShowUsageProfile",
+                    "-Json"
+                )
+                $preparationRaceJson = Assert-JsonResult $preparationRaceResult "install" 1
+                Assert-True (
+                    $preparationRaceJson.status -eq "partial" -and
+                    $preparationRaceJson.code -eq "transaction_recovery_pending"
+                ) "newly started client did not defer interrupted preparation recovery"
+                Assert-True (
+                    (Test-Path -LiteralPath $preparationRaceConfig -PathType Leaf) -and
+                    (Get-Item -LiteralPath $preparationRaceConfig).Length -eq 0 -and
+                    (Test-Path -LiteralPath $preparationRaceVerge -PathType Leaf) -and
+                    (Get-Item -LiteralPath $preparationRaceVerge).Length -eq 0
+                ) "newly started client allowed prepared current-config targets to be deleted"
+                Assert-True (
+                    [Convert]::ToBase64String(
+                        [System.IO.File]::ReadAllBytes($preparationRacePath)
+                    ) -eq [Convert]::ToBase64String($preparationRaceRecordBytes)
+                ) "newly started client allowed preparation recovery to consume its record"
+            } finally {
+                & $stopRecoveryRaceClient $preparationRacePid
+                $env:CLASH_PATCH_TEST_RECOVERY_RACE_MODE = $null
+                $env:CLASH_PATCH_TEST_RECOVERY_RACE_EXECUTABLE = $null
+                $env:CLASH_PATCH_TEST_RECOVERY_RACE_PID = $null
+            }
+        }
+
         Invoke-DeferredProbe "public new-target journal handoff strong-kill recovery" {
             $publicHandoffPackageParent = Join-Path $sandbox "public-journal-handoff-crash-package"
             New-Item -ItemType Directory -Path $publicHandoffPackageParent -Force | Out-Null
