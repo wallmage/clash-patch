@@ -3038,8 +3038,12 @@ try {
             $publicUninstallDeleteEnd,
             $publicUninstallHook
         )
-        $publicUninstallRecoveryNeedle =
-            '                Write-LockedStreamBytes $stream $item.Action.Original ([byte[]]@())'
+        $publicUninstallRecoveryNeedle = @'
+                    Write-LockedStreamBytes `
+                        $entry.Stream `
+                        $entry.Item.Action.Original `
+                        $entry.Current
+'@
         $publicUninstallRecoveryOffset = $publicUninstallTransactionText.IndexOf(
             $publicUninstallRecoveryNeedle
         )

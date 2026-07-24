@@ -24,6 +24,7 @@ function readInstallerBundle() {
 }
 const installWrapperPath = path.join(root, 'clash-patch/scripts/install_windows.cmd');
 const uninstallWrapperPath = path.join(root, 'clash-patch/scripts/uninstall_windows.cmd');
+const windowsInstallerTestPath = path.join(root, 'tests/test_windows_installer.ps1');
 const fixturePath = path.join(root, 'tests/fixtures/main_group_cases.json');
 const available = fs.existsSync(enginePath) && fs.existsSync(policyPath);
 const fixturesAvailable = available && fs.existsSync(fixturePath);
@@ -1035,6 +1036,24 @@ test('PowerShell installer structurally edits YAML and rolls back failed transac
   assert.match(source, /ComputeHash\(\$[Bb]ytes,\s*0,\s*\$[Bb]ytes\.Length\)/);
   assert.doesNotMatch(source, /ComputeHash\(\$[Bb]ytes\)/);
   assert.doesNotMatch(source, /function Set-TunBlock/);
+});
+
+test('Windows recovery fault injection matches the current write boundary', () => {
+  const fixture = fs.readFileSync(windowsInstallerTestPath, 'utf8').replace(/\r\n/g, '\n');
+  const transaction = fs.readFileSync(
+    path.join(installerModuleDir, 'transaction.ps1'),
+    'utf8'
+  ).replace(/\r\n/g, '\n');
+  const match = fixture.match(
+    /\$publicUninstallRecoveryNeedle = @'\n([\s\S]*?)\n'@/
+  );
+  assert.ok(match, 'public uninstall recovery fixture omitted its literal boundary');
+  const boundary = match[1];
+  assert.equal(
+    transaction.split(boundary).length - 1,
+    1,
+    'public uninstall recovery fixture boundary must match transaction.ps1 exactly once'
+  );
 });
 
 test('Windows installation fails closed and preserves exact restore state', () => {
