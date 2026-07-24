@@ -3337,9 +3337,7 @@ try {
             $publicPreJournalUsage = Join-Path $publicPreJournalHome "clash-patch-usage-profile.json"
             $publicPreJournalConfig = Join-Path $publicPreJournalHome "config.yaml"
             $publicPreJournalVerge = Join-Path $publicPreJournalHome "verge.yaml"
-            $publicPreJournalPreparation = Join-Path (
-                $publicPreJournalHome ".clash-patch-transaction-preparation.json"
-            )
+            $publicPreJournalPreparation = Join-Path $publicPreJournalHome ".clash-patch-transaction-preparation.json"
             Assert-True (
                 (Test-Path -LiteralPath $publicPreJournalUsage -PathType Leaf) -and
                 (Get-Item -LiteralPath $publicPreJournalUsage).Length -eq 0
@@ -3360,9 +3358,7 @@ try {
             $publicPreJournalPreparationBytes = [System.IO.File]::ReadAllBytes(
                 $publicPreJournalPreparation
             )
-            $publicPreJournalRunningClientPath = Join-Path (
-                $publicPreJournalHome "clash-verge.exe"
-            )
+            $publicPreJournalRunningClientPath = Join-Path $publicPreJournalHome "clash-verge.exe"
             Copy-Item -LiteralPath (
                 Join-Path (Join-Path $env:SystemRoot "System32") "ping.exe"
             ) -Destination $publicPreJournalRunningClientPath
