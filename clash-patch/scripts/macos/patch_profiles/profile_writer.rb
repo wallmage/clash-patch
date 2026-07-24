@@ -269,7 +269,7 @@ module ClashPatch
 
   def resume_profile_transaction(backup_root, roots:, work_items:, reload_runtime:,
                                  require_tun:, socket: nil, requester: nil,
-                                 connectivity_checker: nil)
+                                 connectivity_checker: nil, precommit_condition: nil)
     pending = profile_transaction_pending?(backup_root)
     transaction = recover_profile_transaction(
       backup_root, roots: roots, keep_transaction: pending
@@ -279,23 +279,41 @@ module ClashPatch
       reload_runtime &&
       reload_recovered_profile_runtime(
         work_items, require_tun: require_tun, socket: socket, requester: requester,
-        connectivity_checker: connectivity_checker
+        connectivity_checker: connectivity_checker,
+        precommit_condition: precommit_condition
       )
 
     remove_profile_transaction(transaction)
     :recovered
   end
 
-  def recover_pending_profile_transaction(backup_root, directories:, selected_name: nil)
+  def recover_pending_profile_transaction(backup_root, directories:, selected_name: nil,
+                                          guard_storage: false, expected_storage: nil)
     operation_lock = profile_operation_lock(backup_root)
     return :none unless profile_transaction_pending?(backup_root)
 
-    selected = selected_name.nil? ? selected_profile_name : selected_name
+    runtime_context = if selected_name.nil?
+                        capture_runtime_profile_context(
+                          directories, guard_storage: guard_storage,
+                          expected_storage: expected_storage
+                        )
+                      end
+    return :runtime_restore_pending if selected_name.nil? && runtime_context.nil?
+
+    selected = runtime_context ? runtime_context.fetch(:selected) : selected_name
+    precommit_condition = if runtime_context
+                            lambda do
+                              runtime_profile_context_current?(
+                                runtime_context, directories,
+                                guard_storage: guard_storage
+                              )
+                            end
+                          end
     active_root = active_profile_root(directories, selected)
     work_items = profile_work_items(directories, selected, active_root)
     resume_profile_transaction(
       backup_root, roots: directories, work_items: work_items, reload_runtime: true,
-      require_tun: :preserve
+      require_tun: :preserve, precommit_condition: precommit_condition
     )
   ensure
     operation_lock&.close
@@ -406,13 +424,34 @@ module ClashPatch
 
   def run(directory: nil, directories: nil, policy_path:, dry_run: false, backup_root: nil,
           selected_name: nil, active_directory: nil, validator: nil, auto_reload: false,
-          socket: nil, requester: nil, connectivity_checker: nil, usage_profile: 3)
+          socket: nil, requester: nil, connectivity_checker: nil, usage_profile: 3,
+          guard_storage: false, expected_storage: nil)
     policy = JSON.parse(File.read(policy_path, encoding: "UTF-8"))
     unless policy.is_a?(Hash) && policy["version"] == POLICY_VERSION
       raise InvalidConfigError, "不支持的策略版本"
     end
-    selected = selected_name.nil? ? selected_profile_name : selected_name
     roots = directories || (directory ? [directory] : default_profile_directories)
+    needs_runtime_context = selected_name.nil? && !dry_run
+    runtime_context = if needs_runtime_context
+                        capture_runtime_profile_context(
+                          roots, guard_storage: guard_storage,
+                          expected_storage: expected_storage
+                        )
+                      end
+    if needs_runtime_context && runtime_context.nil?
+      return roots.flat_map { |root| profile_paths(root) }.map do |path|
+        base_result(nil, :concurrent_change).merge(path: path, active: false)
+      end
+    end
+    selected = runtime_context ? runtime_context.fetch(:selected) :
+      (selected_name.nil? ? selected_profile_name : selected_name)
+    precommit_condition = if runtime_context
+                            lambda do
+                              runtime_profile_context_current?(
+                                runtime_context, roots, guard_storage: guard_storage
+                              )
+                            end
+                          end
     active_root = active_directory || active_profile_root(roots, selected, directory)
     operation_lock = profile_operation_lock(backup_root) if !dry_run && backup_root
     begin
@@ -421,7 +460,8 @@ module ClashPatch
         recovery = resume_profile_transaction(
           backup_root, roots: roots, work_items: work_items, reload_runtime: auto_reload,
           require_tun: usage_profile >= 2, socket: socket, requester: requester,
-          connectivity_checker: connectivity_checker
+          connectivity_checker: connectivity_checker,
+          precommit_condition: precommit_condition
         )
         if recovery == :runtime_restore_pending
           return work_items.map do |item|
@@ -500,7 +540,8 @@ module ClashPatch
               socket: socket,
               requester: requester,
               connectivity_checker: connectivity_checker,
-              require_tun: usage_profile >= 2
+              require_tun: usage_profile >= 2,
+              precommit_condition: precommit_condition
             )
           end
           results << result

@@ -142,7 +142,7 @@ module ClashPatch
   end
 
   def reload_recovered_profile_runtime(work_items, require_tun:, socket: nil, requester: nil,
-                                       connectivity_checker: nil)
+                                       connectivity_checker: nil, precommit_condition: nil)
     active = work_items.find { |item| item.fetch(:active) }
     return true unless active
 
@@ -167,6 +167,8 @@ module ClashPatch
                      :ignore
                    end
     return false if expected_tun == :unknown
+    return false unless runtime_precommit_allowed?(precommit_condition)
+
     code, _body = requester.call(
       "PUT", "/configs?force=true", JSON.generate("path" => File.expand_path(active.fetch(:path)))
     )
@@ -180,17 +182,28 @@ module ClashPatch
     false
   end
 
-  def activate_updated_profile(result, socket: nil, requester: nil, connectivity_checker: nil, require_tun: true)
+  def activate_updated_profile(result, socket: nil, requester: nil, connectivity_checker: nil,
+                               require_tun: true, precommit_condition: nil)
     if requester.nil?
       socket ||= controller_socket
-      return result.merge(status: rollback_after_reload_failure(result, nil, nil)) unless socket
+      return result.merge(
+        status: rollback_after_reload_failure(
+          result, nil, nil, precommit_condition: precommit_condition
+        )
+      ) unless socket
 
       requester = ->(method, endpoint, body) { controller_request(socket, method, endpoint, body) }
     end
     connectivity_checker ||= method(:default_connectivity_healthy?)
 
     before = runtime_selections(requester)
-    return result.merge(status: rollback_after_reload_failure(result, requester, result[:path])) unless before
+    unless before
+      return result.merge(
+        status: rollback_after_reload_failure(
+          result, requester, result[:path], precommit_condition: precommit_condition
+        )
+      )
+    end
     expected_tun = if require_tun == :preserve
                      tun_state(requester: requester)
                    elsif require_tun
@@ -201,10 +214,14 @@ module ClashPatch
     rollback = lambda do
       rollback_after_reload_failure(
         result, requester, result[:path], selections: before, expected_tun: expected_tun,
-        connectivity_checker: connectivity_checker
+        connectivity_checker: connectivity_checker, precommit_condition: precommit_condition
       )
     end
     return result.merge(status: rollback.call) if expected_tun == :unknown
+    unless runtime_precommit_allowed?(precommit_condition)
+      status = restore_profile_bytes(result) ? :reload_failed_rolled_back : :reload_failed_rollback_conflict
+      return result.merge(status: status)
+    end
 
     code, _body = requester.call(
       "PUT", "/configs?force=true", JSON.generate("path" => File.expand_path(result.fetch(:path)))
@@ -219,14 +236,19 @@ module ClashPatch
 
     result.merge(status: rollback.call)
   rescue StandardError
-    result.merge(status: rollback_after_reload_failure(result, requester, result[:path]))
+    result.merge(
+      status: rollback_after_reload_failure(
+        result, requester, result[:path], precommit_condition: precommit_condition
+      )
+    )
   end
 
   def rollback_after_reload_failure(result, requester, path, selections: nil, expected_tun: nil,
-                                    connectivity_checker: nil)
+                                    connectivity_checker: nil, precommit_condition: nil)
     return :reload_failed_rollback_conflict unless restore_profile_bytes(result)
     return :reload_failed_restore_pending unless requester && path && selections && expected_tun
     connectivity_checker ||= method(:default_connectivity_healthy?)
+    return :reload_failed_restore_pending unless runtime_precommit_allowed?(precommit_condition)
 
     code, _body = requester.call(
       "PUT", "/configs?force=true", JSON.generate("path" => File.expand_path(path))

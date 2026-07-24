@@ -257,8 +257,65 @@ module ClashPatch
     { status: result, domain: ownership.fetch("Domain") }
   end
 
-  def selected_profile_name
-    defaults_read("selectConfigName")
+  def selected_profile_name(runner: Open3.method(:capture3))
+    exported = defaults_export_domain(runner: runner)
+    return nil unless exported
+
+    json, _error, status = runner.call(
+      "/usr/bin/plutil", "-convert", "json", "-o", "-", "-",
+      stdin_data: exported.fetch(:plist)
+    )
+    return nil unless status.success?
+
+    preferences = JSON.parse(json)
+    return nil unless preferences.is_a?(Hash)
+    return "" unless preferences.key?("selectConfigName")
+
+    selected = preferences["selectConfigName"]
+    selected.is_a?(String) ? selected.strip : nil
+  rescue StandardError
+    nil
+  end
+
+  def capture_runtime_profile_context(roots, guard_storage: false, expected_storage: nil)
+    storage_before = guard_storage ? storage_mode : nil
+    return nil if guard_storage && !expected_storage.nil? && storage_before != expected_storage
+
+    selected_before = selected_profile_name
+    return nil unless selected_before.is_a?(String)
+
+    matching_paths = roots.flat_map { |root| profile_paths(root) }.select do |path|
+      active_profile?(path, selected_before)
+    end
+    storage_after = guard_storage ? storage_mode : nil
+    selected_after = selected_profile_name
+    return nil unless selected_after.is_a?(String)
+    return nil unless selected_before == selected_after && storage_before == storage_after
+    return nil if guard_storage && storage_before == :unknown
+    return nil unless matching_paths.length == 1
+
+    {
+      selected: selected_before,
+      storage: storage_before,
+      active_path: matching_paths.first && File.realpath(matching_paths.first)
+    }
+  rescue SystemCallError, IOError
+    nil
+  end
+
+  def runtime_profile_context_current?(expected, roots, guard_storage: false)
+    return false unless expected.is_a?(Hash)
+
+    current = capture_runtime_profile_context(roots, guard_storage: guard_storage)
+    !current.nil? && current == expected
+  rescue StandardError
+    false
+  end
+
+  def runtime_precommit_allowed?(condition)
+    condition.nil? || condition.call == true
+  rescue StandardError
+    false
   end
 
   def icloud_enabled?
@@ -463,16 +520,20 @@ module ClashPatch
     [""]
   end
 
-  def default_safe_update_activation(items, usage_profile, selected_name = selected_profile_name)
+  def default_safe_update_activation(items, usage_profile, selected_name = selected_profile_name,
+                                     precommit_condition: nil)
     active = items.find { |item| active_profile?(item.fetch(:path), selected_name) }
-    return true unless active
+    return runtime_precommit_allowed?(precommit_condition) unless active
 
     result = {
       path: active.fetch(:path), status: :updated, active: true,
       rollback_bytes: active.fetch(:original), patched_digest: Digest::SHA256.hexdigest(active.fetch(:candidate)),
       patched_identity: active[:patched_identity], patched_path: active[:patched_path]
     }
-    activate_updated_profile(result, require_tun: usage_profile >= 2)
+    activate_updated_profile(
+      result, require_tun: usage_profile >= 2,
+      precommit_condition: precommit_condition
+    )
   end
 
   def reload_recovered_safe_update_runtime(targets, usage_profile, selected_name)
@@ -487,6 +548,10 @@ module ClashPatch
     return false unless selections
 
     expected_tun = usage_profile >= 2 ? :enabled : :ignore
+    roots = targets.map { |target| File.dirname(File.expand_path(target.fetch(:path))) }.uniq
+    runtime_context = capture_runtime_profile_context(roots)
+    return false unless runtime_context && runtime_context.fetch(:selected) == selected_name
+
     code, _body = requester.call(
       "PUT", "/configs?force=true", JSON.generate("path" => File.expand_path(active.fetch(:path)))
     )
@@ -501,20 +566,39 @@ module ClashPatch
   end
 
   def safe_update_all(targets:, policy:, backup_root:, usage_profile:, fetcher: method(:fetch_remote_subscription),
-                      validator: method(:validate_with_mihomo), activation: nil, selected_name: nil)
+                      validator: method(:validate_with_mihomo), activation: nil, selected_name: nil,
+                      guard_storage: false, expected_storage: nil)
     operation_lock = nil
     raise InvalidConfigError, "用途档位无效" unless [1, 2, 3].include?(usage_profile)
     raise InvalidConfigError, "没有可更新的远程订阅" unless targets.is_a?(Array) && !targets.empty?
     roots = targets.map { |target| File.dirname(File.expand_path(target.fetch(:path))) }.uniq
+    runtime_context = if selected_name.nil?
+                        capture_runtime_profile_context(
+                          roots, guard_storage: guard_storage,
+                          expected_storage: expected_storage
+                        )
+                      end
+    if selected_name.nil? && runtime_context.nil?
+      return { status: :aborted, failed_profile: "", reason: :client_state_changed }
+    end
+    selected_name = runtime_context.fetch(:selected) if runtime_context
+    precommit_condition = if runtime_context
+                            lambda do
+                              runtime_profile_context_current?(
+                                runtime_context, roots, guard_storage: guard_storage
+                              )
+                            end
+                          end
     if Dir.exist?(backup_root)
       operation_lock = profile_operation_lock(backup_root)
       if profile_transaction_pending?(backup_root)
-        selected = selected_name.nil? ? selected_profile_name : selected_name
+        selected = selected_name
         active_root = active_profile_root(roots, selected)
         work_items = profile_work_items(roots, selected, active_root)
         recovery = resume_profile_transaction(
           backup_root, roots: roots, work_items: work_items, reload_runtime: true,
-          require_tun: usage_profile >= 2
+          require_tun: usage_profile >= 2,
+          precommit_condition: precommit_condition
         )
         if recovery == :runtime_restore_pending
           return {
@@ -641,7 +725,12 @@ module ClashPatch
       item[:patched_identity] = item.fetch(:committed_identity)
       item[:patched_path] = item.fetch(:write_path)
     end
-    activation ||= ->(updated_items) { default_safe_update_activation(updated_items, usage_profile, selected_name) }
+    activation ||= lambda do |updated_items|
+      default_safe_update_activation(
+        updated_items, usage_profile, selected_name,
+        precommit_condition: precommit_condition
+      )
+    end
     activation_result = begin
       activation.call(items)
     rescue StandardError
@@ -714,7 +803,10 @@ module ClashPatch
     return [] if mode == :unknown
     return Dir.exist?(local) ? [local] : [] if mode == :local
 
-    selected = selected_profile_name if selected.nil?
+    if selected.nil?
+      selected = selected_profile_name
+      return [] unless selected.is_a?(String)
+    end
     existing_clouds = clouds.select { |path| Dir.exist?(path) }.uniq
     matching = existing_clouds.select do |root|
       profile_paths(root).any? { |path| active_profile?(path, selected) }

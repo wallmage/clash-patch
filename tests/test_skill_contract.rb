@@ -5,11 +5,14 @@ require "open3"
 require "rbconfig"
 require "tmpdir"
 require "yaml"
+require_relative "support/macos_runtime_fixture"
 
 ROOT = File.expand_path("..", __dir__)
 SKILL = File.join(ROOT, "clash-patch")
 
 class SkillContractTest < Minitest::Test
+  include MacosRuntimeFixture
+
   REQUIRED_PUBLIC_FILES = %w[
     README.md
     clash-patch/SKILL.md
@@ -50,6 +53,7 @@ class SkillContractTest < Minitest::Test
     tests/coverage_ruby.rb
     tests/generate_windows_policy.rb
     tests/run_macos_production_probes.rb
+    tests/support/macos_runtime_fixture.rb
     tests/test_macos_patcher.rb
     tests/test_macos_wrappers.rb
     tests/test_mutation_safety.rb
@@ -163,16 +167,51 @@ class SkillContractTest < Minitest::Test
           exit 0
         SH
         FileUtils.chmod(0o700, fake_core)
+        preferences_fixture = write_release_preferences_fixture(directory)
         release_env = {
           "HOME" => release_home,
+          "RUBYOPT" => "-r#{preferences_fixture}",
           "CLASH_PATCH_PROFILE_DIR" => profile_directory,
           "CLASH_PATCH_USAGE_STATE_PATH" => File.join(release_home, "usage-profile.plist"),
           "CLASH_PATCH_USAGE_PROFILE" => nil
         }
-        output, error, status = Open3.capture3(
-          release_env, "sh", install_macos, "--profile", "1", "--json"
-        )
-        assert status.success?, "extracted public installer failed: #{error}"
+        controller_server, controller_thread, controller_socket_path, controller_requests =
+          start_release_controller(release_home)
+        connectivity_server, connectivity_thread =
+          start_release_connectivity_server(release_home)
+        begin
+          probe = <<~RUBY
+            context = ClashPatch.capture_runtime_profile_context([ARGV.fetch(0)])
+            puts JSON.generate(
+              selected: ClashPatch.selected_profile_name,
+              context: context,
+              socket: ClashPatch.controller_socket
+            )
+            exit(
+              context && context[:selected] == "friend" &&
+              context[:active_path] == File.realpath(File.join(ARGV.fetch(0), "friend.yaml")) &&
+              ClashPatch.controller_socket ? 0 : 1
+            )
+          RUBY
+          probe_output, probe_error, probe_status = Open3.capture3(
+            release_env, RbConfig.ruby, "-r#{patcher}", "-e", probe, profile_directory
+          )
+          assert probe_status.success?,
+                 "isolated release runtime context was unavailable: #{probe_error}#{probe_output}"
+          output, error, status = Open3.capture3(
+            release_env, "sh", install_macos, "--profile", "1", "--json"
+          )
+        ensure
+          stop_release_runtime_fixture(
+            controller_server: controller_server,
+            controller_thread: controller_thread,
+            controller_socket_path: controller_socket_path,
+            connectivity_server: connectivity_server,
+            connectivity_thread: connectivity_thread
+          )
+        end
+        assert status.success?,
+               "extracted public installer failed after #{controller_requests.inspect}: #{error}#{output}"
         assert_empty error
         result = JSON.parse(output)
         assert_equal status.exitstatus, result.fetch("exit_code")
@@ -1121,6 +1160,95 @@ class SkillContractTest < Minitest::Test
       assert_includes document, "提交收据"
       assert_includes document, "operation_committed_result_failed"
       assert_includes document, "operation_result_unknown_recovery_intent"
+    end
+  end
+
+  def test_macos_controller_loads_recheck_the_live_profile_context
+    runtime = File.read(
+      File.join(SKILL, "scripts/macos/patch_profiles/runtime.rb")
+    )
+    subscriptions = File.read(
+      File.join(SKILL, "scripts/macos/patch_profiles/subscriptions.rb")
+    )
+    writer = File.read(
+      File.join(SKILL, "scripts/macos/patch_profiles/profile_writer.rb")
+    )
+    cli = File.read(File.join(SKILL, "scripts/macos/patch_profiles/cli.rb"))
+    patcher_tests = File.read(File.join(ROOT, "tests/test_macos_patcher.rb"))
+
+    [
+      ["def reload_recovered_profile_runtime", "def activate_updated_profile"],
+      ["def activate_updated_profile", "def rollback_after_reload_failure"],
+      ["def rollback_after_reload_failure", "\nend\n"]
+    ].each do |start_marker, end_marker|
+      start = runtime.index(start_marker)
+      finish = runtime.index(end_marker, start + start_marker.length)
+      refute_nil start
+      refute_nil finish
+      body = runtime[start...finish]
+      guard = body.index("runtime_precommit_allowed?(precommit_condition)")
+      load = body.index('"PUT", "/configs?force=true"')
+      refute_nil guard
+      refute_nil load
+      assert_operator guard, :<, load
+    end
+
+    safe_recovery_start = subscriptions.index("def reload_recovered_safe_update_runtime")
+    safe_recovery_end = subscriptions.index("def safe_update_all", safe_recovery_start)
+    refute_nil safe_recovery_start
+    refute_nil safe_recovery_end
+    safe_recovery = subscriptions[safe_recovery_start...safe_recovery_end]
+    assert_operator(
+      safe_recovery.index("capture_runtime_profile_context(roots)"),
+      :<,
+      safe_recovery.index('"PUT", "/configs?force=true"')
+    )
+
+    assert_includes subscriptions, "def capture_runtime_profile_context"
+    assert_includes subscriptions, "def selected_profile_name(runner:"
+    assert_includes subscriptions, '"selectConfigName"'
+    assert_includes subscriptions, "selected_before = selected_profile_name"
+    assert_includes subscriptions, "selected_after = selected_profile_name"
+    assert_includes subscriptions, "return nil unless selected_before.is_a?(String)"
+    assert_includes subscriptions, "return nil unless selected_after.is_a?(String)"
+    assert_includes subscriptions, "return nil unless matching_paths.length == 1"
+    assert_includes subscriptions, "storage_before = guard_storage ? storage_mode : nil"
+    assert_includes subscriptions, "storage_after = guard_storage ? storage_mode : nil"
+    assert_includes subscriptions,
+                    "return runtime_precommit_allowed?(precommit_condition) unless active"
+    assert_includes writer, "precommit_condition: precommit_condition"
+    assert_includes cli, "guard_storage: guard_storage"
+    assert_includes cli, "!runtime_precommit_allowed?(precommit_condition)"
+    refute_includes cli,
+                    "usage_profile: options[:usage_profile], selected_name: selected_profile_name"
+
+    %w[
+      test_run_does_not_reload_the_old_profile_after_the_user_switches_profiles
+      test_safe_update_does_not_reload_the_old_profile_after_the_user_switches_profiles
+      test_pending_runtime_recovery_does_not_reload_a_profile_the_user_left
+      test_reload_failure_does_not_force_the_old_profile_after_a_late_user_switch
+      test_cli_restore_backup_does_not_reload_the_old_profile_after_a_user_switch
+      test_safe_update_aborts_if_the_client_changes_storage_during_validation
+      test_safe_update_aborts_when_the_user_enters_a_remote_target_during_validation
+      test_cli_restore_backup_rolls_back_if_the_user_enters_the_target_during_validation
+      test_pending_runtime_recovery_keeps_the_journal_when_the_active_profile_is_missing
+      test_selected_profile_snapshot_distinguishes_default_config_from_read_failure
+      test_run_without_reload_stops_when_the_current_profile_cannot_be_read
+    ].each { |name| assert_includes patcher_tests, name }
+
+    documents = [
+      File.read(File.join(ROOT, "README.md")),
+      File.read(File.join(SKILL, "SKILL.md")),
+      File.read(File.join(SKILL, "references/patch-policy.md")),
+      File.read(
+        File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md")
+      ),
+      File.read(File.join(ROOT, "tests/baseline.md"))
+    ]
+    documents.each do |document|
+      assert_includes document, "每次控制器加载前"
+      assert_includes document, "绝不加载旧订阅"
+      assert_match(/读取失败|无法可靠读取/, document)
     end
   end
 

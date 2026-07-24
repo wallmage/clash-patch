@@ -315,7 +315,9 @@ module ClashPatch
       return 0
     end
 
-    directories = options[:profile_dirs].empty? ? default_profile_directories : options[:profile_dirs]
+    guard_storage = options[:profile_dirs].empty?
+    expected_storage = storage_mode if guard_storage
+    directories = guard_storage ? default_profile_directories : options[:profile_dirs]
     if directories.empty?
       return emit_cli_result(
         operation: "patch_profiles", exit_code: 2, status: "failed", code: "profile_directory_missing",
@@ -338,7 +340,8 @@ module ClashPatch
 
     if options[:recover_profile_transaction]
       result = recover_pending_profile_transaction(
-        options[:backup_root], directories: directories
+        options[:backup_root], directories: directories,
+        guard_storage: guard_storage, expected_storage: expected_storage
       )
       if result == :runtime_restore_pending
         return emit_cli_result(
@@ -372,19 +375,52 @@ module ClashPatch
     end
 
     if options[:restore_backup]
-      selected = selected_profile_name
+      runtime_context = capture_runtime_profile_context(
+        directories, guard_storage: guard_storage,
+        expected_storage: expected_storage
+      )
+      unless runtime_context
+        return emit_cli_result(
+          operation: "restore_backup", exit_code: 1, status: "failed",
+          code: "client_state_changed",
+          summary_zh: "当前订阅或存储位置正在变化，未恢复备份。"
+        ) if options[:json]
+        warn "当前订阅或存储位置正在变化，未恢复备份。"
+        return 1
+      end
+      selected = runtime_context.fetch(:selected)
+      precommit_condition = lambda do
+        runtime_profile_context_current?(
+          runtime_context, directories, guard_storage: guard_storage
+        )
+      end
       activation = lambda do |restore_result|
-        active_root = active_profile_root(directories, selected)
-        active = active_root &&
-                 File.expand_path(File.dirname(restore_result.fetch(:path))) == File.expand_path(active_root) &&
-                 active_profile?(restore_result.fetch(:path), selected)
+        if restore_result[:status] != :no_change &&
+           !runtime_precommit_allowed?(precommit_condition)
+          status = if restore_profile_bytes(restore_result)
+                     :reload_failed_rolled_back
+                   else
+                     :reload_failed_rollback_conflict
+                   end
+          next restore_result.merge(status: status)
+        end
+        active = runtime_context[:active_path] &&
+                 File.realpath(restore_result.fetch(:path)) == runtime_context.fetch(:active_path)
         restore_result = restore_result.merge(active: !!active)
-        active ? activate_updated_profile(restore_result, require_tun: :preserve) : restore_result
+        if active
+          activate_updated_profile(
+            restore_result, require_tun: :preserve,
+            precommit_condition: precommit_condition
+          )
+        else
+          restore_result
+        end
       end
       result = restore_backup(
         options[:restore_backup], directories: directories, backup_root: options[:backup_root],
         expected_current_sha256: options[:expected_current_sha256], validator: method(:validate_with_mihomo),
-        selected_name: selected, activation: activation
+        selected_name: selected, activation: activation,
+        precommit_condition: precommit_condition
       )
 
       status, code, summary = case result[:status]
@@ -425,7 +461,8 @@ module ClashPatch
       targets = remote_subscription_targets(directories)
       result = safe_update_all(
         targets: targets, policy: policy, backup_root: options[:backup_root],
-        usage_profile: options[:usage_profile], selected_name: selected_profile_name
+        usage_profile: options[:usage_profile], guard_storage: guard_storage,
+        expected_storage: expected_storage
       )
       if result[:status] == :updated
         mark_wrapper_commit_receipt(options)
@@ -471,7 +508,8 @@ module ClashPatch
       backup_root: options[:backup_root],
       validator: options[:dry_run] ? nil : method(:validate_with_mihomo),
       auto_reload: options[:auto_reload] && !options[:dry_run],
-      usage_profile: options[:usage_profile] || 3
+      usage_profile: options[:usage_profile] || 3,
+      guard_storage: guard_storage, expected_storage: expected_storage
     )
     if results.empty?
       return emit_cli_result(

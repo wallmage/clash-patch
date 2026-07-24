@@ -3,6 +3,7 @@ require "json"
 require "minitest/autorun"
 require "open3"
 require "tmpdir"
+require_relative "support/macos_runtime_fixture"
 
 ROOT = File.expand_path("..", __dir__) unless defined?(ROOT)
 INSTALLER = File.join(ROOT, "clash-patch/scripts/install_macos.sh")
@@ -11,6 +12,8 @@ RESULT_CONTRACT = File.join(ROOT, "clash-patch/scripts/macos/result_contract.rb"
 OPERATION_LOCK = File.join(ROOT, "clash-patch/scripts/macos/operation_lock.rb")
 
 class MacosWrapperTest < Minitest::Test
+  include MacosRuntimeFixture
+
   REQUIRED_RESULT_FIELDS = %w[
     schema version command platform client operation ok status code exit_code summary_zh
     profile changes checks items messages warnings
@@ -926,12 +929,30 @@ class MacosWrapperTest < Minitest::Test
         YAML
         File.write(profile, original)
 
-        stdout, stderr, status, state = run_script(
-          INSTALLER, "--profile", "1", home: home,
-          extra_env: { "CLASH_PATCH_PROFILE_DIR" => profiles }
-        )
+        preferences_fixture = write_release_preferences_fixture(home)
+        controller_server, controller_thread, controller_socket_path, controller_requests =
+          start_release_controller(home)
+        connectivity_server, connectivity_thread =
+          start_release_connectivity_server(home)
+        begin
+          stdout, stderr, status, state = run_script(
+            INSTALLER, "--profile", "1", home: home,
+            extra_env: {
+              "CLASH_PATCH_PROFILE_DIR" => profiles,
+              "RUBYOPT" => "-r#{preferences_fixture}"
+            }
+          )
+        ensure
+          stop_release_runtime_fixture(
+            controller_server: controller_server,
+            controller_thread: controller_thread,
+            controller_socket_path: controller_socket_path,
+            connectivity_server: connectivity_server,
+            connectivity_thread: connectivity_thread
+          )
+        end
 
-        assert status.success?, "#{stdout}\n#{stderr}"
+        assert status.success?, "#{controller_requests.inspect}\n#{stdout}\n#{stderr}"
         assert_empty stderr
         assert File.file?(state)
         output = File.read(profile)

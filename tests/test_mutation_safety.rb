@@ -125,7 +125,7 @@ class MutationSafetyTest < Minitest::Test
         "clash-patch/scripts/macos/patch_profiles/backups.rb",
         "      recovery = resume_profile_transaction(\n" \
           "        backup_root, roots: directories, work_items: work_items, reload_runtime: true,\n" \
-          "        require_tun: :preserve\n" \
+          "        require_tun: :preserve, precommit_condition: precommit_condition\n" \
           "      )\n",
         "      recovery = :recovered\n"
       )
@@ -201,7 +201,8 @@ class MutationSafetyTest < Minitest::Test
           "      reload_runtime &&\n" \
           "      reload_recovered_profile_runtime(\n" \
           "        work_items, require_tun: require_tun, socket: socket, requester: requester,\n" \
-          "        connectivity_checker: connectivity_checker\n" \
+          "        connectivity_checker: connectivity_checker,\n" \
+          "        precommit_condition: precommit_condition\n" \
           "      )\n",
         "    return :runtime_restore_pending unless true\n"
       )
@@ -369,12 +370,13 @@ class MutationSafetyTest < Minitest::Test
         root,
         "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
         "      if profile_transaction_pending?(backup_root)\n" \
-          "        selected = selected_name.nil? ? selected_profile_name : selected_name\n" \
+          "        selected = selected_name\n" \
           "        active_root = active_profile_root(roots, selected)\n" \
           "        work_items = profile_work_items(roots, selected, active_root)\n" \
           "        recovery = resume_profile_transaction(\n" \
           "          backup_root, roots: roots, work_items: work_items, reload_runtime: true,\n" \
-          "          require_tun: usage_profile >= 2\n" \
+          "          require_tun: usage_profile >= 2,\n" \
+          "          precommit_condition: precommit_condition\n" \
           "        )\n" \
           "        if recovery == :runtime_restore_pending\n" \
           "          return {\n" \
@@ -1503,6 +1505,100 @@ class MutationSafetyTest < Minitest::Test
         "/usr/bin/env", "CLASH_PATCH_RUN_PRODUCTION_PROBES=1",
         RbConfig.ruby, "tests/test_macos_wrappers.rb",
         "--name", "test_production_probe_uninstall_preserves_a_file_replaced_after_staging"
+      )
+    end
+  end
+
+  def test_macos_runtime_profile_precommit_guard_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/runtime.rb",
+        "    unless runtime_precommit_allowed?(precommit_condition)\n" \
+          "      status = restore_profile_bytes(result) ?",
+        "    if false\n" \
+          "      status = restore_profile_bytes(result) ?"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name",
+        "test_run_does_not_reload_the_old_profile_after_the_user_switches_profiles"
+      )
+    end
+  end
+
+  def test_macos_runtime_recovery_profile_guard_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/runtime.rb",
+        "    return false if expected_tun == :unknown\n" \
+          "    return false unless runtime_precommit_allowed?(precommit_condition)\n",
+        "    return false if expected_tun == :unknown\n" \
+          "    # mutant: skip the live profile check\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name",
+        "test_pending_runtime_recovery_does_not_reload_a_profile_the_user_left"
+      )
+    end
+  end
+
+  def test_macos_runtime_context_requires_one_active_profile_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/subscriptions.rb",
+        "    return nil unless matching_paths.length == 1\n",
+        "    return nil if matching_paths.length > 1\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name",
+        "test_pending_runtime_recovery_keeps_the_journal_when_the_active_profile_is_missing"
+      )
+    end
+  end
+
+  def test_macos_no_reload_profile_context_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/profile_writer.rb",
+        "    needs_runtime_context = selected_name.nil? && !dry_run\n",
+        "    needs_runtime_context = selected_name.nil? && auto_reload && !dry_run\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name",
+        "test_run_without_reload_stops_when_the_current_profile_cannot_be_read"
+      )
+    end
+  end
+
+  def test_macos_runtime_rollback_profile_guard_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/runtime.rb",
+        "    return :reload_failed_restore_pending unless runtime_precommit_allowed?(precommit_condition)\n",
+        "    return :reload_failed_restore_pending if false\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name",
+        "test_reload_failure_does_not_force_the_old_profile_after_a_late_user_switch"
       )
     end
   end

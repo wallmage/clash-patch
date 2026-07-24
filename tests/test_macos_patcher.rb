@@ -333,7 +333,8 @@ class MacosPatcherTest < Minitest::Test
           policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 1,
           fetcher: ->(_target) { YAML.dump(base_config.merge("subscription-marker" => "new")) },
           validator: ->(_path) { true },
-          activation: ->(_items) { flunk "failed transaction must not activate" }
+          activation: ->(_items) { flunk "failed transaction must not activate" },
+          selected_name: "friend"
         )
       end
 
@@ -630,6 +631,86 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_pending_runtime_recovery_does_not_reload_a_profile_the_user_left
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "active.yaml")
+      other = File.join(directory, "other.yaml")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old"))
+      File.binwrite(profile, original)
+      File.binwrite(other, YAML.dump(base_config.merge("subscription-marker" => "other")))
+      preview = ClashPatch.patch_path(
+        profile, @policy, dry_run: true, validator: ->(_path) { true },
+        usage_profile: 1, capture_transaction: true
+      )
+      candidate = preview.fetch(:transaction_candidate)
+      ClashPatch.prepare_profile_transaction(
+        [{ path: profile, original: original.b, candidate: candidate }],
+        backup_root
+      )
+      File.binwrite(profile, candidate)
+      selected = "active"
+      put_paths = []
+      requester = lambda do |method, endpoint, body = nil|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          selected = "other"
+          [200, JSON.generate("proxies" => {
+            "Main" => { "type" => "Selector", "now" => "Taiwan" }
+          })]
+        when ["PUT", "/configs?force=true"]
+          put_paths << JSON.parse(body).fetch("path")
+          [204, ""]
+        else
+          [204, ""]
+        end
+      end
+      validator_called = false
+
+      results = ClashPatch.stub(:selected_profile_name, -> { selected }) do
+        ClashPatch.stub(:storage_mode, :local) do
+          ClashPatch.run(
+            directory: directory, policy_path: POLICY_PATH, backup_root: backup_root,
+            validator: ->(_path) { validator_called = true; true },
+            auto_reload: true, requester: requester,
+            connectivity_checker: -> { true }, usage_profile: 1
+          )
+        end
+      end
+
+      assert_empty put_paths, "runtime recovery forced the profile the user had left"
+      assert_equal original.b, File.binread(profile)
+      assert File.exist?(ClashPatch.profile_transaction_path(backup_root))
+      refute validator_called
+      assert results.any? { |result| result.fetch(:status) == :reload_failed_restore_pending }
+    end
+  end
+
+  def test_pending_runtime_recovery_keeps_the_journal_when_the_active_profile_is_missing
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "active.yaml")
+      backup_root = File.join(directory, "backups")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old"))
+      candidate = YAML.dump(base_config.merge("subscription-marker" => "candidate"))
+      File.binwrite(profile, original)
+      ClashPatch.prepare_profile_transaction(
+        [{ path: profile, original: original, candidate: candidate }],
+        backup_root
+      )
+      File.binwrite(profile, candidate)
+
+      result = ClashPatch.stub(:selected_profile_name, "missing-profile") do
+        ClashPatch.recover_pending_profile_transaction(
+          backup_root, directories: [directory]
+        )
+      end
+
+      assert_equal :runtime_restore_pending, result
+      assert_equal candidate.b, File.binread(profile)
+      assert File.file?(ClashPatch.profile_transaction_path(backup_root))
+    end
+  end
+
   def test_production_probe_next_safe_update_recovers_batch_killed_after_first_swap
     require_production_probe!
     Dir.mktmpdir do |directory|
@@ -669,7 +750,8 @@ class MacosPatcherTest < Minitest::Test
               fetcher: lambda { |target|
                 YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}"))
               },
-              validator: ->(_path) { true }, activation: ->(_items) { true }
+              validator: ->(_path) { true }, activation: ->(_items) { true },
+              selected_name: "a-first"
             )
           end
           exit! 0
@@ -686,7 +768,8 @@ class MacosPatcherTest < Minitest::Test
           targets: targets, policy: @policy,
           backup_root: File.join(directory, "backups"), usage_profile: 1,
           fetcher: ->(_target) { raise IOError, "injected preflight failure" },
-          validator: ->(_path) { true }, activation: ->(_items) { true }
+          validator: ->(_path) { true }, activation: ->(_items) { true },
+          selected_name: "a-first"
         )
         originals.each do |path, bytes|
           assert File.binread(path) == bytes, "next safe-update entry did not recover #{File.basename(path)}"
@@ -2940,6 +3023,34 @@ class MacosPatcherTest < Minitest::Test
     refute restored
   end
 
+  def test_safe_update_does_not_reload_runtime_without_a_recovery_transaction
+    Dir.mktmpdir do |directory|
+      path = File.join(directory, "active.yaml")
+      backup_root = File.join(directory, "backups")
+      FileUtils.mkdir_p(backup_root)
+      File.binwrite(path, YAML.dump(base_config.merge("subscription-marker" => "old")))
+      target = { name: "active", path: path, url: "https://subscriptions.invalid/active" }
+      recovery_calls = 0
+
+      result = ClashPatch.stub(:reload_recovered_safe_update_runtime, lambda { |*_arguments|
+        recovery_calls += 1
+        true
+      }) do
+        ClashPatch.safe_update_all(
+          targets: [target], policy: @policy, backup_root: backup_root, usage_profile: 1,
+          fetcher: lambda { |_item|
+            YAML.dump(base_config.merge("subscription-marker" => "new"))
+          },
+          validator: ->(_path) { true }, activation: ->(_items) { true },
+          selected_name: "active"
+        )
+      end
+
+      assert_equal :updated, result.fetch(:status)
+      assert_equal 0, recovery_calls
+    end
+  end
+
   def test_recovered_safe_update_runtime_checks_the_remote_active_profile
     target = { name: "active", path: "/tmp/active.yaml" }
     put_paths = []
@@ -2956,14 +3067,32 @@ class MacosPatcherTest < Minitest::Test
     end
     refute no_socket
 
+    changed = ClashPatch.stub(:controller_socket, "socket") do
+      ClashPatch.stub(:controller_request, requester) do
+        ClashPatch.stub(:runtime_selections, {}) do
+          ClashPatch.stub(:capture_runtime_profile_context, nil) do
+            ClashPatch.reload_recovered_safe_update_runtime([target], 3, "active")
+          end
+        end
+      end
+    end
+    refute changed
+    assert_empty put_paths
+
     restored = ClashPatch.stub(:controller_socket, "socket") do
       ClashPatch.stub(:controller_request, requester) do
         ClashPatch.stub(:runtime_selections, {}) do
-          ClashPatch.stub(:runtime_health_healthy?, lambda { |_requester, **options|
-            expected_tun = options.fetch(:expected_tun)
-            true
-          }) do
-            ClashPatch.reload_recovered_safe_update_runtime([target], 3, "active")
+          context = {
+            selected: "active", storage: nil,
+            active_path: File.expand_path(target.fetch(:path))
+          }
+          ClashPatch.stub(:capture_runtime_profile_context, context) do
+            ClashPatch.stub(:runtime_health_healthy?, lambda { |_requester, **options|
+              expected_tun = options.fetch(:expected_tun)
+              true
+            }) do
+              ClashPatch.reload_recovered_safe_update_runtime([target], 3, "active")
+            end
           end
         end
       end
@@ -3023,7 +3152,7 @@ class MacosPatcherTest < Minitest::Test
       result = ClashPatch.safe_update_all(
         targets: targets, policy: @policy, backup_root: backup_root, usage_profile: 3,
         fetcher: fetcher, validator: ->(_path) { true },
-        activation: ->(_items) { activated = true; true }
+        activation: ->(_items) { activated = true; true }, selected_name: "MESL"
       )
 
       assert_equal :updated, result.fetch(:status)
@@ -3061,7 +3190,8 @@ class MacosPatcherTest < Minitest::Test
       first = ClashPatch.safe_update_all(
         targets: [target], policy: @policy, backup_root: backup_root, usage_profile: 1,
         fetcher: fetcher, validator: ->(_path) { true },
-        activation: ->(_items) { flunk "preflight conflict must not activate" }
+        activation: ->(_items) { flunk "preflight conflict must not activate" },
+        selected_name: "friend"
       )
 
       assert refresh_injected
@@ -3074,7 +3204,8 @@ class MacosPatcherTest < Minitest::Test
       second = ClashPatch.safe_update_all(
         targets: [target], policy: @policy, backup_root: backup_root, usage_profile: 1,
         fetcher: ->(_target) { YAML.dump(base_config.merge("subscription-marker" => "retry")) },
-        validator: ->(_path) { true }, activation: ->(_items) { true }
+        validator: ->(_path) { true }, activation: ->(_items) { true },
+        selected_name: "friend"
       )
       assert_equal :updated, second.fetch(:status)
       assert_equal "retry", ClashPatch.load_yaml(File.binread(path)).fetch("subscription-marker")
@@ -3108,7 +3239,8 @@ class MacosPatcherTest < Minitest::Test
         ClashPatch.safe_update_all(
           targets: targets, policy: @policy, backup_root: backup_root, usage_profile: 3,
           fetcher: ->(target) { YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}")) },
-          validator: ->(_path) { true }, activation: ->(_items) { flunk "must not activate" }
+          validator: ->(_path) { true }, activation: ->(_items) { flunk "must not activate" },
+          selected_name: "first"
         )
       end
 
@@ -3148,7 +3280,8 @@ class MacosPatcherTest < Minitest::Test
         ClashPatch.safe_update_all(
           targets: [target], policy: @policy, backup_root: backup_root, usage_profile: 1,
           fetcher: ->(_item) { YAML.dump(base_config.merge("subscription-marker" => "new")) },
-          validator: ->(_path) { true }, activation: ->(_items) { flunk "must not activate" }
+          validator: ->(_path) { true }, activation: ->(_items) { flunk "must not activate" },
+          selected_name: "friend"
         )
       end
 
@@ -3183,7 +3316,8 @@ class MacosPatcherTest < Minitest::Test
         ClashPatch.safe_update_all(
           targets: targets, policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 3,
           fetcher: ->(target) { YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}")) },
-          validator: ->(_path) { true }, activation: ->(_items) { flunk "must not activate" }
+          validator: ->(_path) { true }, activation: ->(_items) { flunk "must not activate" },
+          selected_name: "first"
         )
       end
 
@@ -3208,7 +3342,8 @@ class MacosPatcherTest < Minitest::Test
 
       result = ClashPatch.safe_update_all(
         targets: targets, policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 3,
-        fetcher: fetcher, validator: ->(_path) { true }, activation: ->(_items) { flunk "must not activate" }
+        fetcher: fetcher, validator: ->(_path) { true },
+        activation: ->(_items) { flunk "must not activate" }, selected_name: "first"
       )
 
       assert_equal :aborted, result.fetch(:status)
@@ -3229,7 +3364,7 @@ class MacosPatcherTest < Minitest::Test
         targets: [{ name: "ordinary", path: path, url: "https://subscriptions.invalid/ordinary" }],
         policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 2,
         fetcher: ->(_target) { YAML.dump(downloaded) }, validator: ->(_path) { true },
-        activation: ->(_items) { true }
+        activation: ->(_items) { true }, selected_name: "ordinary"
       )
 
       assert_equal :updated, result.fetch(:status)
@@ -3257,12 +3392,146 @@ class MacosPatcherTest < Minitest::Test
       result = ClashPatch.safe_update_all(
         targets: targets, policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 3,
         fetcher: ->(target) { YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}")) },
-        validator: ->(_path) { true }, activation: ->(_items) { raise "controller failed" }
+        validator: ->(_path) { true }, activation: ->(_items) { raise "controller failed" },
+        selected_name: "first"
       )
 
       assert_equal :aborted, result.fetch(:status)
       assert_equal :activation_failed, result.fetch(:reason)
       targets.each { |target| assert_equal originals.fetch(target.fetch(:path)), File.binread(target.fetch(:path)) }
+    end
+  end
+
+  def test_safe_update_does_not_reload_the_old_profile_after_the_user_switches_profiles
+    Dir.mktmpdir do |directory|
+      targets = %w[friend other].map do |name|
+        path = File.join(directory, "#{name}.yaml")
+        File.write(path, YAML.dump(base_config.merge("subscription-marker" => "old-#{name}")))
+        { name: name, path: path, url: "https://subscriptions.invalid/#{name}" }
+      end
+      originals = targets.to_h { |target| [target.fetch(:path), File.binread(target.fetch(:path))] }
+      selected = "friend"
+      put_paths = []
+      requester = lambda do |_socket, method, endpoint, body|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          [200, JSON.generate("proxies" => {
+            "Main" => { "type" => "Selector", "now" => "台湾家宽 01" }
+          })]
+        when ["PUT", "/configs?force=true"]
+          put_paths << JSON.parse(body).fetch("path")
+          [204, ""]
+        else
+          [204, ""]
+        end
+      end
+      fetcher = lambda do |target|
+        selected = "other"
+        YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}"))
+      end
+
+      result = ClashPatch.stub(:selected_profile_name, -> { selected }) do
+        ClashPatch.stub(:storage_mode, :local) do
+          ClashPatch.stub(:controller_socket, "socket") do
+            ClashPatch.stub(:controller_request, requester) do
+              ClashPatch.safe_update_all(
+                targets: targets, policy: @policy,
+                backup_root: File.join(directory, "backups"), usage_profile: 1,
+                fetcher: fetcher, validator: ->(_path) { true }
+              )
+            end
+          end
+        end
+      end
+
+      assert_empty put_paths, "profile switch allowed the old profile to be forced back into Mihomo"
+      assert_equal :aborted, result.fetch(:status)
+      targets.each do |target|
+        assert_equal originals.fetch(target.fetch(:path)), File.binread(target.fetch(:path)),
+                     "profile switch did not restore the safe-update batch"
+      end
+    end
+  end
+
+  def test_safe_update_aborts_when_the_user_enters_a_remote_target_during_validation
+    Dir.mktmpdir do |directory|
+      config_path = File.join(directory, "config.yaml")
+      remote_path = File.join(directory, "remote.yaml")
+      backup_root = File.join(directory, "backups")
+      File.binwrite(config_path, YAML.dump(base_config.merge("subscription-marker" => "config")))
+      original = YAML.dump(base_config.merge("subscription-marker" => "old-remote"))
+      File.binwrite(remote_path, original)
+      target = {
+        name: "remote", path: remote_path,
+        url: "https://subscriptions.invalid/remote"
+      }
+      selected = "config"
+      fetcher = lambda do |_item|
+        selected = "remote"
+        YAML.dump(base_config.merge("subscription-marker" => "new-remote"))
+      end
+
+      result = ClashPatch.stub(:selected_profile_name, -> { selected }) do
+        ClashPatch.safe_update_all(
+          targets: [target], policy: @policy, backup_root: backup_root,
+          usage_profile: 1, fetcher: fetcher, validator: ->(_path) { true }
+        )
+      end
+
+      assert_equal :aborted, result.fetch(:status)
+      assert_equal :activation_failed, result.fetch(:reason)
+      assert_equal original.b, File.binread(remote_path)
+      refute File.exist?(ClashPatch.profile_transaction_path(backup_root))
+    end
+  end
+
+  def test_safe_update_aborts_if_the_client_changes_storage_during_validation
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old"))
+      File.binwrite(profile, original)
+      target = {
+        name: "friend", path: profile,
+        url: "https://subscriptions.invalid/friend"
+      }
+      storage = :local
+      put_paths = []
+      controller = lambda do |_socket, method, endpoint, body|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          [200, JSON.generate("proxies" => {
+            "Main" => { "type" => "Selector", "now" => "Taiwan" }
+          })]
+        when ["PUT", "/configs?force=true"]
+          put_paths << JSON.parse(body).fetch("path")
+          [204, ""]
+        else
+          [204, ""]
+        end
+      end
+      fetcher = lambda do |_item|
+        storage = :icloud
+        YAML.dump(base_config.merge("subscription-marker" => "new"))
+      end
+
+      result = ClashPatch.stub(:selected_profile_name, "friend") do
+        ClashPatch.stub(:storage_mode, -> { storage }) do
+          ClashPatch.stub(:controller_socket, "socket") do
+            ClashPatch.stub(:controller_request, controller) do
+              ClashPatch.safe_update_all(
+                targets: [target], policy: @policy,
+                backup_root: File.join(directory, "backups"), usage_profile: 1,
+                fetcher: fetcher, validator: ->(_path) { true },
+                guard_storage: true
+              )
+            end
+          end
+        end
+      end
+
+      assert_empty put_paths
+      assert_equal :aborted, result.fetch(:status)
+      assert_equal original.b, File.binread(profile)
     end
   end
 
@@ -3294,7 +3563,8 @@ class MacosPatcherTest < Minitest::Test
         targets: [target], policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 3,
         fetcher: ->(_target) { YAML.dump(base_config.merge("subscription-marker" => "new")) },
         validator: ->(_path) { true },
-        activation: ->(_items) { { status: :reload_failed_restore_pending } }
+        activation: ->(_items) { { status: :reload_failed_restore_pending } },
+        selected_name: "friend"
       )
 
       assert_equal :runtime_restore_pending, result.fetch(:status)
@@ -3339,7 +3609,8 @@ class MacosPatcherTest < Minitest::Test
           ClashPatch.safe_update_all(
             targets: targets, policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 1,
             fetcher: ->(target) { YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}")) },
-            validator: ->(_path) { true }, activation: activation
+            validator: ->(_path) { true }, activation: activation,
+            selected_name: "active"
           )
         end
       end
@@ -3398,7 +3669,8 @@ class MacosPatcherTest < Minitest::Test
             ClashPatch.safe_update_all(
               targets: [target], policy: @policy, backup_root: backup_root, usage_profile: 1,
               fetcher: ->(_item) { YAML.dump(base_config.merge("subscription-marker" => "new")) },
-              validator: ->(_path) { true }, activation: activation
+              validator: ->(_path) { true }, activation: activation,
+              selected_name: "active"
             )
           end
         end
@@ -3430,7 +3702,8 @@ class MacosPatcherTest < Minitest::Test
         ClashPatch.safe_update_all(
           targets: targets, policy: @policy, backup_root: File.join(directory, "backups"), usage_profile: 3,
           fetcher: ->(target) { YAML.dump(base_config.merge("subscription-marker" => "new-#{target.fetch(:name)}")) },
-          validator: ->(_path) { true }, activation: ->(_items) { false }
+          validator: ->(_path) { true }, activation: ->(_items) { false },
+          selected_name: "first"
         )
       end
 
@@ -3453,7 +3726,8 @@ class MacosPatcherTest < Minitest::Test
         usage_profile: 3,
         fetcher: ->(_target) { YAML.dump(base_config.merge("subscription-marker" => "new")) },
         validator: ->(_candidate) { true },
-        activation: ->(_items) { true }
+        activation: ->(_items) { true },
+        selected_name: "friend"
       }
 
       ClashPatch.stub(:locked_profile_current?, false) do
@@ -3492,7 +3766,8 @@ class MacosPatcherTest < Minitest::Test
           targets: [target], policy: @policy, backup_root: File.join(directory, "backups"),
           usage_profile: 3,
           fetcher: ->(_target) { YAML.dump(base_config.merge("subscription-marker" => "new")) },
-          validator: ->(_candidate) { true }, activation: ->(_items) { flunk "must not activate" }
+          validator: ->(_candidate) { true }, activation: ->(_items) { flunk "must not activate" },
+          selected_name: "friend"
         )
         assert_equal :aborted, result.fetch(:status)
         assert_equal :concurrent_change, result.fetch(:reason)
@@ -3517,7 +3792,7 @@ class MacosPatcherTest < Minitest::Test
           result = ClashPatch.safe_update_all(
             targets: [target], policy: @policy, backup_root: File.join(directory, "backups"),
             usage_profile: 3, fetcher: ->(_target) { YAML.dump(base_config) },
-            validator: ->(_candidate) { true }
+            validator: ->(_candidate) { true }, selected_name: "friend"
           )
           assert_equal :aborted, result.fetch(:status)
           assert_equal :unexpected_error, result.fetch(:reason)
@@ -3963,6 +4238,81 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_run_does_not_reload_the_old_profile_after_the_user_switches_profiles
+    Dir.mktmpdir do |directory|
+      paths = %w[friend other].to_h do |name|
+        path = File.join(directory, "#{name}.yaml")
+        File.write(path, YAML.dump(base_config.merge("subscription-marker" => "old-#{name}")))
+        [name, path]
+      end
+      originals = paths.transform_values { |path| File.binread(path) }
+      selected = "friend"
+      put_paths = []
+      requester = lambda do |method, endpoint, body|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          [200, JSON.generate("proxies" => {
+            "Main" => { "type" => "Selector", "now" => "台湾家宽 01" }
+          })]
+        when ["GET", "/configs"]
+          [200, JSON.generate("tun" => { "enable" => false })]
+        when ["PUT", "/configs?force=true"]
+          put_paths << JSON.parse(body).fetch("path")
+          [204, ""]
+        else
+          [204, ""]
+        end
+      end
+      validator = lambda do |_path|
+        selected = "other"
+        true
+      end
+
+      results = ClashPatch.stub(:selected_profile_name, -> { selected }) do
+        ClashPatch.stub(:storage_mode, :local) do
+          ClashPatch.run(
+            directory: directory, policy_path: POLICY_PATH,
+            backup_root: File.join(directory, "backups"),
+            validator: validator, auto_reload: true, requester: requester,
+            connectivity_checker: -> { true }, usage_profile: 1
+          )
+        end
+      end
+
+      assert_empty put_paths, "profile switch allowed the old profile to be forced back into Mihomo"
+      paths.each do |name, path|
+        assert_equal originals.fetch(name), File.binread(path),
+                     "profile switch did not restore the aborted batch: #{name}"
+      end
+      refute results.all? { |result| %i[updated unchanged].include?(result.fetch(:status)) }
+    end
+  end
+
+  def test_run_without_reload_stops_when_the_current_profile_cannot_be_read
+    Dir.mktmpdir do |directory|
+      paths = %w[config friend].to_h do |name|
+        path = File.join(directory, "#{name}.yaml")
+        File.binwrite(path, YAML.dump(base_config.merge("subscription-marker" => name)))
+        [name, path]
+      end
+      originals = paths.transform_values { |path| File.binread(path) }
+
+      results = ClashPatch.stub(:selected_profile_name, nil) do
+        ClashPatch.run(
+          directory: directory, policy_path: POLICY_PATH,
+          backup_root: File.join(directory, "backups"),
+          auto_reload: false, validator: ->(_path) { true },
+          usage_profile: 1
+        )
+      end
+
+      assert_equal [:concurrent_change], results.map { |result| result.fetch(:status) }.uniq
+      paths.each do |name, path|
+        assert_equal originals.fetch(name), File.binread(path)
+      end
+    end
+  end
+
   def test_runtime_selection_guard_ignores_automatic_url_test_groups
     requester = lambda do |_method, _endpoint, _body|
       [200, JSON.generate("proxies" => {
@@ -3972,6 +4322,97 @@ class MacosPatcherTest < Minitest::Test
     end
 
     assert_equal({ "Main" => "Singapore" }, ClashPatch.runtime_selections(requester))
+  end
+
+  def test_runtime_profile_context_guards_fail_closed
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
+
+      selected_reads = %w[friend other]
+      unstable = ClashPatch.stub(:selected_profile_name, -> { selected_reads.shift }) do
+        ClashPatch.capture_runtime_profile_context([directory])
+      end
+      assert_nil unstable
+
+      File.stub(:realpath, ->(_path) { raise Errno::ENOENT }) do
+        ClashPatch.stub(:selected_profile_name, "friend") do
+          assert_nil ClashPatch.capture_runtime_profile_context([directory])
+        end
+      end
+
+      ClashPatch.stub(:selected_profile_name, nil) do
+        assert_nil ClashPatch.capture_runtime_profile_context([directory])
+      end
+      ClashPatch.stub(:selected_profile_name, "missing") do
+        assert_nil ClashPatch.capture_runtime_profile_context([directory])
+      end
+
+      refute ClashPatch.runtime_profile_context_current?("invalid", [directory])
+      ClashPatch.stub(:capture_runtime_profile_context, ->(*_args, **_kwargs) { raise "changed" }) do
+        refute ClashPatch.runtime_profile_context_current?({}, [directory])
+      end
+      assert ClashPatch.runtime_precommit_allowed?(nil)
+      assert ClashPatch.runtime_precommit_allowed?(-> { true })
+      refute ClashPatch.runtime_precommit_allowed?(-> { false })
+      refute ClashPatch.runtime_precommit_allowed?(-> { raise "changed" })
+
+      results = ClashPatch.stub(:capture_runtime_profile_context, nil) do
+        ClashPatch.run(
+          directory: directory, policy_path: POLICY_PATH,
+          backup_root: File.join(directory, "backups"),
+          auto_reload: true, validator: ->(_path) { flunk "unstable context reached validation" }
+        )
+      end
+      assert_equal [:concurrent_change], results.map { |result| result.fetch(:status) }.uniq
+
+      target = {
+        name: "friend", path: profile,
+        url: "https://subscriptions.invalid/friend"
+      }
+      result = ClashPatch.stub(:capture_runtime_profile_context, nil) do
+        ClashPatch.safe_update_all(
+          targets: [target], policy: @policy,
+          backup_root: File.join(directory, "safe-backups"), usage_profile: 1,
+          fetcher: ->(_item) { flunk "unstable context reached download" },
+          validator: ->(_path) { true }
+        )
+      end
+      assert_equal :aborted, result.fetch(:status)
+      assert_equal :client_state_changed, result.fetch(:reason)
+    end
+  end
+
+  def test_public_transaction_recovery_forwards_the_live_profile_guard
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      backup_root = File.join(directory, "backups")
+      FileUtils.mkdir_p(backup_root)
+      File.write(profile, YAML.dump(base_config))
+      File.write(ClashPatch.profile_transaction_path(backup_root), "{}\n")
+      forwarded = false
+      resume = lambda do |_root, roots:, work_items:, reload_runtime:, require_tun:,
+                         precommit_condition:, **_keywords|
+        assert_equal [directory], roots
+        assert work_items.any? { |item| item.fetch(:active) }
+        assert reload_runtime
+        assert_equal :preserve, require_tun
+        assert precommit_condition.call
+        forwarded = true
+        :recovered
+      end
+
+      result = ClashPatch.stub(:selected_profile_name, "friend") do
+        ClashPatch.stub(:resume_profile_transaction, resume) do
+          ClashPatch.recover_pending_profile_transaction(
+            backup_root, directories: [directory]
+          )
+        end
+      end
+
+      assert_equal :recovered, result
+      assert forwarded
+    end
   end
 
   def test_route_verifier_rejects_direct_hidden_below_ai_selector
@@ -4051,6 +4492,52 @@ class MacosPatcherTest < Minitest::Test
 
       assert_equal :reload_failed_rolled_back, result.fetch(:status)
       assert_equal original.b, File.binread(profile)
+    end
+  end
+
+  def test_reload_failure_does_not_force_the_old_profile_after_a_late_user_switch
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      original = YAML.dump(base_config.merge("subscription-marker" => "old"))
+      candidate = YAML.dump(base_config.merge("subscription-marker" => "new"))
+      File.binwrite(profile, candidate)
+      stat = File.stat(profile)
+      guard_calls = 0
+      precommit = lambda do
+        guard_calls += 1
+        guard_calls == 1
+      end
+      put_paths = []
+      requester = lambda do |method, endpoint, body|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          [200, JSON.generate("proxies" => {
+            "Main" => { "type" => "Selector", "now" => "Taiwan" }
+          })]
+        when ["PUT", "/configs?force=true"]
+          put_paths << JSON.parse(body).fetch("path")
+          [204, ""]
+        when ["POST", "/cache/fakeip/flush"]
+          [503, ""]
+        else
+          [204, ""]
+        end
+      end
+
+      result = ClashPatch.activate_updated_profile(
+        {
+          path: profile, rollback_bytes: original.b,
+          patched_digest: Digest::SHA256.hexdigest(candidate.b),
+          patched_identity: [stat.dev, stat.ino], patched_path: File.realpath(profile)
+        },
+        requester: requester, connectivity_checker: -> { true },
+        require_tun: false, precommit_condition: precommit
+      )
+
+      assert_equal [File.expand_path(profile)], put_paths
+      assert_equal original.b, File.binread(profile)
+      assert_equal :reload_failed_restore_pending, result.fetch(:status)
+      assert_equal 2, guard_calls
     end
   end
 
@@ -4688,6 +5175,44 @@ class MacosPatcherTest < Minitest::Test
     Open3.stub(:capture3, runner) do
       assert_equal "Yue.to | 悦通", ClashPatch.defaults_read("selectConfigName")
     end
+  end
+
+  def test_selected_profile_snapshot_distinguishes_default_config_from_read_failure
+    success = Struct.new(:success?).new(true)
+    failure = Struct.new(:success?).new(false)
+    plist = "<?xml version=\"1.0\"?><plist><dict/></plist>"
+    cases = [
+      [
+        [[plist, "", success], [JSON.generate("selectConfigName" => "friend"), "", success]],
+        "friend"
+      ],
+      [
+        [[plist, "", success], [JSON.generate({}), "", success]],
+        ""
+      ],
+      [
+        [[plist, "", success], ["", "invalid plist", failure]],
+        nil
+      ]
+    ]
+
+    cases.each do |responses, expected|
+      runner = lambda do |*_args, **_kwargs|
+        responses.shift || ["", "", failure]
+      end
+      if expected.nil?
+        assert_nil ClashPatch.selected_profile_name(runner: runner)
+      else
+        assert_equal expected, ClashPatch.selected_profile_name(runner: runner)
+      end
+    end
+    assert_nil ClashPatch.selected_profile_name(runner: ->(*_args, **_kwargs) { raise IOError })
+    responses = [[plist, "", success]]
+    assert_nil ClashPatch.selected_profile_name(
+      runner: lambda { |*_args, **_kwargs|
+        responses.shift || raise(IOError, "plutil unavailable")
+      }
+    )
   end
 
   def test_single_custom_profile_directory_is_active
@@ -5771,7 +6296,8 @@ class MacosPatcherTest < Minitest::Test
         usage_profile: 3,
         fetcher: ->(_target) { YAML.dump(base_config.merge("subscription-marker" => "new")) },
         validator: ->(_candidate) { true },
-        activation: ->(_items) { flunk "must not activate" }
+        activation: ->(_items) { flunk "must not activate" },
+        selected_name: "friend"
       }
 
       lock_checks = [true, true, false]
@@ -5796,6 +6322,11 @@ class MacosPatcherTest < Minitest::Test
   def test_storage_and_application_discovery_cover_local_and_icloud_variants
     ClashPatch.stub(:storage_mode, :icloud) do
       assert ClashPatch.icloud_enabled?
+    end
+    ClashPatch.stub(:selected_profile_name, nil) do
+      assert_empty ClashPatch.default_profile_directories(
+        home: Dir.tmpdir, app_paths: [], cloud_enabled: true
+      )
     end
 
     expected_user_app = File.expand_path("~/Applications/ClashX Meta.app")
@@ -5854,8 +6385,8 @@ class MacosPatcherTest < Minitest::Test
     Dir.mktmpdir do |directory|
       backup_root = File.join(directory, "backups")
       calls = []
-      recovery = lambda do |root, directories:|
-        calls << [root, directories]
+      recovery = lambda do |root, directories:, guard_storage:, expected_storage:|
+        calls << [root, directories, guard_storage, expected_storage]
         :recovered
       end
       ClashPatch.stub(:recover_pending_profile_transaction, recovery) do
@@ -5868,7 +6399,7 @@ class MacosPatcherTest < Minitest::Test
         assert_empty error
         assert_equal "recovered\n", output
       end
-      assert_equal [[backup_root, [directory]]], calls
+      assert_equal [[backup_root, [directory], false, nil]], calls
 
       ClashPatch.stub(:recover_pending_profile_transaction, :recovered) do
         output, error = capture_io do
@@ -5977,6 +6508,7 @@ class MacosPatcherTest < Minitest::Test
 
   def test_cli_json_covers_backup_and_auto_update_operations
     Dir.mktmpdir do |directory|
+      File.write(File.join(directory, "friend.yaml"), YAML.dump(base_config))
       ClashPatch.stub(:list_backups, ["private.backup"]) do
         output, = capture_io do
           assert_equal 0, ClashPatch.cli(["--json", "--profile-dir", directory, "--list-backups"])
@@ -5997,10 +6529,12 @@ class MacosPatcherTest < Minitest::Test
         assert_equal ["dns.nameserver"], JSON.parse(output).fetch("changes")
       end
       ClashPatch.stub(:restore_backup, { status: :updated }) do
-        output, = capture_io do
-          assert_equal 0, ClashPatch.cli(["--json", "--profile-dir", directory, "--restore-backup", "id"])
+        ClashPatch.stub(:selected_profile_name, "friend") do
+          output, = capture_io do
+            assert_equal 0, ClashPatch.cli(["--json", "--profile-dir", directory, "--restore-backup", "id"])
+          end
+          assert_equal "updated", JSON.parse(output).fetch("code")
         end
-        assert_equal "updated", JSON.parse(output).fetch("code")
       end
       ClashPatch.stub(:disable_subscription_auto_update, { status: :already_disabled }) do
         output, = capture_io do
@@ -6138,17 +6672,20 @@ class MacosPatcherTest < Minitest::Test
 
   def test_cli_human_restore_and_top_level_errors_report_without_sensitive_values
     Dir.mktmpdir do |directory|
+      File.write(File.join(directory, "friend.yaml"), YAML.dump(base_config))
       [
         :reload_failed_rolled_back,
         :reload_failed_rollback_conflict,
         :invalid_backup
       ].each do |status|
         ClashPatch.stub(:restore_backup, { status: status }) do
-          output, error = capture_io do
-            assert_equal 1, ClashPatch.cli(["--profile-dir", directory, "--restore-backup", "backup-id"])
+          ClashPatch.stub(:selected_profile_name, "friend") do
+            output, error = capture_io do
+              assert_equal 1, ClashPatch.cli(["--profile-dir", directory, "--restore-backup", "backup-id"])
+            end
+            assert_includes output, status.to_s
+            assert_empty error
           end
-          assert_includes output, status.to_s
-          assert_empty error
         end
       end
 
@@ -6183,12 +6720,13 @@ class MacosPatcherTest < Minitest::Test
   def test_cli_restore_backup_reloads_and_checks_the_active_profile
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
       restore_result = {
         status: :updated, path: profile, rollback_bytes: "current",
         patched_digest: Digest::SHA256.hexdigest("restored")
       }
       activated = false
-      activation = lambda do |result, require_tun:|
+      activation = lambda do |result, require_tun:, **_keywords|
         activated = true
         assert_equal :preserve, require_tun
         result.merge(reloaded: true)
@@ -6218,9 +6756,150 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_cli_restore_backup_refuses_an_unstable_client_context
+    Dir.mktmpdir do |directory|
+      File.write(File.join(directory, "friend.yaml"), YAML.dump(base_config))
+      [false, true].each do |json|
+        arguments = [
+          "--profile-dir", directory, "--restore-backup", "backup-id",
+          "--expected-current-sha256", "0" * 64
+        ]
+        arguments.unshift("--json") if json
+        output, error = ClashPatch.stub(:capture_runtime_profile_context, nil) do
+          capture_io { assert_equal 1, ClashPatch.cli(arguments) }
+        end
+        if json
+          result = JSON.parse(output)
+          assert_equal "client_state_changed", result.fetch("code")
+          assert_empty error
+        else
+          assert_empty output
+          assert_includes error, "当前订阅或存储位置正在变化"
+        end
+      end
+    end
+  end
+
+  def test_cli_restore_backup_does_not_activate_a_noncurrent_profile
+    Dir.mktmpdir do |directory|
+      friend = File.join(directory, "friend.yaml")
+      other = File.join(directory, "other.yaml")
+      File.write(friend, YAML.dump(base_config))
+      File.write(other, YAML.dump(base_config))
+      restore_result = {
+        status: :updated, path: friend, rollback_bytes: "current",
+        patched_digest: Digest::SHA256.hexdigest("restored")
+      }
+      restore = lambda do |*_arguments, **keywords|
+        keywords.fetch(:activation).call(restore_result)
+      end
+
+      ClashPatch.stub(:restore_backup, restore) do
+        ClashPatch.stub(:selected_profile_name, "other") do
+          output, error = capture_io do
+            assert_equal 0, ClashPatch.cli([
+              "--json", "--profile-dir", directory, "--restore-backup", "backup-id",
+              "--expected-current-sha256", "0" * 64
+            ])
+          end
+          assert_empty error
+          result = JSON.parse(output)
+          assert_equal "ok", result.fetch("status")
+          assert_equal "updated", result.fetch("code")
+          assert_equal "备份已恢复。", result.fetch("summary_zh")
+        end
+      end
+    end
+  end
+
+  def test_cli_restore_backup_rolls_back_if_the_user_enters_the_target_during_validation
+    Dir.mktmpdir do |directory|
+      friend = File.join(directory, "friend.yaml")
+      other = File.join(directory, "other.yaml")
+      backup_root = File.join(directory, "backups")
+      current = YAML.dump(base_config.merge("subscription-marker" => "current"))
+      restored = YAML.dump(base_config.merge("subscription-marker" => "restored"))
+      File.binwrite(friend, current)
+      File.binwrite(other, YAML.dump(base_config.merge("subscription-marker" => "other")))
+      backup = ClashPatch.create_versioned_backup(
+        friend, backup_root, content: restored, reason: "prewrite"
+      )
+      selected = "other"
+      validator = lambda do |_path|
+        selected = "friend"
+        true
+      end
+      output = nil
+
+      ClashPatch.stub(:selected_profile_name, -> { selected }) do
+        ClashPatch.stub(:validate_with_mihomo, validator) do
+          output, error = capture_io do
+            assert_equal 1, ClashPatch.cli([
+              "--json", "--profile-dir", directory,
+              "--backup-dir", backup_root,
+              "--restore-backup", File.basename(backup),
+              "--expected-current-sha256", Digest::SHA256.hexdigest(current.b)
+            ])
+          end
+          assert_empty error
+        end
+      end
+
+      assert_equal current.b, File.binread(friend)
+      refute File.exist?(ClashPatch.profile_transaction_path(backup_root))
+      result = JSON.parse(output)
+      assert_equal "rolled_back", result.fetch("status")
+      assert_equal "restore_runtime_check_failed", result.fetch("code")
+    end
+  end
+
+  def test_cli_restore_backup_preserves_a_concurrent_refresh_after_context_changes
+    Dir.mktmpdir do |directory|
+      friend = File.join(directory, "friend.yaml")
+      other = File.join(directory, "other.yaml")
+      backup_root = File.join(directory, "backups")
+      current = YAML.dump(base_config.merge("subscription-marker" => "current"))
+      restored = YAML.dump(base_config.merge("subscription-marker" => "restored"))
+      refreshed = YAML.dump(base_config.merge("subscription-marker" => "external-refresh"))
+      File.binwrite(friend, current)
+      File.binwrite(other, YAML.dump(base_config.merge("subscription-marker" => "other")))
+      backup = ClashPatch.create_versioned_backup(
+        friend, backup_root, content: restored, reason: "prewrite"
+      )
+      context_check = lambda do |*_arguments, **_keywords|
+        File.binwrite(friend, refreshed)
+        false
+      end
+      output = nil
+
+      ClashPatch.stub(:selected_profile_name, "other") do
+        ClashPatch.stub(:validate_with_mihomo, true) do
+          ClashPatch.stub(:runtime_profile_context_current?, context_check) do
+            output, error = capture_io do
+              assert_equal 1, ClashPatch.cli([
+                "--json", "--profile-dir", directory,
+                "--backup-dir", backup_root,
+                "--restore-backup", File.basename(backup),
+                "--expected-current-sha256", Digest::SHA256.hexdigest(current.b)
+              ])
+            end
+            assert_empty error
+          end
+        end
+      end
+
+      assert_equal refreshed.b, File.binread(friend)
+      assert File.file?(ClashPatch.profile_transaction_path(backup_root))
+      result = JSON.parse(output)
+      assert_equal "partial", result.fetch("status")
+      assert_equal "restore_rollback_conflict", result.fetch("code")
+    end
+  end
+
   def test_cli_restore_backup_reports_when_the_previous_runtime_cannot_be_reloaded
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
       restore_result = {
         status: :updated, path: profile, rollback_bytes: "current",
         patched_digest: Digest::SHA256.hexdigest("restored")
@@ -6252,15 +6931,75 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_cli_restore_backup_does_not_reload_the_old_profile_after_a_user_switch
+    Dir.mktmpdir do |directory|
+      profile = File.join(directory, "friend.yaml")
+      current = YAML.dump(base_config.merge("subscription-marker" => "current"))
+      restored = YAML.dump(base_config.merge("subscription-marker" => "restored"))
+      File.binwrite(profile, restored)
+      stat = File.stat(profile)
+      selected = "friend"
+      put_paths = []
+      controller = lambda do |_socket, method, endpoint, body|
+        case [method, endpoint]
+        when ["GET", "/proxies"]
+          [200, JSON.generate("proxies" => {
+            "Main" => { "type" => "Selector", "now" => "Taiwan" }
+          })]
+        when ["GET", "/configs"]
+          [200, JSON.generate("tun" => { "enable" => false })]
+        when ["PUT", "/configs?force=true"]
+          put_paths << JSON.parse(body).fetch("path")
+          [204, ""]
+        else
+          [204, ""]
+        end
+      end
+      restore_result = {
+        status: :updated, path: profile, rollback_bytes: current.b,
+        patched_digest: Digest::SHA256.hexdigest(restored.b),
+        patched_identity: [stat.dev, stat.ino], patched_path: File.realpath(profile)
+      }
+      restore = lambda do |*_arguments, **keywords|
+        selected = "other"
+        keywords.fetch(:activation).call(restore_result)
+      end
+
+      output = nil
+      ClashPatch.stub(:restore_backup, restore) do
+        ClashPatch.stub(:selected_profile_name, -> { selected }) do
+          ClashPatch.stub(:controller_socket, "socket") do
+            ClashPatch.stub(:controller_request, controller) do
+              output, error = capture_io do
+                assert_equal 1, ClashPatch.cli([
+                  "--json", "--profile-dir", directory, "--restore-backup", "backup-id",
+                  "--expected-current-sha256", "0" * 64
+                ])
+              end
+              assert_empty error
+            end
+          end
+        end
+      end
+
+      assert_empty put_paths, "backup restore forced the profile the user had left"
+      assert_equal current.b, File.binread(profile)
+      result = JSON.parse(output)
+      assert_equal "rolled_back", result.fetch("status")
+      assert_equal "restore_runtime_check_failed", result.fetch("code")
+    end
+  end
+
   def test_cli_restore_backup_checks_the_active_runtime_when_the_file_already_matches
     Dir.mktmpdir do |directory|
       profile = File.join(directory, "friend.yaml")
+      File.write(profile, YAML.dump(base_config))
       restore_result = {
         status: :no_change, path: profile, rollback_bytes: "restored",
         patched_digest: Digest::SHA256.hexdigest("restored")
       }
       activated = false
-      activation = lambda do |result, require_tun:|
+      activation = lambda do |result, require_tun:, **_keywords|
         activated = true
         assert_equal :preserve, require_tun
         result.merge(reloaded: true)
@@ -6577,7 +7316,8 @@ class MacosPatcherTest < Minitest::Test
       results = ClashPatch.run(
         directory: directory, policy_path: POLICY_PATH,
         backup_root: File.join(directory, "backups"),
-        validator: ->(_path) { true }, auto_reload: false, usage_profile: 3
+        validator: ->(_path) { true }, auto_reload: false, usage_profile: 3,
+        selected_name: "a-valid"
       )
 
       assert results.any? { |result| result[:status] == :invalid }
@@ -6606,7 +7346,8 @@ class MacosPatcherTest < Minitest::Test
         ClashPatch.run(
           directory: directory, policy_path: POLICY_PATH,
           backup_root: File.join(directory, "backups"),
-          validator: ->(_path) { true }, auto_reload: false, usage_profile: 3
+          validator: ->(_path) { true }, auto_reload: false, usage_profile: 3,
+          selected_name: "a-first"
         )
       end
 
@@ -6967,7 +7708,7 @@ class MacosPatcherTest < Minitest::Test
         backup_root: File.join(directory, "backups"),
         policy: @policy, usage_profile: 3,
         fetcher: ->(_target) { YAML.dump(base_config) },
-        validator: ->(_path) { true }
+        validator: ->(_path) { true }, selected_name: "first"
       )
 
       assert_equal :aborted, result.fetch(:status)

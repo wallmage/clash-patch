@@ -197,7 +197,7 @@ module ClashPatch
   end
 
   def restore_backup(backup_id, directories:, backup_root:, expected_current_sha256:, validator:,
-                     selected_name: nil, activation: nil)
+                     selected_name: nil, activation: nil, precommit_condition: nil)
     operation_lock = nil
     return { status: :restore_conflict } unless expected_current_sha256.to_s.match?(/\A[0-9a-f]{64}\z/i)
 
@@ -208,7 +208,7 @@ module ClashPatch
       work_items = profile_work_items(directories, selected, active_root)
       recovery = resume_profile_transaction(
         backup_root, roots: directories, work_items: work_items, reload_runtime: true,
-        require_tun: :preserve
+        require_tun: :preserve, precommit_condition: precommit_condition
       )
       if recovery == :runtime_restore_pending
         active = work_items.find { |item| item.fetch(:active) }
