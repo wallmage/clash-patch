@@ -1529,6 +1529,30 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_macos_batch_profile_context_guard_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/profile_writer.rb",
+        "        if batch_committed &&\n" \
+          "           !runtime_committed &&\n" \
+          "           results.any? { |result| result[:status] == :updated } &&\n" \
+          "           !runtime_precommit_allowed?(precommit_condition)\n",
+        "        if false &&\n" \
+          "           !runtime_committed &&\n" \
+          "           results.any? { |result| result[:status] == :updated } &&\n" \
+          "           !runtime_precommit_allowed?(precommit_condition)\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name",
+        "test_run_aborts_if_the_user_enters_an_updated_profile_while_the_initial_profile_is_unchanged"
+      )
+    end
+  end
+
   def test_macos_runtime_recovery_profile_guard_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

@@ -4288,6 +4288,56 @@ class MacosPatcherTest < Minitest::Test
     end
   end
 
+  def test_run_aborts_if_the_user_enters_an_updated_profile_while_the_initial_profile_is_unchanged
+    Dir.mktmpdir do |directory|
+      config_path = File.join(directory, "config.yaml")
+      friend_path = File.join(directory, "friend.yaml")
+      patched_config = ClashPatch.patch(
+        base_config.merge("subscription-marker" => "config"),
+        @policy, usage_profile: 1
+      ).fetch(:config)
+      File.binwrite(config_path, YAML.dump(patched_config))
+      File.binwrite(
+        friend_path,
+        YAML.dump(base_config.merge("subscription-marker" => "old-friend"))
+      )
+      originals = {
+        config_path => File.binread(config_path),
+        friend_path => File.binread(friend_path)
+      }
+      backup_root = File.join(directory, "backups")
+      selected = ""
+      put_paths = []
+      validator = lambda do |_path|
+        selected = "friend"
+        true
+      end
+      requester = lambda do |method, endpoint, body|
+        if method == "PUT" && endpoint == "/configs?force=true"
+          put_paths << JSON.parse(body).fetch("path")
+        end
+        [204, ""]
+      end
+
+      results = ClashPatch.stub(:selected_profile_name, -> { selected }) do
+        ClashPatch.run(
+          directory: directory, policy_path: POLICY_PATH,
+          backup_root: backup_root, validator: validator,
+          auto_reload: true, requester: requester,
+          connectivity_checker: -> { true }, usage_profile: 1
+        )
+      end
+
+      assert_empty put_paths
+      originals.each do |path, original|
+        assert_equal original, File.binread(path),
+                     "profile switch did not restore the aborted batch: #{File.basename(path)}"
+      end
+      refute results.all? { |result| %i[updated unchanged].include?(result.fetch(:status)) }
+      refute File.exist?(ClashPatch.profile_transaction_path(backup_root))
+    end
+  end
+
   def test_run_without_reload_stops_when_the_current_profile_cannot_be_read
     Dir.mktmpdir do |directory|
       paths = %w[config friend].to_h do |name|

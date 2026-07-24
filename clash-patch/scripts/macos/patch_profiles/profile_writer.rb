@@ -555,6 +555,22 @@ module ClashPatch
           break
         end
 
+        batch_committed = results.length == work_items.length &&
+                          results.all? { |result| %i[updated unchanged].include?(result.fetch(:status)) }
+        runtime_committed = results.any? do |result|
+          result[:active] && result[:status] == :updated && result[:reloaded] == true
+        end
+        if batch_committed &&
+           !runtime_committed &&
+           results.any? { |result| result[:status] == :updated } &&
+           !runtime_precommit_allowed?(precommit_condition)
+          results.reverse_each do |result|
+            next unless result[:status] == :updated
+
+            result[:status] = restore_profile_bytes(result) ? :batch_rolled_back : :batch_rollback_failed
+          end
+        end
+
         if transaction
           if results.length == work_items.length &&
              results.all? { |result| %i[updated unchanged].include?(result.fetch(:status)) }
