@@ -1,6 +1,9 @@
 module ClashPatch
   module_function
 
+  WRAPPER_COMMIT_RECEIPT_FAILURE_EXIT = 75
+  class WrapperCommitReceiptError < StandardError; end
+
   def chinese_status(result)
     name = safe_label(File.basename(result[:path].to_s))
     case result[:status]
@@ -91,6 +94,51 @@ module ClashPatch
     ["failed", "processing_failed", "配置处理失败。"]
   end
 
+  def wrapper_commit_receipt_bytes(nonce, committed)
+    "#{committed ? 1 : 0}:#{nonce}\n".b
+  end
+
+  def with_wrapper_commit_receipt(options)
+    path = options[:wrapper_commit_receipt]
+    nonce = options[:wrapper_commit_nonce]
+    return if path.nil? && nonce.nil?
+    raise InvalidConfigError, "wrapper commit receipt is incomplete" if path.nil? || nonce.nil?
+    raise InvalidConfigError, "wrapper commit nonce is invalid" unless nonce.match?(/\A[0-9a-f]{32}\z/)
+    raise InvalidConfigError, "wrapper commit receipt is outside backup directory" unless
+      File.realpath(File.dirname(path)) == File.realpath(options[:backup_root])
+
+    before = File.lstat(path)
+    raise InvalidConfigError, "wrapper commit receipt is unsafe" unless
+      before.file? && !before.symlink? && before.nlink == 1 && (before.mode & 0o077).zero?
+    File.open(path, File::RDWR) do |io|
+      opened = io.stat
+      raise InvalidConfigError, "wrapper commit receipt changed" unless
+        opened.dev == before.dev && opened.ino == before.ino &&
+        io.read == wrapper_commit_receipt_bytes(nonce, false)
+      yield io, nonce
+    end
+  end
+
+  def validate_wrapper_commit_receipt(options)
+    with_wrapper_commit_receipt(options) { |_io, _nonce| nil }
+  end
+
+  def mark_wrapper_commit_receipt(options)
+    return if options[:wrapper_commit_receipt].nil? && options[:wrapper_commit_nonce].nil?
+
+    with_wrapper_commit_receipt(options) do |io, nonce|
+      committed = wrapper_commit_receipt_bytes(nonce, true)
+      io.rewind
+      io.write(committed)
+      io.flush
+      io.fsync
+      io.rewind
+      raise IOError, "wrapper commit receipt was not persisted" unless io.read == committed
+    end
+  rescue StandardError
+    raise WrapperCommitReceiptError, "wrapper commit receipt publication failed"
+  end
+
   def cli(argv = ARGV)
     json_mode = argv.include?("--json")
     options = {
@@ -113,6 +161,8 @@ module ClashPatch
       safe_update_all: false,
       recover_profile_transaction: false,
       usage_profile: nil,
+      wrapper_commit_receipt: nil,
+      wrapper_commit_nonce: nil,
       json: json_mode,
       help: false
     }
@@ -137,12 +187,15 @@ module ClashPatch
       opts.on("--safe-update-all", "安全更新当前存储位置中的全部远程订阅") { options[:safe_update_all] = true }
       opts.on("--recover-profile-transaction", "恢复未完成的配置事务及当前运行配置") { options[:recover_profile_transaction] = true }
       opts.on("--usage-profile N", Integer, "补丁与安全更新采用的用途档位") { |value| options[:usage_profile] = value }
+      opts.on("--wrapper-commit-receipt PATH") { |value| options[:wrapper_commit_receipt] = File.expand_path(value) }
+      opts.on("--wrapper-commit-nonce VALUE") { |value| options[:wrapper_commit_nonce] = value }
       opts.on("--json", "输出 JSON v1 结果") { options[:json] = true }
       opts.on("-h", "--help", "显示帮助") do
         options[:help] = true
       end
     end
     parser.parse!(argv)
+    validate_wrapper_commit_receipt(options)
 
     if options[:help]
       return emit_cli_result(
@@ -375,6 +428,7 @@ module ClashPatch
         usage_profile: options[:usage_profile], selected_name: selected_profile_name
       )
       if result[:status] == :updated
+        mark_wrapper_commit_receipt(options)
         return emit_cli_result(
           operation: "safe_update", exit_code: 0, status: "ok", code: "safe_update_completed",
           summary_zh: "全部远程订阅已安全更新。", profile: options[:usage_profile],
@@ -427,6 +481,8 @@ module ClashPatch
       warn "没有找到可处理的配置。"
       return 1
     end
+    operation_succeeded = results.all? { |result| %i[updated unchanged].include?(result[:status]) }
+    mark_wrapper_commit_receipt(options) if operation_succeeded
     if options[:json]
       status, code, summary = batch_json_status(results)
       exit_code = %w[ok no_change].include?(status) ? 0 : 1
@@ -438,7 +494,7 @@ module ClashPatch
       )
     end
     results.each { |result| puts chinese_status(result) }
-    results.all? { |result| %i[updated unchanged].include?(result[:status]) } ? 0 : 1
+    operation_succeeded ? 0 : 1
   rescue OptionParser::ParseError => error
     return emit_cli_result(
       operation: "parse_arguments", exit_code: 64, status: "invalid_request", code: "invalid_arguments",
@@ -468,6 +524,23 @@ module ClashPatch
     ) if json_mode
     warn "Clash 补丁运行失败：#{safe_label(error.message)}。"
     1
+  rescue WrapperCommitReceiptError
+    begin
+      if json_mode
+        emit_cli_result(
+          operation: options[:safe_update_all] ? "safe_update" : "patch_profiles",
+          exit_code: WRAPPER_COMMIT_RECEIPT_FAILURE_EXIT,
+          status: "partial", code: "wrapper_commit_receipt_failed",
+          summary_zh: "配置已经提交，但提交收据写入失败。",
+          profile: options[:usage_profile]
+        )
+      else
+        warn "配置已经提交，但提交收据写入失败。"
+      end
+    rescue StandardError
+      nil
+    end
+    WRAPPER_COMMIT_RECEIPT_FAILURE_EXIT
   rescue StandardError => error
     return emit_cli_result(
       operation: "patch_profiles", exit_code: 1, status: "failed", code: "unexpected_error",

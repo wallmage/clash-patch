@@ -36,6 +36,12 @@ PROFILE_OPERATION_RECOVERY_INTENT=0
 PROFILE_OPERATION_SIGNAL=0
 PROFILE_OPERATION_CHILD_FINISHED=0
 PROFILE_OPERATION_CHILD_STATUS=0
+PROFILE_OPERATION_RECEIPT_PATH=""
+PROFILE_OPERATION_RECEIPT_NONCE=""
+PROFILE_OPERATION_RECEIPT_COMMITTED=0
+PROFILE_OPERATION_RECEIPT_INVALID=0
+PROFILE_OPERATION_RESULT_FAILED=0
+PROFILE_OPERATION_RESULT_UNKNOWN=0
 OPERATION_LOCK_REQUIRED=1
 
 unexpected_exit() {
@@ -44,6 +50,8 @@ unexpected_exit() {
   [ "$unexpected_status" -ne 0 ] || return 0
   set +e
   [ -z "$PENDING_TEMPORARY" ] || /bin/rm -f "$PENDING_TEMPORARY"
+  [ -z "$PROFILE_OPERATION_RECEIPT_PATH" ] ||
+    /bin/rm -f "$PROFILE_OPERATION_RECEIPT_PATH"
   profile_restore_failed=0
   if [ "$PROFILE_STATE_CHANGED" -eq 1 ]; then
     rollback_profile_selection || profile_restore_failed=1
@@ -305,7 +313,8 @@ preserve_profile_operation_state() {
 finish_profile_operation_signal() {
   trap '' HUP INT TERM
   preserve_profile_operation_state
-  if [ "$PROFILE_OPERATION_CHILD_STATUS" -eq 0 ]; then
+  if [ "$PROFILE_OPERATION_CHILD_STATUS" -eq 0 ] ||
+     [ "$PROFILE_OPERATION_RECEIPT_COMMITTED" -eq 1 ]; then
     PROFILE_OPERATION_COMMITTED=1
   else
     PROFILE_OPERATION_RECOVERY_INTENT=1
@@ -325,10 +334,44 @@ record_profile_operation_signal() {
 run_committing_profile_operation() {
   child_output_path=""
   child_json=""
+  PROFILE_OPERATION_RECEIPT_NONCE=$(
+    /usr/bin/uuidgen |
+      /usr/bin/tr '[:upper:]' '[:lower:]' |
+      /usr/bin/tr -d '-'
+  ) || return 1
+  case "$PROFILE_OPERATION_RECEIPT_NONCE" in
+    ""|*[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#PROFILE_OPERATION_RECEIPT_NONCE}" -eq 32 ] || return 1
+  PROFILE_OPERATION_RECEIPT_PATH=$(
+    /usr/bin/mktemp "$BACKUP_DIR/.profile-operation-receipt.XXXXXX"
+  ) || return 1
+  if ! /usr/bin/printf '0:%s\n' "$PROFILE_OPERATION_RECEIPT_NONCE" \
+      >"$PROFILE_OPERATION_RECEIPT_PATH" ||
+     ! /bin/chmod 600 "$PROFILE_OPERATION_RECEIPT_PATH"; then
+    /bin/rm -f "$PROFILE_OPERATION_RECEIPT_PATH"
+    PROFILE_OPERATION_RECEIPT_PATH=""
+    return 1
+  fi
+  PROFILE_OPERATION_RECEIPT_COMMITTED=0
+  PROFILE_OPERATION_RECEIPT_INVALID=0
+  PROFILE_OPERATION_RESULT_FAILED=0
+  PROFILE_OPERATION_RESULT_UNKNOWN=0
   if [ "$JSON_OUTPUT" -eq 1 ]; then
-    child_output_path=$(/usr/bin/mktemp "$BACKUP_DIR/.profile-operation-result.XXXXXX")
+    if ! child_output_path=$(
+      /usr/bin/mktemp "$BACKUP_DIR/.profile-operation-result.XXXXXX"
+    ); then
+      /bin/rm -f "$PROFILE_OPERATION_RECEIPT_PATH"
+      PROFILE_OPERATION_RECEIPT_PATH=""
+      return 1
+    fi
     PENDING_TEMPORARY=$child_output_path
-    /bin/chmod 600 "$child_output_path"
+    if ! /bin/chmod 600 "$child_output_path"; then
+      /bin/rm -f "$child_output_path" "$PROFILE_OPERATION_RECEIPT_PATH"
+      PENDING_TEMPORARY=""
+      PROFILE_OPERATION_RECEIPT_PATH=""
+      return 1
+    fi
   fi
 
   PROFILE_OPERATION_SIGNAL=0
@@ -338,7 +381,10 @@ run_committing_profile_operation() {
   trap 'record_profile_operation_signal 130' INT
   trap 'record_profile_operation_signal 143' TERM
   if [ "$JSON_OUTPUT" -eq 1 ]; then
-    if /usr/bin/ruby "$PATCHER_SOURCE" "$@" --json >"$child_output_path" 2>/dev/null; then
+    if /usr/bin/ruby "$PATCHER_SOURCE" "$@" \
+        --wrapper-commit-receipt "$PROFILE_OPERATION_RECEIPT_PATH" \
+        --wrapper-commit-nonce "$PROFILE_OPERATION_RECEIPT_NONCE" \
+        --json >"$child_output_path" 2>/dev/null; then
       PROFILE_OPERATION_CHILD_STATUS=0
     else
       PROFILE_OPERATION_CHILD_STATUS=$?
@@ -347,25 +393,60 @@ run_committing_profile_operation() {
     /bin/rm -f "$child_output_path"
     PENDING_TEMPORARY=""
   else
-    if /usr/bin/ruby "$PATCHER_SOURCE" "$@"; then
+    if /usr/bin/ruby "$PATCHER_SOURCE" "$@" \
+        --wrapper-commit-receipt "$PROFILE_OPERATION_RECEIPT_PATH" \
+        --wrapper-commit-nonce "$PROFILE_OPERATION_RECEIPT_NONCE"; then
       PROFILE_OPERATION_CHILD_STATUS=0
     else
       PROFILE_OPERATION_CHILD_STATUS=$?
     fi
   fi
 
+  receipt_value=$(/bin/cat "$PROFILE_OPERATION_RECEIPT_PATH" 2>/dev/null || true)
+  case "$receipt_value" in
+    "1:$PROFILE_OPERATION_RECEIPT_NONCE") PROFILE_OPERATION_RECEIPT_COMMITTED=1 ;;
+    "0:$PROFILE_OPERATION_RECEIPT_NONCE") ;;
+    *) PROFILE_OPERATION_RECEIPT_INVALID=1 ;;
+  esac
+  /bin/rm -f "$PROFILE_OPERATION_RECEIPT_PATH"
+  PROFILE_OPERATION_RECEIPT_PATH=""
   PROFILE_OPERATION_CHILD_FINISHED=1
   if [ "$PROFILE_OPERATION_SIGNAL" -ne 0 ]; then
     finish_profile_operation_signal
   fi
-  if [ "$PROFILE_OPERATION_CHILD_STATUS" -eq 0 ]; then
+  if [ "$PROFILE_OPERATION_CHILD_STATUS" -eq 0 ] ||
+     [ "$PROFILE_OPERATION_RECEIPT_COMMITTED" -eq 1 ]; then
     preserve_profile_operation_state
     PROFILE_OPERATION_COMMITTED=1
+    if [ "$PROFILE_OPERATION_CHILD_STATUS" -ne 0 ]; then
+      PROFILE_OPERATION_RESULT_FAILED=1
+    fi
+  elif [ "$PROFILE_OPERATION_CHILD_STATUS" -eq 75 ]; then
+    preserve_profile_operation_state
+    PROFILE_OPERATION_COMMITTED=1
+    PROFILE_OPERATION_RESULT_FAILED=1
+  elif [ "$PROFILE_OPERATION_RECEIPT_INVALID" -eq 1 ] ||
+       [ "$PROFILE_OPERATION_CHILD_STATUS" -ge 128 ]; then
+    preserve_profile_operation_state
+    PROFILE_OPERATION_RECOVERY_INTENT=1
+    PROFILE_OPERATION_RESULT_UNKNOWN=1
   fi
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
   return "$PROFILE_OPERATION_CHILD_STATUS"
+}
+
+finish_profile_operation_result_failure() {
+  if [ "$PROFILE_OPERATION_RESULT_FAILED" -eq 1 ]; then
+    finish 1 partial operation_committed_result_failed \
+      "配置已经提交，但结果传输失败；保存档位和自动更新状态保持不变，请按同一档位重试。" \
+      "$OPERATION"
+  fi
+  [ "$PROFILE_OPERATION_RESULT_UNKNOWN" -eq 1 ] || return 0
+  finish 1 partial operation_result_unknown_recovery_intent \
+    "无法确认配置是否提交；保存档位和自动更新状态保持不变，请按同一档位重试以完成恢复。" \
+    "$OPERATION"
 }
 
 if [ "$OPERATION_LOCK_REQUIRED" -eq 1 ] &&
@@ -615,6 +696,7 @@ if [ "$SAFE_UPDATE" -eq 1 ]; then
         --policy "$POLICY_SOURCE" \
         --backup-dir "$BACKUP_DIR" \
         --safe-update-all --usage-profile "$USAGE_PROFILE"; then
+      finish_profile_operation_result_failure
       if [ "$JSON_OUTPUT" -eq 1 ]; then
         finish_json_child_failure "$child_json" failed safe_update_failed "安全更新失败。" safe_update
       else
@@ -627,6 +709,7 @@ if [ "$SAFE_UPDATE" -eq 1 ]; then
         --policy "$POLICY_SOURCE" \
         --backup-dir "$BACKUP_DIR" \
         --safe-update-all --usage-profile "$USAGE_PROFILE"; then
+      finish_profile_operation_result_failure
       if [ "$JSON_OUTPUT" -eq 1 ]; then
         finish_json_child_failure "$child_json" failed safe_update_failed "安全更新失败。" safe_update
       else
@@ -644,6 +727,7 @@ if [ -n "$CUSTOM_PROFILE_DIR" ]; then
       --profile-dir "$CUSTOM_PROFILE_DIR" \
       --policy "$POLICY_SOURCE" \
       --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE"; then
+    finish_profile_operation_result_failure
     if [ "$JSON_OUTPUT" -eq 1 ]; then
       finish_json_child_failure "$child_json" failed patch_failed "配置处理失败。" patch_profiles
     else
@@ -655,6 +739,7 @@ else
   if ! run_committing_profile_operation \
       --policy "$POLICY_SOURCE" \
       --backup-dir "$BACKUP_DIR" --usage-profile "$USAGE_PROFILE"; then
+    finish_profile_operation_result_failure
     if [ "$JSON_OUTPUT" -eq 1 ]; then
       finish_json_child_failure "$child_json" failed patch_failed "配置处理失败。" patch_profiles
     else

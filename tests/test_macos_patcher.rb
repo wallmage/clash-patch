@@ -6329,6 +6329,221 @@ class MacosPatcherTest < Minitest::Test
     assert_equal "failed", ClashPatch.batch_json_status([{ status: :invalid }]).first
   end
 
+  def test_wrapper_commit_receipt_is_preallocated_validated_and_marked
+    Dir.mktmpdir do |directory|
+      backup_root = File.join(directory, "backups")
+      FileUtils.mkdir_p(backup_root)
+      nonce = "a" * 32
+      path = File.join(backup_root, ".profile-operation-receipt.test")
+      pending = ClashPatch.wrapper_commit_receipt_bytes(nonce, false)
+      committed = ClashPatch.wrapper_commit_receipt_bytes(nonce, true)
+      File.binwrite(path, pending)
+      File.chmod(0o600, path)
+      options = {
+        backup_root: backup_root,
+        wrapper_commit_receipt: path,
+        wrapper_commit_nonce: nonce
+      }
+
+      assert_nil ClashPatch.validate_wrapper_commit_receipt(options)
+      ClashPatch.mark_wrapper_commit_receipt(options)
+      assert_equal committed, File.binread(path)
+      assert_nil ClashPatch.validate_wrapper_commit_receipt(
+        backup_root: backup_root,
+        wrapper_commit_receipt: nil,
+        wrapper_commit_nonce: nil
+      )
+
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.validate_wrapper_commit_receipt(
+          backup_root: backup_root,
+          wrapper_commit_receipt: path,
+          wrapper_commit_nonce: nil
+        )
+      end
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.validate_wrapper_commit_receipt(
+          backup_root: backup_root,
+          wrapper_commit_receipt: path,
+          wrapper_commit_nonce: "invalid"
+        )
+      end
+
+      outside = File.join(directory, "outside")
+      File.binwrite(outside, pending)
+      File.chmod(0o600, outside)
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.validate_wrapper_commit_receipt(
+          backup_root: backup_root,
+          wrapper_commit_receipt: outside,
+          wrapper_commit_nonce: nonce
+        )
+      end
+
+      File.binwrite(path, pending)
+      File.chmod(0o644, path)
+      assert_raises(ClashPatch::InvalidConfigError) do
+        ClashPatch.validate_wrapper_commit_receipt(options)
+      end
+      File.chmod(0o600, path)
+
+      other = File.join(backup_root, ".profile-operation-receipt.other")
+      File.binwrite(other, pending)
+      File.chmod(0o600, other)
+      File.stub(:lstat, File.lstat(other)) do
+        assert_raises(ClashPatch::InvalidConfigError) do
+          ClashPatch.validate_wrapper_commit_receipt(options)
+        end
+      end
+
+      reads = [pending, pending]
+      fake = Object.new
+      fake.define_singleton_method(:stat) { File.stat(path) }
+      fake.define_singleton_method(:read) { reads.shift }
+      fake.define_singleton_method(:rewind) { 0 }
+      fake.define_singleton_method(:write) { |value| value.bytesize }
+      fake.define_singleton_method(:flush) { nil }
+      fake.define_singleton_method(:fsync) { 0 }
+      File.stub(:open, ->(*_arguments, &block) { block.call(fake) }) do
+        assert_raises(ClashPatch::WrapperCommitReceiptError) do
+          ClashPatch.mark_wrapper_commit_receipt(options)
+        end
+      end
+    end
+  end
+
+  def test_cli_marks_wrapper_receipt_before_success_result_output
+    Dir.mktmpdir do |directory|
+      backup_root = File.join(directory, "backups")
+      profiles = File.join(directory, "profiles")
+      FileUtils.mkdir_p(backup_root)
+      FileUtils.mkdir_p(profiles)
+      nonce = "b" * 32
+      path = File.join(backup_root, ".profile-operation-receipt.test")
+      pending = ClashPatch.wrapper_commit_receipt_bytes(nonce, false)
+      committed = ClashPatch.wrapper_commit_receipt_bytes(nonce, true)
+      arguments = [
+        "--profile-dir", profiles,
+        "--backup-dir", backup_root,
+        "--usage-profile", "3",
+        "--wrapper-commit-receipt", path,
+        "--wrapper-commit-nonce", nonce,
+        "--json"
+      ]
+      failing_output = Object.new
+      failing_output.define_singleton_method(:write) do |_value|
+        raise Errno::ENOSPC, "injected output failure"
+      end
+
+      File.binwrite(path, pending)
+      File.chmod(0o600, path)
+      results = [{ path: File.join(profiles, "a.yaml"), status: :updated }]
+      ClashPatch.stub(:run, results) do
+        original = $stdout
+        $stdout = failing_output
+        begin
+          assert_raises(Errno::ENOSPC) { ClashPatch.cli(arguments.dup) }
+        ensure
+          $stdout = original
+        end
+      end
+      assert_equal committed, File.binread(path)
+
+      File.binwrite(path, pending)
+      File.chmod(0o600, path)
+      safe_arguments = arguments.dup.concat(["--safe-update-all", "--policy", POLICY_PATH])
+      safe_result = { status: :updated, count: 1, profiles: ["a.yaml"] }
+      ClashPatch.stub(:remote_subscription_targets, []) do
+        ClashPatch.stub(:safe_update_all, safe_result) do
+          original = $stdout
+          $stdout = failing_output
+          begin
+            assert_raises(Errno::ENOSPC) { ClashPatch.cli(safe_arguments) }
+          ensure
+            $stdout = original
+          end
+        end
+      end
+      assert_equal committed, File.binread(path)
+    end
+  end
+
+  def test_cli_reports_commit_receipt_publication_failure_with_internal_exit
+    Dir.mktmpdir do |directory|
+      backup_root = File.join(directory, "backups")
+      profiles = File.join(directory, "profiles")
+      FileUtils.mkdir_p(backup_root)
+      FileUtils.mkdir_p(profiles)
+      nonce = "c" * 32
+      path = File.join(backup_root, ".profile-operation-receipt.test")
+      File.binwrite(path, ClashPatch.wrapper_commit_receipt_bytes(nonce, false))
+      File.chmod(0o600, path)
+      arguments = [
+        "--profile-dir", profiles,
+        "--backup-dir", backup_root,
+        "--usage-profile", "3",
+        "--wrapper-commit-receipt", path,
+        "--wrapper-commit-nonce", nonce,
+        "--json"
+      ]
+      results = [{ path: File.join(profiles, "a.yaml"), status: :updated }]
+      failing_publication = lambda do |_options|
+        raise ClashPatch::WrapperCommitReceiptError, "injected receipt publication failure"
+      end
+
+      output = StringIO.new
+      original = $stdout
+      $stdout = output
+      begin
+        exit_code = ClashPatch.stub(:run, results) do
+          ClashPatch.stub(:mark_wrapper_commit_receipt, failing_publication) do
+            ClashPatch.cli(arguments.dup)
+          end
+        end
+      ensure
+        $stdout = original
+      end
+
+      assert_equal ClashPatch::WRAPPER_COMMIT_RECEIPT_FAILURE_EXIT, exit_code
+      result = JSON.parse(output.string)
+      assert_equal "wrapper_commit_receipt_failed", result.fetch("code")
+      assert_equal exit_code, result.fetch("exit_code")
+
+      text_output = StringIO.new
+      text_arguments = arguments.reject { |argument| argument == "--json" }
+      original = $stderr
+      $stderr = text_output
+      begin
+        exit_code = ClashPatch.stub(:run, results) do
+          ClashPatch.stub(:mark_wrapper_commit_receipt, failing_publication) do
+            ClashPatch.cli(text_arguments.dup)
+          end
+        end
+      ensure
+        $stderr = original
+      end
+      assert_equal ClashPatch::WRAPPER_COMMIT_RECEIPT_FAILURE_EXIT, exit_code
+      assert_includes text_output.string, "提交收据写入失败"
+
+      failing_output = Object.new
+      failing_output.define_singleton_method(:write) do |_value|
+        raise Errno::ENOSPC, "injected result write failure"
+      end
+      original = $stdout
+      $stdout = failing_output
+      begin
+        exit_code = ClashPatch.stub(:run, results) do
+          ClashPatch.stub(:mark_wrapper_commit_receipt, failing_publication) do
+            ClashPatch.cli(arguments.dup)
+          end
+        end
+      ensure
+        $stdout = original
+      end
+      assert_equal ClashPatch::WRAPPER_COMMIT_RECEIPT_FAILURE_EXIT, exit_code
+    end
+  end
+
   def test_cli_returns_failure_when_any_profile_was_not_applied
     results = [
       { path: "/private/current.yaml", status: :reload_failed_rolled_back },

@@ -83,6 +83,8 @@ AdGuard for Mac 是 Patch 和 Diagnostics 共享的已知兼容路径。档位 2
 
 普通 Patch 与安全更新的最终 Ruby 子流程共用信号交接：执行期间暂存 TERM、HUP 与 INT；没有信号的普通失败按原规则补偿，确认成功时先提交保存档位和自动更新所有权，再以 `partial/operation_committed_interrupted` 处理等待信号。前台进程组信号同时终止子流程、无法确认提交状态时返回 `partial/operation_interrupted_recovery_intent`，保留新档位、自动更新关闭状态和所有权作为恢复意图。
 
+最终子流程使用固定长度的私有提交收据跨越“配置提交—结果输出”边界。Shell 预分配 pending 收据；Ruby 在文件和运行配置事务完成后、输出前原位改成 committed 并同步。stdout 或 JSON 结果文件失败时，外层凭 committed 收据返回 `partial/operation_committed_result_failed`；事务成功但收据发布失败时，Ruby 用专用内部退出状态传递同一结果。收据损坏、不可读或子进程异常终止而无法确认提交状态时返回 `partial/operation_result_unknown_recovery_intent`。这些路径都保留外层状态；只有有效 pending 收据加普通失败才执行补偿。
+
 macOS 安全卸载先完整暂存所有自有文件，再用 `READY` 划定允许删除的提交边界。边界前中断只清理不完整暂存；边界后恢复以不可覆盖的原子文件发布完成，任何时刻被强制结束都不能留下半文件，下一次卸载可从同一事务继续。
 
 macOS 普通安装、安全更新和安全卸载的完整 Shell 编排共用备份目录中的跨进程操作锁，锁从读取用途档位持续到最终提交。并发写操作最多等待 5 秒，超时后以 `operation_in_progress` 零修改退出。Ruby 内部锁继续保护单次配置事务；外层锁负责档位、自动更新所有权、订阅修改与卸载删除之间的顺序，避免卸载在最终核对后误删另一个安装刚发布的新状态。卸载在 `READY` 后中断时，下一次安装或安全更新先在锁内完成公开卸载；只有成功收据和暂存目录清理都可验证时才继续，失败则保留恢复状态并停止。

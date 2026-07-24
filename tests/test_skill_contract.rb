@@ -1062,6 +1062,8 @@ class SkillContractTest < Minitest::Test
 
   def test_macos_profile_operation_signal_handoff_preserves_committed_state
     installer = File.read(File.join(SKILL, "scripts/install_macos.sh"))
+    cli = File.read(File.join(SKILL, "scripts/macos/patch_profiles/cli.rb"))
+    patcher_tests = File.read(File.join(ROOT, "tests/test_macos_patcher.rb"))
     wrappers = File.read(File.join(ROOT, "tests/test_macos_wrappers.rb"))
 
     assert_includes installer, "run_committing_profile_operation()"
@@ -1077,10 +1079,30 @@ class SkillContractTest < Minitest::Test
                     "trap ':' HUP INT TERM\n" \
                     "  set +e\n" \
                     '  /usr/bin/ruby "$OPERATION_LOCK_SOURCE"'
+    assert_includes installer, "--wrapper-commit-receipt"
+    assert_includes installer, "PROFILE_OPERATION_RECEIPT_COMMITTED=1"
+    assert_includes installer, "operation_committed_result_failed"
+    assert_includes installer, "operation_result_unknown_recovery_intent"
+    assert_includes cli, "WRAPPER_COMMIT_RECEIPT_FAILURE_EXIT = 75"
+    assert_includes cli, "wrapper_commit_receipt_failed"
+    assert_includes cli, "def validate_wrapper_commit_receipt(options)"
+    assert_includes cli, "def mark_wrapper_commit_receipt(options)"
+    assert_includes cli, "io.fsync"
+    assert_includes cli, "mark_wrapper_commit_receipt(options) if operation_succeeded"
+    assert_includes cli,
+                    "if result[:status] == :updated\n" \
+                    "        mark_wrapper_commit_receipt(options)"
+    assert_includes patcher_tests,
+                    "test_cli_marks_wrapper_receipt_before_success_result_output"
     assert_includes wrappers,
                     "test_signal_after_profile_commit_preserves_outer_profile_state"
+    assert_includes wrappers,
+                    "test_result_failure_after_profile_commit_preserves_outer_profile_state"
+    assert_includes wrappers,
+                    "test_uncertain_or_unpublished_commit_receipt_preserves_outer_profile_state"
     assert_includes wrappers, 'Process.kill("TERM", Process.ppid)'
     assert_includes wrappers, 'Process.kill("TERM", -Process.getpgrp)'
+    assert_includes wrappers, 'raise Errno::ENOSPC, "injected result write failure"'
     assert_includes wrappers, '"--restore-owned-subscription-auto-update"'
 
     documents = [
@@ -1096,6 +1118,9 @@ class SkillContractTest < Minitest::Test
       assert_includes document, "TERM"
       assert_includes document, "operation_committed_interrupted"
       assert_includes document, "operation_interrupted_recovery_intent"
+      assert_includes document, "提交收据"
+      assert_includes document, "operation_committed_result_failed"
+      assert_includes document, "operation_result_unknown_recovery_intent"
     end
   end
 

@@ -1081,6 +1081,126 @@ class MutationSafetyTest < Minitest::Test
     end
   end
 
+  def test_macos_wrapper_commit_receipt_detection_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_macos.sh",
+        '    "1:$PROFILE_OPERATION_RECEIPT_NONCE") PROFILE_OPERATION_RECEIPT_COMMITTED=1 ;;',
+        '    "1:$PROFILE_OPERATION_RECEIPT_NONCE") PROFILE_OPERATION_RECEIPT_COMMITTED=0 ;;'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_wrappers.rb",
+        "--name", "test_result_failure_after_profile_commit_preserves_outer_profile_state"
+      )
+    end
+  end
+
+  def test_macos_normal_commit_receipt_publication_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/cli.rb",
+        "    mark_wrapper_commit_receipt(options) if operation_succeeded\n",
+        ""
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_cli_marks_wrapper_receipt_before_success_result_output"
+      )
+    end
+  end
+
+  def test_macos_safe_update_commit_receipt_publication_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/cli.rb",
+        "        mark_wrapper_commit_receipt(options)\n",
+        ""
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_cli_marks_wrapper_receipt_before_success_result_output"
+      )
+    end
+  end
+
+  def test_macos_commit_receipt_failure_exit_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_macos.sh",
+        '  elif [ "$PROFILE_OPERATION_CHILD_STATUS" -eq 75 ]; then',
+        '  elif [ "$PROFILE_OPERATION_CHILD_STATUS" -eq 76 ]; then'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_wrappers.rb",
+        "--name", "test_uncertain_or_unpublished_commit_receipt_preserves_outer_profile_state"
+      )
+    end
+  end
+
+  def test_macos_unknown_commit_result_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_macos.sh",
+        "    PROFILE_OPERATION_RESULT_UNKNOWN=1\n",
+        "    PROFILE_OPERATION_RESULT_UNKNOWN=0\n"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_wrappers.rb",
+        "--name", "test_uncertain_or_unpublished_commit_receipt_preserves_outer_profile_state"
+      )
+    end
+  end
+
+  def test_macos_abnormal_commit_exit_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/install_macos.sh",
+        "  elif [ \"\$PROFILE_OPERATION_RECEIPT_INVALID\" -eq 1 ] ||\n" \
+        "       [ \"\$PROFILE_OPERATION_CHILD_STATUS\" -ge 128 ]; then",
+        "  elif [ \"\$PROFILE_OPERATION_RECEIPT_INVALID\" -eq 1 ]; then"
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_wrappers.rb",
+        "--name", "test_uncertain_or_unpublished_commit_receipt_preserves_outer_profile_state"
+      )
+    end
+  end
+
+  def test_macos_commit_receipt_error_mapping_mutation_is_killed
+    with_repo_copy do |root|
+      replace_once(
+        root,
+        "clash-patch/scripts/macos/patch_profiles/cli.rb",
+        '    raise WrapperCommitReceiptError, "wrapper commit receipt publication failed"',
+        '    raise IOError, "wrapper commit receipt publication failed"'
+      )
+
+      assert_mutation_is_killed(
+        root,
+        RbConfig.ruby, "tests/test_macos_patcher.rb",
+        "--name", "test_wrapper_commit_receipt_is_preallocated_validated_and_marked"
+      )
+    end
+  end
+
   def test_auto_update_ownership_state_mutation_is_killed
     with_repo_copy do |root|
       replace_once(

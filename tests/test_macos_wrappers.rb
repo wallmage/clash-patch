@@ -1194,6 +1194,159 @@ class MacosWrapperTest < Minitest::Test
     end
   end
 
+  def test_result_failure_after_profile_commit_preserves_outer_profile_state
+    patcher = <<~'RUBY'
+      home = ENV.fetch("HOME")
+      File.open(File.join(home, "patcher-calls.log"), "a") { |file| file.puts(ARGV.join(" ")) }
+      if ARGV.include?("--print-core-status")
+        puts "supported"
+        exit 0
+      end
+      if ARGV.include?("--disable-subscription-auto-update")
+        File.write(File.join(home, "auto-update-owned"), "disabled")
+        puts "disabled"
+        exit 0
+      end
+      if ARGV.include?("--restore-owned-subscription-auto-update")
+        File.delete(File.join(home, "auto-update-owned")) if File.exist?(File.join(home, "auto-update-owned"))
+        puts "restored"
+        exit 0
+      end
+      exit 0 if ARGV.include?("--snapshot-initial")
+      profile_index = ARGV.index("--usage-profile")
+      profile = ARGV.fetch(profile_index + 1)
+      operation = ARGV.include?("--safe-update-all") ? "safe-update" : "install"
+      File.write(File.join(home, "#{operation}-committed"), profile)
+      receipt_index = ARGV.index("--wrapper-commit-receipt")
+      nonce_index = ARGV.index("--wrapper-commit-nonce")
+      if receipt_index && nonce_index
+        File.binwrite(
+          ARGV.fetch(receipt_index + 1),
+          "1:#{ARGV.fetch(nonce_index + 1)}\n"
+        )
+      end
+      raise Errno::ENOSPC, "injected result write failure"
+    RUBY
+    with_supported_mihomo_installer(patcher_source: patcher) do |installer|
+      %w[install safe-update].each do |operation|
+        [false, true].each do |json|
+          Dir.mktmpdir do |home|
+            with_supported_app(home) do
+              state = File.join(home, "usage-profile.plist")
+              system("/usr/bin/plutil", "-create", "xml1", state)
+              system("/usr/bin/plutil", "-insert", "Version", "-integer", "1", state)
+              system("/usr/bin/plutil", "-insert", "Profile", "-integer", "1", state)
+              arguments = ["--profile", "3"]
+              arguments.unshift("--safe-update") if operation == "safe-update"
+              arguments << "--json" if json
+
+              stdout, _stderr, status = run_script(installer, *arguments, home: home)
+
+              assert_equal 1, status.exitstatus
+              if json
+                result = assert_json_result(stdout, status, command: "install")
+                assert_equal "partial", result.fetch("status")
+                assert_equal "operation_committed_result_failed", result.fetch("code")
+              end
+              assert_equal "3", File.read(File.join(home, "#{operation}-committed"))
+              assert File.exist?(File.join(home, "auto-update-owned"))
+              saved_profile, error, read_status = Open3.capture3(
+                "/usr/bin/plutil", "-extract", "Profile", "raw", state
+              )
+              assert read_status.success?, error
+              assert_equal "3", saved_profile.strip
+              calls = File.read(File.join(home, "patcher-calls.log")).lines.map(&:strip)
+              refute calls.any? { |call| call.include?("--restore-owned-subscription-auto-update") }
+            end
+          end
+        end
+      end
+    end
+  end
+
+  def test_uncertain_or_unpublished_commit_receipt_preserves_outer_profile_state
+    patcher = <<~'RUBY'
+      home = ENV.fetch("HOME")
+      File.open(File.join(home, "patcher-calls.log"), "a") { |file| file.puts(ARGV.join(" ")) }
+      if ARGV.include?("--print-core-status")
+        puts "supported"
+        exit 0
+      end
+      if ARGV.include?("--disable-subscription-auto-update")
+        File.write(File.join(home, "auto-update-owned"), "disabled")
+        puts "disabled"
+        exit 0
+      end
+      if ARGV.include?("--restore-owned-subscription-auto-update")
+        File.delete(File.join(home, "auto-update-owned")) if File.exist?(File.join(home, "auto-update-owned"))
+        puts "restored"
+        exit 0
+      end
+      exit 0 if ARGV.include?("--snapshot-initial")
+      profile_index = ARGV.index("--usage-profile")
+      profile = ARGV.fetch(profile_index + 1)
+      operation = ARGV.include?("--safe-update-all") ? "safe-update" : "install"
+      File.write(File.join(home, "#{operation}-committed"), profile)
+      receipt_index = ARGV.index("--wrapper-commit-receipt")
+      case ENV.fetch("CLASH_PATCH_TEST_RECEIPT_OUTCOME")
+      when "invalid"
+        File.binwrite(ARGV.fetch(receipt_index + 1), "invalid\n")
+        exit 1
+      when "publish-failed"
+        exit 75
+      when "killed"
+        Process.kill("KILL", Process.pid)
+      else
+        raise "unexpected receipt outcome"
+      end
+    RUBY
+    expected_codes = {
+      "invalid" => "operation_result_unknown_recovery_intent",
+      "publish-failed" => "operation_committed_result_failed",
+      "killed" => "operation_result_unknown_recovery_intent"
+    }
+    with_supported_mihomo_installer(patcher_source: patcher) do |installer|
+      expected_codes.each do |receipt_outcome, expected_code|
+        %w[install safe-update].each do |operation|
+          [false, true].each do |json|
+            Dir.mktmpdir do |home|
+              with_supported_app(home) do
+                state = File.join(home, "usage-profile.plist")
+                system("/usr/bin/plutil", "-create", "xml1", state)
+                system("/usr/bin/plutil", "-insert", "Version", "-integer", "1", state)
+                system("/usr/bin/plutil", "-insert", "Profile", "-integer", "1", state)
+                arguments = ["--profile", "3"]
+                arguments.unshift("--safe-update") if operation == "safe-update"
+                arguments << "--json" if json
+
+                stdout, _stderr, status = run_script(
+                  installer, *arguments, home: home,
+                  extra_env: { "CLASH_PATCH_TEST_RECEIPT_OUTCOME" => receipt_outcome }
+                )
+
+                assert_equal 1, status.exitstatus
+                if json
+                  result = assert_json_result(stdout, status, command: "install")
+                  assert_equal "partial", result.fetch("status")
+                  assert_equal expected_code, result.fetch("code")
+                end
+                assert_equal "3", File.read(File.join(home, "#{operation}-committed"))
+                assert File.exist?(File.join(home, "auto-update-owned"))
+                saved_profile, error, read_status = Open3.capture3(
+                  "/usr/bin/plutil", "-extract", "Profile", "raw", state
+                )
+                assert read_status.success?, error
+                assert_equal "3", saved_profile.strip
+                calls = File.read(File.join(home, "patcher-calls.log")).lines.map(&:strip)
+                refute calls.any? { |call| call.include?("--restore-owned-subscription-auto-update") }
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
   def test_profile_three_restores_auto_update_when_a_later_step_fails
     patcher = <<~RUBY
       File.open(File.join(ENV.fetch("HOME"), "patcher-calls.log"), "a") { |file| file.puts(ARGV.join(" ")) }
