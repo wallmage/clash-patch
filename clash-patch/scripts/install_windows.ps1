@@ -104,6 +104,9 @@ $mutationLock = $null
 try {
     $mutationLock = Enter-AppHomeMutationLock $AppHome
 } catch {
+    if ($_.Exception.Message -eq "客户端保持运行；中断的当前配置事务等待恢复。") {
+        Complete-InstallResult 1 "partial" "transaction_recovery_pending" "客户端保持运行；中断的当前配置事务仍在等待安全恢复，请稍后重试。"
+    }
     Complete-InstallResult 1 "failed" "operation_in_progress" $_.Exception.Message
 }
 $clientStoppedPreCommit = {

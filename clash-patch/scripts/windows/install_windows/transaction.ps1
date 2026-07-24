@@ -761,6 +761,30 @@ function Remove-FileTransactionPreparation([byte[]]$ExpectedBytes) {
     }
 }
 
+function Test-CurrentConfigRecoveryRequiresStoppedClient([string[]]$Paths) {
+    $currentConfigPaths = @(
+        (ConvertTo-NormalizedWindowsPath (
+            Join-Path $script:ClashPatchMutationRoot "config.yaml"
+        )),
+        (ConvertTo-NormalizedWindowsPath (
+            Join-Path $script:ClashPatchMutationRoot "verge.yaml"
+        ))
+    )
+    foreach ($path in $Paths) {
+        $targetPath = ConvertTo-NormalizedWindowsPath $path
+        foreach ($currentConfigPath in $currentConfigPaths) {
+            if ([string]::Equals(
+                $targetPath,
+                $currentConfigPath,
+                [StringComparison]::OrdinalIgnoreCase
+            )) {
+                return $true
+            }
+        }
+    }
+    return $false
+}
+
 function Repair-InterruptedFilePreparation {
     $path = [string]$script:ClashPatchTransactionPreparationPath
     if ([string]::IsNullOrWhiteSpace($path)) { return }
@@ -777,12 +801,23 @@ function Repair-InterruptedFilePreparation {
     } catch {
         throw "新建文件准备记录损坏，无法安全恢复。"
     }
+    $targets = @()
     foreach ($targetPath in $paths) {
         $target = Get-OptionalFileSnapshot $targetPath "中断事务新建目标"
         if (-not $target.Exists) { continue }
         if ($target.Bytes.Length -ne 0) {
             throw "中断事务新建目标包含无法自动合并的内容：$targetPath"
         }
+        $targets += $target
+    }
+    $targetPaths = @()
+    foreach ($target in $targets) { $targetPaths += [string]$target.Path }
+    if ((Test-CurrentConfigRecoveryRequiresStoppedClient $targetPaths) -and
+        (Test-ClashVergeRunning)) {
+        throw "客户端保持运行；中断的当前配置事务等待恢复。"
+    }
+    foreach ($target in $targets) {
+        $targetPath = [string]$target.Path
         $directoryHandles = @(Open-VerifiedDirectoryChain (Split-Path -Parent $targetPath))
         $handle = $null
         $stream = $null
@@ -1092,6 +1127,12 @@ function Repair-InterruptedFileTransaction {
         throw "文件事务记录损坏，无法安全恢复。"
     }
     $plan = @(Get-InterruptedTransactionRecoveryPlan $actions)
+    $planPaths = @()
+    foreach ($item in $plan) { $planPaths += [string]$item.Action.Path }
+    if ((Test-CurrentConfigRecoveryRequiresStoppedClient $planPaths) -and
+        (Test-ClashVergeRunning)) {
+        throw "客户端保持运行；中断的当前配置事务等待恢复。"
+    }
     Invoke-InterruptedTransactionRecovery $plan
     Assert-InterruptedTransactionRecovered $actions
     Remove-FileTransactionJournal $snapshot.Bytes

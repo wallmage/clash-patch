@@ -1167,6 +1167,57 @@ class SkillContractTest < Minitest::Test
     assert_includes recovery, 'if (-not $target.Exists) { continue }'
   end
 
+  def test_windows_interrupted_current_config_recovery_waits_for_the_client
+    transaction = File.binread(
+      File.join(SKILL, "scripts/windows/install_windows/transaction.ps1")
+    ).force_encoding("UTF-8")
+    installer = File.binread(
+      File.join(SKILL, "scripts/install_windows.ps1")
+    ).force_encoding("UTF-8")
+    uninstaller = File.binread(
+      File.join(SKILL, "scripts/uninstall_windows.ps1")
+    ).force_encoding("UTF-8")
+    windows_tests = File.binread(
+      File.join(ROOT, "tests/test_windows_installer.ps1")
+    ).force_encoding("UTF-8")
+
+    assert_includes transaction,
+                    "function Test-CurrentConfigRecoveryRequiresStoppedClient("
+    assert_includes transaction,
+                    "if ((Test-CurrentConfigRecoveryRequiresStoppedClient $planPaths) -and\n" \
+                    "        (Test-ClashVergeRunning)) {"
+    assert_includes transaction,
+                    "if ((Test-CurrentConfigRecoveryRequiresStoppedClient $targetPaths) -and\n" \
+                    "        (Test-ClashVergeRunning)) {"
+    assert_includes transaction,
+                    'throw "客户端保持运行；中断的当前配置事务等待恢复。"'
+    [installer, uninstaller].each do |entrypoint|
+      assert_includes entrypoint, '"transaction_recovery_pending"'
+    end
+    assert_includes windows_tests,
+                    "running client changed an interrupted current-config target"
+    assert_includes windows_tests,
+                    "running client consumed an interrupted current-config journal"
+    assert_includes windows_tests,
+                    "running client changed a prepared current-config target"
+    assert_includes windows_tests,
+                    "running client consumed a current-config preparation record"
+
+    documents = [
+      File.read(File.join(ROOT, "README.md")),
+      File.read(File.join(SKILL, "SKILL.md")),
+      File.read(File.join(SKILL, "references/patch-policy.md")),
+      File.read(
+        File.join(ROOT, "docs/superpowers/specs/2026-07-20-clash-patch-skill-design.md")
+      ),
+      File.read(File.join(ROOT, "tests/baseline.md"))
+    ]
+    documents.each do |document|
+      assert_includes document, "中断的当前配置事务"
+      assert_includes document, "transaction_recovery_pending"
+    end
+  end
+
   def test_windows_uninstall_rechecks_client_after_transaction_targets_are_locked
     transaction = File.read(
       File.join(SKILL, "scripts/windows/install_windows/transaction.ps1")

@@ -3213,7 +3213,44 @@ try {
                 $env:CLASH_PATCH_TEST_RESTORE_CRASH_READY = $null
                 if (-not $publicRestoreChild.HasExited) { Stop-Process -Id $publicRestoreChild.Id -Force }
             }
-            Assert-True (Test-Path -LiteralPath (Join-Path $publicRestoreHome ".clash-patch-transaction.json") -PathType Leaf) "interrupted public restore did not leave a recovery journal"
+            $publicRestoreJournal = Join-Path $publicRestoreHome ".clash-patch-transaction.json"
+            Assert-True (Test-Path -LiteralPath $publicRestoreJournal -PathType Leaf) "interrupted public restore did not leave a recovery journal"
+            $publicRestoreInterruptedBytes = [System.IO.File]::ReadAllBytes($publicRestoreTarget)
+            $publicRestoreRunningClientPath = Join-Path $publicRestoreHome "clash-verge.exe"
+            Copy-Item -LiteralPath (
+                Join-Path (Join-Path $env:SystemRoot "System32") "ping.exe"
+            ) -Destination $publicRestoreRunningClientPath
+            $publicRestoreRunningClient = Start-Process `
+                -FilePath $publicRestoreRunningClientPath `
+                -ArgumentList @("-n", "20", "127.0.0.1") `
+                -PassThru
+            try {
+                Start-Sleep -Milliseconds 100
+                $blockedPublicRestoreRecovery = Invoke-TestPowerShell $publicRestoreInstaller @(
+                    "-AppHome", $publicRestoreHome,
+                    "-ShowUsageProfile",
+                    "-Json"
+                )
+                $blockedPublicRestoreJson = Assert-JsonResult `
+                    $blockedPublicRestoreRecovery "install" 1
+                Assert-True (
+                    $blockedPublicRestoreJson.status -eq "partial" -and
+                    $blockedPublicRestoreJson.code -eq "transaction_recovery_pending"
+                ) "running client did not defer interrupted current-config recovery"
+                Assert-True (
+                    [Convert]::ToBase64String(
+                        [System.IO.File]::ReadAllBytes($publicRestoreTarget)
+                    ) -eq [Convert]::ToBase64String($publicRestoreInterruptedBytes)
+                ) "running client changed an interrupted current-config target"
+                Assert-True (
+                    Test-Path -LiteralPath $publicRestoreJournal -PathType Leaf
+                ) "running client consumed an interrupted current-config journal"
+            } finally {
+                if (-not $publicRestoreRunningClient.HasExited) {
+                    Stop-Process -Id $publicRestoreRunningClient.Id -Force
+                }
+                $publicRestoreRunningClient.WaitForExit()
+            }
             $publicRestoreRecovery = Invoke-TestPowerShell $publicRestoreInstaller @(
                 "-AppHome", $publicRestoreHome,
                 "-ShowUsageProfile",
@@ -3224,7 +3261,7 @@ try {
                 (Get-BytesSha256 ([System.IO.File]::ReadAllBytes($publicRestoreTarget))) -eq
                 (Get-BytesSha256 $publicRestoreCurrentBytes)
             ) "next public operation did not recover an interrupted restore"
-            Assert-True (-not (Test-Path -LiteralPath (Join-Path $publicRestoreHome ".clash-patch-transaction.json"))) "recovered public restore retained its transaction journal"
+            Assert-True (-not (Test-Path -LiteralPath $publicRestoreJournal)) "recovered public restore retained its transaction journal"
         }
 
         Invoke-DeferredProbe "public new-target pre-journal strong-kill recovery" {
@@ -3269,14 +3306,6 @@ try {
             $publicPreJournalReady = Join-Path $sandbox "public-pre-journal-crash.ready"
             New-Item -ItemType Directory -Path $publicPreJournalProfiles -Force | Out-Null
             [System.IO.File]::WriteAllText(
-                (Join-Path $publicPreJournalHome "config.yaml"),
-                "ipv6: true`ntun: null`n"
-            )
-            [System.IO.File]::WriteAllText(
-                (Join-Path $publicPreJournalHome "verge.yaml"),
-                "enable_tun_mode: false`n"
-            )
-            [System.IO.File]::WriteAllText(
                 (Join-Path $publicPreJournalHome "profiles.yaml"),
                 "items:`n- uid: R-pre-journal`n  type: remote`n  option:`n    allow_auto_update: true`n"
             )
@@ -3284,7 +3313,7 @@ try {
             $publicPreJournalChild = Start-Process -FilePath $PowerShellPath -ArgumentList @(
                 "-NoLogo", "-NoProfile", "-File", $publicPreJournalInstaller,
                 "-AppHome", $publicPreJournalHome,
-                "-UsageProfile", "1",
+                "-UsageProfile", "3",
                 "-MihomoPath", $fakeCore
             ) -PassThru
             try {
@@ -3306,35 +3335,83 @@ try {
                 }
             }
             $publicPreJournalUsage = Join-Path $publicPreJournalHome "clash-patch-usage-profile.json"
+            $publicPreJournalConfig = Join-Path $publicPreJournalHome "config.yaml"
+            $publicPreJournalVerge = Join-Path $publicPreJournalHome "verge.yaml"
+            $publicPreJournalPreparation = Join-Path (
+                $publicPreJournalHome ".clash-patch-transaction-preparation.json"
+            )
             Assert-True (
                 (Test-Path -LiteralPath $publicPreJournalUsage -PathType Leaf) -and
                 (Get-Item -LiteralPath $publicPreJournalUsage).Length -eq 0
             ) "public pre-journal crash fixture did not leave the newly created empty state"
+            Assert-True (
+                (Test-Path -LiteralPath $publicPreJournalConfig -PathType Leaf) -and
+                (Get-Item -LiteralPath $publicPreJournalConfig).Length -eq 0 -and
+                (Test-Path -LiteralPath $publicPreJournalVerge -PathType Leaf) -and
+                (Get-Item -LiteralPath $publicPreJournalVerge).Length -eq 0
+            ) "public pre-journal crash fixture did not leave empty current-config targets"
             Assert-True (-not (
                 Test-Path -LiteralPath (Join-Path $publicPreJournalHome ".clash-patch-transaction.json")
             )) "public pre-journal crash unexpectedly published the main transaction journal"
             Assert-True (
-                Test-Path -LiteralPath (
-                    Join-Path $publicPreJournalHome ".clash-patch-transaction-preparation.json"
-                ) -PathType Leaf
+                Test-Path -LiteralPath $publicPreJournalPreparation -PathType Leaf
             ) "public pre-journal crash did not leave a preparation record"
 
+            $publicPreJournalPreparationBytes = [System.IO.File]::ReadAllBytes(
+                $publicPreJournalPreparation
+            )
+            $publicPreJournalRunningClientPath = Join-Path (
+                $publicPreJournalHome "clash-verge.exe"
+            )
+            Copy-Item -LiteralPath (
+                Join-Path (Join-Path $env:SystemRoot "System32") "ping.exe"
+            ) -Destination $publicPreJournalRunningClientPath
+            $publicPreJournalRunningClient = Start-Process `
+                -FilePath $publicPreJournalRunningClientPath `
+                -ArgumentList @("-n", "20", "127.0.0.1") `
+                -PassThru
+            try {
+                Start-Sleep -Milliseconds 100
+                $blockedPreJournalRecovery = Invoke-TestPowerShell $publicPreJournalInstaller @(
+                    "-AppHome", $publicPreJournalHome,
+                    "-ShowUsageProfile",
+                    "-Json"
+                )
+                $blockedPreJournalJson = Assert-JsonResult `
+                    $blockedPreJournalRecovery "install" 1
+                Assert-True (
+                    $blockedPreJournalJson.status -eq "partial" -and
+                    $blockedPreJournalJson.code -eq "transaction_recovery_pending"
+                ) "running client did not defer prepared current-config recovery"
+                Assert-True (
+                    (Get-Item -LiteralPath $publicPreJournalConfig).Length -eq 0 -and
+                    (Get-Item -LiteralPath $publicPreJournalVerge).Length -eq 0
+                ) "running client changed a prepared current-config target"
+                Assert-True (
+                    [Convert]::ToBase64String(
+                        [System.IO.File]::ReadAllBytes($publicPreJournalPreparation)
+                    ) -eq [Convert]::ToBase64String($publicPreJournalPreparationBytes)
+                ) "running client consumed a current-config preparation record"
+            } finally {
+                if (-not $publicPreJournalRunningClient.HasExited) {
+                    Stop-Process -Id $publicPreJournalRunningClient.Id -Force
+                }
+                $publicPreJournalRunningClient.WaitForExit()
+            }
             $publicPreJournalRecovery = Invoke-TestPowerShell $publicPreJournalInstaller @(
                 "-AppHome", $publicPreJournalHome,
-                "-UsageProfile", "1",
+                "-UsageProfile", "3",
                 "-MihomoPath", $fakeCore,
                 "-Json"
             )
             $publicPreJournalRecoveryJson = Assert-JsonResult $publicPreJournalRecovery "install" 0
             Assert-True (
-                $publicPreJournalRecoveryJson.code -eq "installed_common_baseline"
+                $publicPreJournalRecoveryJson.code -eq "installed"
             ) "next public install did not recover the pre-journal new target"
             $publicPreJournalUsageJson = Get-Content -LiteralPath $publicPreJournalUsage -Raw | ConvertFrom-Json
-            Assert-True ([int]$publicPreJournalUsageJson.Profile -eq 1) "recovered install did not replace the empty usage state"
+            Assert-True ([int]$publicPreJournalUsageJson.Profile -eq 3) "recovered install did not replace the empty usage state"
             Assert-True (-not (
-                Test-Path -LiteralPath (
-                    Join-Path $publicPreJournalHome ".clash-patch-transaction-preparation.json"
-                )
+                Test-Path -LiteralPath $publicPreJournalPreparation
             )) "recovered install retained the preparation record"
         }
 
